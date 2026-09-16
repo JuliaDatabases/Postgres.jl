@@ -90,7 +90,8 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, x::T, tags) where {T<:JSON.
 """
     Postgres.Numeric
 
-Exact decimal representation of a PostgreSQL `numeric`/`decimal` value:
+Exact fallback for PostgreSQL `numeric`/`decimal` values that exceed
+`DataDecimals.DecimalValue{DataDecimals.Int256}` storage:
 `coeff * 10^-scale`, where `coeff` is a `BigInt` and `scale` the number of
 digits after the decimal point. Preserves the value and scale exactly (no
 floating-point rounding). `print`/`string` produce the decimal text form.
@@ -103,6 +104,11 @@ struct Numeric
     scale::Int
 end
 StructUtils.structlike(::AbstractPostgresStyle, ::Type{Numeric}) = false
+
+const PGDecimal = DataDecimals.DecimalValue{DataDecimals.Int256}
+const NumericValue = Union{PGDecimal, Numeric}
+const MIN_DECIMAL_COEFFICIENT = BigInt(typemin(DataDecimals.Int256))
+const MAX_DECIMAL_COEFFICIENT = BigInt(typemax(DataDecimals.Int256))
 
 Base.:(==)(a::Numeric, b::Numeric) = a.coeff == b.coeff && a.scale == b.scale
 
@@ -214,7 +220,7 @@ function _populate_default_type_registry!()
     2950 => TypeInfo(UUID, nothing),
     700 => TypeInfo(Float32, nothing),
     701 => TypeInfo(Float64, nothing),
-    1700 => TypeInfo(Numeric, (val, registry) -> parse_numeric(val)),
+    1700 => TypeInfo(NumericValue, (val, registry) -> parse_numeric(val)),
     1114 => TypeInfo(PGTimestamp, (val, registry) -> pg_parse_timestamp(val)),
     1184 => TypeInfo(PGTimestamp, (val, registry) -> pg_parse_timestamp(val)),
     1082 => TypeInfo(Date, nothing),
@@ -239,13 +245,13 @@ function _populate_default_type_registry!()
     1183 => TypeInfo(Vector{Time}, (val, registry) -> parse_array_by_oid(val, 1083, registry)),
     1185 => TypeInfo(Vector{PGTimestamp}, (val, registry) -> parse_array_by_oid(val, 1184, registry)),
     1187 => TypeInfo(Vector{IntervalType}, (val, registry) -> parse_array_by_oid(val, 1186, registry)),
-    1231 => TypeInfo(Vector{Numeric}, (val, registry) -> parse_array_by_oid(val, 1700, registry)),
+    1231 => TypeInfo(Vector{NumericValue}, (val, registry) -> parse_array_by_oid(val, 1700, registry)),
     199 => TypeInfo(Vector{JSONType}, (val, registry) -> parse_array_by_oid(val, 114, registry)),
     2951 => TypeInfo(Vector{UUID}, (val, registry) -> parse_array_by_oid(val, 2950, registry)),
     3807 => TypeInfo(Vector{JSONType}, (val, registry) -> parse_array_by_oid(val, 3802, registry)),
     3904 => TypeInfo(PostgresRange{Int32}, (val, registry) -> parse_range(val, 23, registry)),
     3926 => TypeInfo(PostgresRange{Int64}, (val, registry) -> parse_range(val, 20, registry)),
-    3906 => TypeInfo(PostgresRange{Numeric}, (val, registry) -> parse_range(val, 1700, registry)),
+    3906 => TypeInfo(PostgresRange{NumericValue}, (val, registry) -> parse_range(val, 1700, registry)),
     3908 => TypeInfo(PostgresRange{PGTimestamp}, (val, registry) -> parse_range(val, 1114, registry)),
     3910 => TypeInfo(PostgresRange{PGTimestamp}, (val, registry) -> parse_range(val, 1184, registry)),
     3912 => TypeInfo(PostgresRange{Date}, (val, registry) -> parse_range(val, 1082, registry)),
@@ -474,12 +480,30 @@ end
 
 Base.show(io::IO, num::Numeric) = print(io, numeric_string(num))
 
-function parse_numeric(val::String)
+function parse_numeric(val::String)::NumericValue
+    # Parse once without a precision cap. Keep both coefficient and scale;
+    # narrowing a long coefficient via a decimal string parser can discard
+    # trailing zeroes and change PostgreSQL's declared scale.
+    num = parse_numeric_big(val)
+    if num.scale <= 16383 && MIN_DECIMAL_COEFFICIENT <= num.coeff <= MAX_DECIMAL_COEFFICIENT
+        return PGDecimal(DataDecimals.Int256(num.coeff), num.scale)
+    end
+    return num
+end
+
+function parse_decimal(::Type{T}, val::String) where {T<:DataDecimals.AbstractDecimal}
+    num = parse_numeric(val)
+    # Decimal string constructors can round to a declared scale. Conversion
+    # from an exact number must instead preserve the value or throw.
+    return num isa PGDecimal ? T(num) : T(num.coeff // big(10)^num.scale)
+end
+
+function parse_numeric_big(val::String)
     stripped = strip(val)
     stripped == "" && return Numeric(BigInt(0), 0)
     lowered = lowercase(stripped)
     (lowered == "nan" || lowered == "infinity" || lowered == "-infinity" || lowered == "+infinity") &&
-        throw(PostgresInterfaceError("postgres numeric special value \"$stripped\" cannot be represented as Postgres.Numeric"))
+        throw(PostgresInterfaceError("postgres numeric special value \"$stripped\" cannot be represented as a finite decimal"))
     sign = 1
     if stripped[1] == '-'
         sign = -1
@@ -490,7 +514,7 @@ function parse_numeric(val::String)
     exp_index = findfirst(c -> c == 'e' || c == 'E', stripped)
     exp_val = 0
     if exp_index !== nothing
-        # postgres numeric tops out at 16383 digits either side of the point;
+        # PostgreSQL numeric supports 131072 integer and 16383 fractional digits;
         # bound the exponent so a bogus value can't drive an enormous BigInt
         # scaling below (tryparse so an oversized exponent reports the same
         # error as an out-of-range one, rather than an OverflowError)
@@ -674,6 +698,7 @@ function _range_typed(@nospecialize(T), @nospecialize(lower), @nospecialize(uppe
     T === Int32 && return _make_range(Int32, lower, upper, li, ui, empty)
     T === Int64 && return _make_range(Int64, lower, upper, li, ui, empty)
     T === Float64 && return _make_range(Float64, lower, upper, li, ui, empty)
+    T === NumericValue && return _make_range(NumericValue, lower, upper, li, ui, empty)
     T === Numeric && return _make_range(Numeric, lower, upper, li, ui, empty)
     T === Date && return _make_range(Date, lower, upper, li, ui, empty)
     T === PGTimestamp && return _make_range(PGTimestamp, lower, upper, li, ui, empty)
@@ -886,7 +911,7 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
     elseif T == UUID
         return UUID(val)
     elseif T == Numeric
-        return parse_numeric(val)
+        return parse_numeric_big(val)
     elseif T == Int16
         return Parsers.parse(Int16, val)
     elseif T == Int32
@@ -960,7 +985,7 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Date}, s::String) = pg_parse_da
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Time}, s::String) = pg_parse_time(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{DateTime}, s::String) = pg_parse_datetime_any(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{UUID}, s::String) = UUID(s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Numeric}, s::String) = parse_numeric(s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Numeric}, s::String) = parse_numeric_big(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{IntervalType}, s::String) = parse_interval(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{UInt8}}, s::String) = decode_bytea(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{JSONType}, s::String) = JSON.lazy(s), nothing
@@ -988,3 +1013,6 @@ StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, s::String, tags) where {T
 StructUtils.structlike(::AbstractPostgresStyle, ::Type{<:Durations.Timestamp}) = false
 StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, s::String) where {T<:Durations.Timestamp} = convert(T, pg_parse_timestamp(s)), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{T}}, s::String) where {T<:Durations.Timestamp} = parse_array(s, T), nothing
+
+StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, s::String) where {T<:DataDecimals.AbstractDecimal} = parse_decimal(T, s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{T}}, s::String) where {T<:DataDecimals.AbstractDecimal} = parse_array(s, T), nothing

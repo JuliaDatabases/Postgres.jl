@@ -1,7 +1,7 @@
 using Test
 using Aqua
 using Dates
-import Durations
+import Durations, DataDecimals
 using Distributed
 using UUIDs
 using DBInterface
@@ -49,7 +49,7 @@ StructUtils.@defaults struct TypeRow
     bool_col::Bool = false
     float4_col::Float32 = 0
     float8_col::Float64 = 0
-    numeric_col::Postgres.Numeric = Postgres.Numeric(BigInt(0), 0)
+    numeric_col::DataDecimals.DecimalValue{DataDecimals.Int256} = DataDecimals.DecimalValue{DataDecimals.Int256}(0, 0)
     text_col::String = ""
     varchar_col::String = ""
     bpchar_col::String = ""
@@ -484,9 +484,11 @@ function random_array_string(rng::AbstractRNG)
 end
 
 include("timestamps.jl")
+include("decimals.jl")
 
 @testset "Postgres" begin
     test_timestamps()
+    test_decimals()
     Aqua.test_all(Postgres)
 
     @testset "Export Surface" begin
@@ -676,7 +678,7 @@ include("timestamps.jl")
         @test string(Postgres.API.parse_numeric("123.4500")) == "123.4500"
         @test string(Postgres.API.parse_numeric("-0.00120")) == "-0.00120"
         @test string(Postgres.API.parse_numeric("1.23e3")) == "1230"
-        @test Postgres.API.parse_numeric("+42") == Postgres.Numeric(BigInt(42), 0)
+        @test Postgres.API.parse_numeric("+42") == DataDecimals.DecimalValue(42, 0)
         # numeric special values can't be represented and must fail clearly
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("NaN")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("Infinity")
@@ -1226,7 +1228,7 @@ include("timestamps.jl")
                     """)))
                     @test array_types_row.uuid_array == UUID[UUID("12345678-1234-5678-1234-567812345678")]
                     @test array_types_row.date_array == Date[Date(2024, 1, 28)]
-                    @test isequal(array_types_row.numeric_array, Union{Missing, Postgres.Numeric}[Postgres.API.parse_numeric("123.45"), missing])
+                    @test isequal(array_types_row.numeric_array, [Postgres.API.parse_numeric("123.45"), missing])
                     @test JSON.parse(only(array_types_row.jsonb_array))["a"] == 1
                 end
 
@@ -1283,6 +1285,7 @@ include("timestamps.jl")
                 end
 
                 test_timestamp_roundtrips(conn)
+                test_decimal_roundtrips(conn)
 
                 @testset "Microsecond Round Trips" begin
                     rng = MersenneTwister(0x71ae)

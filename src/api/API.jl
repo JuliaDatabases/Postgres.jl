@@ -3,7 +3,7 @@ module API
 using UUIDs, Dates, Reseau, SASLAuth, MD5, Parsers, StructUtils, JSON, Random
 import ..PostgresInterfaceError
 
-import Durations
+import Durations, DataDecimals
 
 export PostgresStyle, AbstractPostgresStyle, query_logging_enabled, query_logger, notice_callback, notification_callback, Error, Notification, Numeric, PostgresRange, cancel_request
 
