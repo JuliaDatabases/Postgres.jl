@@ -288,8 +288,8 @@ connections. See the [1.0 Support Policy](@ref) before using this mode.
 Timestamps use `Durations.Timestamp{Dates.Microsecond}`. `timestamptz` values
 are normalized to UTC. Select a timestamp as `::text` to retain its
 server-rendered timezone offset. Values outside the Unix-epoch `Int64`
-microsecond range raise an error; this excludes the last 29 years of
-PostgreSQL's upper timestamp range. Read those values as text, request `Timestamp{Second}` or
+microsecond range raise an error; its upper limit falls in year 294247,
+before PostgreSQL's upper limit in year 294276. Read those values as text, request `Timestamp{Second}` or
 `Timestamp{Millisecond}` in a typed result, or register a custom parser.
 
 Typed results can request another `Durations.Timestamp{P}` resolution.

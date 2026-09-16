@@ -989,6 +989,13 @@ StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue, tags) wher
     end
 end
 
+@static if isdefined(StructUtils, :StructClosure)
+    @inline function applycast(f::StructUtils.StructClosure, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+        f(name, FieldValue(val, typeId, registry))
+        return
+    end
+end
+
 @static if isdefined(StructUtils, :FieldSink)
     @inline function applycast(f::StructUtils.FieldSink, name, typeId, val::String, registry::Dict{Int, TypeInfo})
         f(name, FieldValue(val, typeId, registry))
