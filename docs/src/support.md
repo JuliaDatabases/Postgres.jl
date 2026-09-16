@@ -1,20 +1,20 @@
-# 1.0 Support Policy
+# Support Policy
 
-Postgres.jl 1.0 supports Julia 1.10 and later. The release test matrix covers
-PostgreSQL 14 through 18 on TCP connections. Unix-domain sockets are not
-supported.
+Postgres.jl supports Julia 1.10 and later. CI tests PostgreSQL 14 through 18
+on TCP connections. Unix-domain sockets are not
+supported. Database and certificate integration tests run on Linux with Docker
+and OpenSSL. The Windows and macOS CI jobs run the parser and API checks;
+they also run database tests when a Linux Docker daemon is available.
 
 ## TLS
 
 `sslmode=verify-full` verifies the certificate chain and server name. Use a DNS
 name as `host`, or set `sslservername` to the DNS name when dialing a resolved
 address. IP-address subject-alternative-name matching on a TLS 1.2-only server
-is not supported in 1.0.
+is not supported.
 
-Client certificates require both `sslcert` and `sslkey`. Postgres.jl 1.0 limits
-client-certificate connections to TLS 1.2 because the current Reseau 1.x mixed
-TLS 1.2/1.3 client path does not send the certificate reliably. Server-only TLS
-connections can negotiate TLS 1.2 or TLS 1.3.
+Client certificates require both `sslcert` and `sslkey` and use TLS 1.2.
+Server-only TLS connections can negotiate TLS 1.2 or TLS 1.3.
 
 `connect_timeout` bounds the TCP connection and TLS handshake. It does not
 bound PostgreSQL authentication or query execution. Use `statement_timeout`
@@ -48,11 +48,29 @@ semantics.
 
 Built-in scalar types, byte arrays, and one-dimensional PostgreSQL arrays can
 be bound as parameters. Custom enum, composite, and range registration is a
-result-decoding feature in 1.0. Bind a text representation with an explicit SQL
+result-decoding feature. Bind a text representation with an explicit SQL
 cast when writing those custom values. Multidimensional Julia arrays are not a
-supported parameter form in 1.0.
+supported parameter form.
+
+`time`, `interval`, `timestamp`, and `timestamptz` decoding retains PostgreSQL's
+microsecond precision. Timestamps use `Durations.Timestamp{Dates.Microsecond}`.
+`timestamptz` is returned in UTC without retaining the original timezone.
+PostgreSQL timestamps beyond this type's upper limit in year 294247 raise an
+error. Read those values as text, request a wider-range Timestamp resolution in
+a typed result, or use a custom parser. Explicit typed `DateTime` fields
+truncate to milliseconds. Timestamp parameters with submicrosecond precision raise an error.
+
+`numeric` uses `DataDecimals.DecimalValue{DataDecimals.Int256}`. Values that
+cannot fit exactly, including `NaN` and infinities, return their original text
+with a warning. Set `numeric_overflow=:error` to throw instead. This policy also
+applies to numeric array elements and range bounds. Explicitly typed decimal
+results always require an exact conversion; excess precision raises an error.
+
+`boolean` and `bit(1)` decode to `Bool`. Wider `bit(n)` values cannot be
+represented as a Boolean and raise an error. Select them as text, for example
+`SELECT flags::text FROM my_table`.
 
 ## Native Compilation
 
-JuliaC `--trim` compilation is not supported in Postgres.jl 1.0. Normal Julia
+JuliaC `--trim` compilation is not supported in Postgres.jl. Normal Julia
 package precompilation is supported and is part of CI.

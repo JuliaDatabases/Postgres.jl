@@ -20,8 +20,7 @@ database.
 Custom styles inherit the default row-materialization traits (lift/structlike/...),
 which dispatch on `AbstractPostgresStyle`, and are used as the StructUtils style when
 materializing query results — so `StructUtils.lift` overloads on a custom style apply
-to row values too. Static dispatch on the style (rather than `Function`-typed callback
-fields) also keeps the driver compilable under `juliac --trim`.
+to row values too.
 """
 abstract type AbstractPostgresStyle <: StructUtils.StructStyle end
 
@@ -87,24 +86,10 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, x::T) where {T<:JSON.LazyVa
 StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, x::T, tags) where {T<:JSON.LazyValue} = x, nothing
 
 
-"""
-    Postgres.Numeric
-
-Exact decimal representation of a PostgreSQL `numeric`/`decimal` value:
-`coeff * 10^-scale`, where `coeff` is a `BigInt` and `scale` the number of
-digits after the decimal point. Preserves the value and scale exactly (no
-floating-point rounding). `print`/`string` produce the decimal text form.
-
-The PostgreSQL special values `NaN`, `Infinity`, and `-Infinity` cannot be
-represented and throw an error when encountered.
-"""
-struct Numeric
-    coeff::BigInt
-    scale::Int
-end
-StructUtils.structlike(::AbstractPostgresStyle, ::Type{Numeric}) = false
-
-Base.:(==)(a::Numeric, b::Numeric) = a.coeff == b.coeff && a.scale == b.scale
+const PGDecimal = DataDecimals.DecimalValue{DataDecimals.Int256}
+const NumericValue = Union{PGDecimal, String}
+const MIN_DECIMAL_COEFFICIENT = BigInt(typemin(DataDecimals.Int256))
+const MAX_DECIMAL_COEFFICIENT = BigInt(typemax(DataDecimals.Int256))
 
 """
     Postgres.PostgresRange{T}
@@ -187,6 +172,8 @@ end
     return out[]
 end
 
+const PGTimestamp = Durations.Timestamp{Dates.Microsecond}
+
 const IntervalType = Union{Dates.Period, Dates.CompoundPeriod}
 
 # Populated in `_populate_default_type_registry!` (called from API.__init__): the
@@ -212,9 +199,9 @@ function _populate_default_type_registry!()
     2950 => TypeInfo(UUID, nothing),
     700 => TypeInfo(Float32, nothing),
     701 => TypeInfo(Float64, nothing),
-    1700 => TypeInfo(Numeric, (val, registry) -> parse_numeric(val)),
-    1114 => TypeInfo(DateTime, nothing),
-    1184 => TypeInfo(DateTime, nothing),
+    1700 => TypeInfo(NumericValue, (val, registry) -> parse_numeric(val)),
+    1114 => TypeInfo(PGTimestamp, (val, registry) -> pg_parse_timestamp(val)),
+    1184 => TypeInfo(PGTimestamp, (val, registry) -> pg_parse_timestamp(val)),
     1082 => TypeInfo(Date, nothing),
     1083 => TypeInfo(Time, nothing),
     1186 => TypeInfo(IntervalType, (val, registry) -> parse_interval(val)),
@@ -232,20 +219,20 @@ function _populate_default_type_registry!()
     1009 => TypeInfo(Vector{String}, nothing),
     1014 => TypeInfo(Vector{String}, nothing),
     1015 => TypeInfo(Vector{String}, nothing),
-    1115 => TypeInfo(Vector{DateTime}, (val, registry) -> parse_array_by_oid(val, 1114, registry)),
+    1115 => TypeInfo(Vector{PGTimestamp}, (val, registry) -> parse_array_by_oid(val, 1114, registry)),
     1182 => TypeInfo(Vector{Date}, (val, registry) -> parse_array_by_oid(val, 1082, registry)),
     1183 => TypeInfo(Vector{Time}, (val, registry) -> parse_array_by_oid(val, 1083, registry)),
-    1185 => TypeInfo(Vector{DateTime}, (val, registry) -> parse_array_by_oid(val, 1184, registry)),
+    1185 => TypeInfo(Vector{PGTimestamp}, (val, registry) -> parse_array_by_oid(val, 1184, registry)),
     1187 => TypeInfo(Vector{IntervalType}, (val, registry) -> parse_array_by_oid(val, 1186, registry)),
-    1231 => TypeInfo(Vector{Numeric}, (val, registry) -> parse_array_by_oid(val, 1700, registry)),
+    1231 => TypeInfo(Vector{NumericValue}, (val, registry) -> parse_array_by_oid(val, 1700, registry)),
     199 => TypeInfo(Vector{JSONType}, (val, registry) -> parse_array_by_oid(val, 114, registry)),
     2951 => TypeInfo(Vector{UUID}, (val, registry) -> parse_array_by_oid(val, 2950, registry)),
     3807 => TypeInfo(Vector{JSONType}, (val, registry) -> parse_array_by_oid(val, 3802, registry)),
     3904 => TypeInfo(PostgresRange{Int32}, (val, registry) -> parse_range(val, 23, registry)),
     3926 => TypeInfo(PostgresRange{Int64}, (val, registry) -> parse_range(val, 20, registry)),
-    3906 => TypeInfo(PostgresRange{Numeric}, (val, registry) -> parse_range(val, 1700, registry)),
-    3908 => TypeInfo(PostgresRange{DateTime}, (val, registry) -> parse_range(val, 1114, registry)),
-    3910 => TypeInfo(PostgresRange{DateTime}, (val, registry) -> parse_range(val, 1184, registry)),
+    3906 => TypeInfo(PostgresRange{NumericValue}, (val, registry) -> parse_range(val, 1700, registry)),
+    3908 => TypeInfo(PostgresRange{PGTimestamp}, (val, registry) -> parse_range(val, 1114, registry)),
+    3910 => TypeInfo(PostgresRange{PGTimestamp}, (val, registry) -> parse_range(val, 1184, registry)),
     3912 => TypeInfo(PostgresRange{Date}, (val, registry) -> parse_range(val, 1082, registry)),
     ))
     return nothing
@@ -283,8 +270,8 @@ end
 # "YYYY-MM-DD HH:MM:SS[.ffffff][±TZ]"), so direct digit extraction is both faster
 # than the generic Dates machinery and — decisive under `juliac --trim` — fully
 # static: Parsers' dateformat path iterates a type-erased Vector{AbstractDateToken},
-# which is dynamic dispatch per token. Fractional seconds beyond millisecond
-# precision are truncated (DateTime/Time storage precision).
+# which is dynamic dispatch per token. Time supports nanoseconds; DateTime supports only milliseconds. Keep the
+# fraction until the target type is known.
 @inline _pg_digit(b::UInt8)::Int = Int(b - UInt8('0'))
 @inline _pg_isdigit(b::UInt8)::Bool = UInt8('0') <= b <= UInt8('9')
 
@@ -319,20 +306,20 @@ end
     h = _pg_digit(c[o]) * 10 + _pg_digit(c[o+1])
     mi = _pg_digit(c[o+3]) * 10 + _pg_digit(c[o+4])
     se = _pg_digit(c[o+6]) * 10 + _pg_digit(c[o+7])
-    ms = 0
+    ns = 0
     i = o + 8
     if i <= length(c) && c[i] == UInt8('.')
         i += 1
-        mult = 100
+        mult = 100_000_000
         while i <= length(c) && _pg_isdigit(c[i])
             if mult > 0
-                ms += _pg_digit(c[i]) * mult
+                ns += _pg_digit(c[i]) * mult
                 mult ÷= 10
             end
             i += 1
         end
     end
-    return h, mi, se, ms
+    return h, mi, se, ns
 end
 
 # `"char"` output: byte 0 renders as an empty string. High bytes render as
@@ -367,10 +354,12 @@ end
 function pg_parse_time(s::AbstractString)::Time
     c = codeunits(s)
     length(c) >= 8 || throw(ArgumentError("invalid postgres time"))
-    h, mi, se, ms = _pg_hms_at(c, 1)
+    h, mi, se, ns = _pg_hms_at(c, 1)
     # postgres permits '24:00:00' as a time value; Julia's Time does not
     h == 24 && throw(PostgresInterfaceError("postgres time value \"$s\" cannot be represented as a Julia Time"))
-    return Time(h, mi, se, ms)
+    ms, remainder = divrem(ns, 1_000_000)
+    us, ns = divrem(remainder, 1_000)
+    return Time(h, mi, se, ms, us, ns)
 end
 
 @noinline _reject_temporal_special(s::AbstractString, what::String) =
@@ -390,8 +379,32 @@ function pg_parse_datetime(s::AbstractString)::DateTime
     length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
     # the time starts one space past the date, whose year may be wider than 4
     d, after_date = _pg_date_at_end(c, 1)
-    h, mi, se, ms = _pg_hms_at(c, after_date + 1)
-    return DateTime(Dates.year(d), Dates.month(d), Dates.day(d), h, mi, se, ms)
+    h, mi, se, ns = _pg_hms_at(c, after_date + 1)
+    return DateTime(Dates.year(d), Dates.month(d), Dates.day(d), h, mi, se, ns ÷ 1_000_000)
+end
+
+# Decode in wide Unix-epoch ticks so both timezone adjustment and the final
+# range check happen before narrowing. Timestamp arithmetic itself wraps at
+# Int64 limits, and a local time can be outside the range while UTC fits.
+pg_parse_timestamp(s::AbstractString) = pg_parse_timestamp(s, PGTimestamp)
+pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp}) = pg_parse_timestamp(s, Durations.Timestamp{Dates.Nanosecond})
+
+function pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp{P}}) where {P}
+    _check_temporal_special(s, "timestamp")
+    c = codeunits(s)
+    length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
+    d, after_date = _pg_date_at_end(c, 1)
+    h, mi, se, ns = _pg_hms_at(c, after_date + 1)
+    Time(h, mi, se) # validate the clock fields
+    offset_at = findnext(ch -> ch == '+' || ch == '-', s, after_date + 1)
+    offset = offset_at === nothing ? 0 : tzoffset_seconds(SubString(s, offset_at))
+    days = Int128(Dates.value(d)) - Dates.value(Date(1970, 1, 1))
+    nanoseconds = days * 86_400_000_000_000 + (h * 3600 + mi * 60 + se - offset) * Int128(1_000_000_000) + ns
+    ticks, remainder = divrem(nanoseconds, Dates.value(convert(Dates.Nanosecond, P(1))))
+    iszero(remainder) || throw(InexactError(:pg_parse_timestamp, Durations.Timestamp{P}, s))
+    typemin(Int64) <= ticks <= typemax(Int64) ||
+        throw(PostgresInterfaceError("postgres timestamp is outside the range of Durations.Timestamp{$P}; select it as text or request a wider-range Timestamp resolution"))
+    return Durations.Timestamp{P}(Dates.UTInstant(P(Int64(ticks))))
 end
 
 # timestamptz column into a DateTime field: sniff a trailing offset/Z
@@ -434,28 +447,32 @@ end
     return dt - Dates.Second(seconds)
 end
 
-function numeric_string(num::Numeric)
-    coeff = num.coeff
-    scale = num.scale
-    sign = coeff < 0 ? "-" : ""
-    digits = string(abs(coeff))
-    scale <= 0 && return sign * digits * repeat("0", -scale)
-    if length(digits) <= scale
-        padding = repeat("0", scale - length(digits))
-        return sign * "0." * padding * digits
+function parse_numeric(val::String, on_overflow::Symbol=:warn)::NumericValue
+    num = parse_numeric_parts(val)
+    if num !== nothing && num.scale <= 16383 && MIN_DECIMAL_COEFFICIENT <= num.coeff <= MAX_DECIMAL_COEFFICIENT
+        return PGDecimal(DataDecimals.Int256(num.coeff), num.scale)
     end
-    split_at = length(digits) - scale
-    return sign * digits[1:split_at] * "." * digits[split_at + 1:end]
+    message = "postgres numeric cannot be represented exactly as DecimalValue{Int256}; select it as text or use a custom parser"
+    on_overflow === :error && throw(PostgresInterfaceError(message))
+    # Do not put database values in the warning: they can contain private data.
+    @warn message * "; returning the original text (numeric_overflow=:error makes this an error)"
+    return val
 end
 
-Base.show(io::IO, num::Numeric) = print(io, numeric_string(num))
+function parse_decimal(::Type{T}, val::String) where {T<:DataDecimals.AbstractDecimal}
+    num = parse_numeric_parts(val)
+    num === nothing && throw(InexactError(:parse_decimal, T, val))
+    # Preserve the requested scale for variable-scale values. Fixed-scale
+    # conversion from an exact rational must preserve the value or throw.
+    T <: DataDecimals.DecimalValue && return T(num.coeff, num.scale)
+    return T(num.coeff // big(10)^num.scale)
+end
 
-function parse_numeric(val::String)
+function parse_numeric_parts(val::String)
     stripped = strip(val)
-    stripped == "" && return Numeric(BigInt(0), 0)
+    stripped == "" && throw(PostgresInterfaceError("invalid numeric text"))
     lowered = lowercase(stripped)
-    (lowered == "nan" || lowered == "infinity" || lowered == "-infinity" || lowered == "+infinity") &&
-        throw(PostgresInterfaceError("postgres numeric special value \"$stripped\" cannot be represented as Postgres.Numeric"))
+    (lowered == "nan" || lowered == "infinity" || lowered == "-infinity" || lowered == "+infinity") && return nothing
     sign = 1
     if stripped[1] == '-'
         sign = -1
@@ -466,7 +483,7 @@ function parse_numeric(val::String)
     exp_index = findfirst(c -> c == 'e' || c == 'E', stripped)
     exp_val = 0
     if exp_index !== nothing
-        # postgres numeric tops out at 16383 digits either side of the point;
+        # PostgreSQL numeric supports 131072 integer and 16383 fractional digits;
         # bound the exponent so a bogus value can't drive an enormous BigInt
         # scaling below (tryparse so an oversized exponent reports the same
         # error as an out-of-range one, rather than an OverflowError)
@@ -483,13 +500,13 @@ function parse_numeric(val::String)
     frac_part = length(parts) == 2 ? parts[2] : ""
     scale = length(frac_part) - exp_val
     digits = int_part * frac_part
-    digits == "" && return Numeric(BigInt(0), 0)
+    digits == "" && throw(PostgresInterfaceError("invalid numeric text"))
     coeff = parse(BigInt, digits)
     if scale < 0
         coeff *= big(10) ^ (-scale)
         scale = 0
     end
-    return Numeric(sign * coeff, scale)
+    return (coeff=sign * coeff, scale=scale)
 end
 
 function parse_interval_time(token::AbstractString)
@@ -502,11 +519,13 @@ function parse_interval_time(token::AbstractString)
     seconds_part = parts[3]
     seconds = 0
     milliseconds = 0
+    microseconds = 0
     if occursin('.', seconds_part)
         whole, frac = split(seconds_part, '.'; limit=2)
         seconds = parse(Int, whole)
-        fs = frac[1:min(end, 3)]
-        milliseconds = parse(Int, fs) * 10^(3 - length(fs))
+        fs = frac[1:min(end, 6)]
+        fraction_us = parse(Int, fs) * 10^(6 - length(fs))
+        milliseconds, microseconds = divrem(fraction_us, 1_000)
     else
         seconds = parse(Int, seconds_part)
     end
@@ -515,6 +534,7 @@ function parse_interval_time(token::AbstractString)
     minutes != 0 && push!(periods, Dates.Minute(minutes))
     seconds != 0 && push!(periods, Dates.Second(sign * seconds))
     milliseconds != 0 && push!(periods, Dates.Millisecond(sign * milliseconds))
+    microseconds != 0 && push!(periods, Dates.Microsecond(sign * microseconds))
     return periods
 end
 
@@ -647,8 +667,9 @@ function _range_typed(@nospecialize(T), @nospecialize(lower), @nospecialize(uppe
     T === Int32 && return _make_range(Int32, lower, upper, li, ui, empty)
     T === Int64 && return _make_range(Int64, lower, upper, li, ui, empty)
     T === Float64 && return _make_range(Float64, lower, upper, li, ui, empty)
-    T === Numeric && return _make_range(Numeric, lower, upper, li, ui, empty)
+    T === NumericValue && return _make_range(NumericValue, lower, upper, li, ui, empty)
     T === Date && return _make_range(Date, lower, upper, li, ui, empty)
+    T === PGTimestamp && return _make_range(PGTimestamp, lower, upper, li, ui, empty)
     T === DateTime && return _make_range(DateTime, lower, upper, li, ui, empty)
     throw(PostgresInterfaceError("no trim-safe range constructor registered for this element type; " *
                                  "register a parser function for the range type"))
@@ -715,54 +736,48 @@ function parse_array_by_oid(val::String, typeId::Int, registry::Dict{Int, TypeIn
     return parse_array_scalar(typeId, registry, parsed)
 end
 
+@noinline invalid_composite() = throw(PostgresInterfaceError("invalid postgres composite value"))
+
 function parse_composite_fields(val::String)
     code = codeunits(val)
-    pos = 1
+    n = length(code)
+    (n >= 2 && code[1] == UInt8('(') && code[n] == UInt8(')')) || invalid_composite()
+    pos = 2
     fields = Vector{Union{String, Missing}}()
-    if pos <= length(code) && code[pos] == UInt8('(')
-        pos += 1
-    end
-    while pos <= length(code)
-        pos > length(code) && break
-        if code[pos] == UInt8(')')
-            pos += 1
-            break
-        end
-        if code[pos] == UInt8('"')
-            pos += 1
-            buf = UInt8[]
-            while pos <= length(code)
-                c = code[pos]
-                if c == UInt8('\\')
-                    pos += 1
-                    pos <= length(code) || break
-                    push!(buf, code[pos])
-                    pos += 1
-                elseif c == UInt8('"')
-                    pos += 1
-                    break
-                else
+    # Even "()" contains one NULL field. The registered field count resolves
+    # the otherwise ambiguous zero-column composite representation.
+    while true
+        buf = UInt8[]
+        quoted = false
+        in_quotes = false
+        while pos < n
+            c = code[pos]
+            if c == UInt8('\\')
+                pos += 1
+                pos < n || invalid_composite()
+                push!(buf, code[pos])
+            elseif c == UInt8('"')
+                quoted = true
+                if in_quotes && pos + 1 < n && code[pos + 1] == UInt8('"')
                     push!(buf, c)
                     pos += 1
+                else
+                    in_quotes = !in_quotes
                 end
+            elseif !in_quotes && c == UInt8(',')
+                break
+            elseif !in_quotes && (c == UInt8('(') || c == UInt8(')'))
+                invalid_composite()
+            else
+                push!(buf, c)
             end
-            push!(fields, String(buf))
-        else
-            start = pos
-            while pos <= length(code)
-                c = code[pos]
-                if c == UInt8(',') || c == UInt8(')')
-                    break
-                end
-                pos += 1
-            end
-            token = String(code[start:pos - 1])
-            token == "" ? push!(fields, missing) : push!(fields, token)
+            pos += 1
         end
-        pos <= length(code) && code[pos] == UInt8(',') && (pos += 1)
-        pos <= length(code) && code[pos] == UInt8(')') && (pos += 1; break)
+        in_quotes && invalid_composite()
+        push!(fields, isempty(buf) && !quoted ? missing : String(buf))
+        pos == n && return fields
+        pos += 1 # comma; the next iteration also records a trailing NULL
     end
-    return fields
 end
 
 @inline function hexnibble(b::UInt8)
@@ -838,6 +853,12 @@ end
     return decode_bytea_escape(val)
 end
 
+function parse_boolean(val::String)
+    (val == "t" || val == "1") && return true
+    (val == "f" || val == "0") && return false
+    throw(PostgresInterfaceError("postgres value cannot be represented as Bool; select multi-bit bit(n) values as text"))
+end
+
 function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
     info = type_info(registry, typeId)
     if info.parser !== nothing
@@ -845,12 +866,11 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
     end
     T = info.julia_type
     if T == Bool
-        if typeId == 1560
-            return val == "1"
-        end
-        return val == "t"
+        return parse_boolean(val)
     elseif T == Char
         return pg_parse_char(val)
+    elseif T == PGTimestamp
+        return pg_parse_timestamp(val)
     elseif T == DateTime
         if typeId == 1184
             return parse_timestamptz(val)
@@ -858,8 +878,6 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
         return pg_parse_datetime(val)
     elseif T == UUID
         return UUID(val)
-    elseif T == Numeric
-        return parse_numeric(val)
     elseif T == Int16
         return Parsers.parse(Int16, val)
     elseif T == Int32
@@ -910,18 +928,50 @@ end
     return
 end
 
-# ── typed-struct materialization: parse by the declared field type ───────────
+# Typed fields can require a wider range than the default OID mapping. Defer
+# decoding until StructUtils supplies the declared field type. Other targets,
+# including Any and registered composites, retain the OID parser behavior.
+struct FieldValue
+    text::String
+    oid::Int
+    registry::Dict{Int, TypeInfo}
+end
+
+const WireFieldScalar = Union{Durations.Timestamp, DataDecimals.AbstractDecimal, DateTime}
+_wire_field(::Type{T}) where {T} = T <: Union{Missing, WireFieldScalar}
+_wire_field(::Type{<:AbstractVector{T}}) where {T} = T <: WireFieldScalar
+_field_source(::Type{T}, v::FieldValue) where {T} = _wire_field(T) ? v.text : parse_value(v.oid, v.text, v.registry)
+StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue) where {T} = StructUtils.make(st, T, _field_source(T, v))
+StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue, tags) where {T} = StructUtils.make(st, T, _field_source(T, v), tags)
+
 @static if isdefined(StructUtils, :InterpClosure) && isdefined(StructUtils, :HotStructClosure)
-    # Typed targets know each field type, so let their PostgresStyle lift parse
-    # the wire string directly. Untyped destinations keep the OID parser above.
     @inline function applycast(f::Union{StructUtils.InterpClosure, StructUtils.HotStructClosure}, name, typeId, val::String, registry::Dict{Int, TypeInfo})
-        f(name, val)
+        f(name, FieldValue(val, typeId, registry))
         return
     end
 end
 
+@static if isdefined(StructUtils, :StructClosure)
+    @inline function applycast(f::StructUtils.StructClosure, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+        f(name, FieldValue(val, typeId, registry))
+        return
+    end
+end
+
+@static if isdefined(StructUtils, :FieldSink)
+    @inline function applycast(f::StructUtils.FieldSink, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+        f(name, FieldValue(val, typeId, registry))
+        return
+    end
+end
+
+@inline function applycast(f::StructUtils.TupleClosure, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+    f(name, FieldValue(val, typeId, registry))
+    return
+end
+
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int8}, s::String) = Parsers.parse(Int8, s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = (s == "t" || s == "1"), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = parse_boolean(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Char}, s::String) = pg_parse_char(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int16}, s::String) = Parsers.parse(Int16, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int32}, s::String) = Parsers.parse(Int32, s), nothing
@@ -933,7 +983,6 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Date}, s::String) = pg_parse_da
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Time}, s::String) = pg_parse_time(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{DateTime}, s::String) = pg_parse_datetime_any(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{UUID}, s::String) = UUID(s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Numeric}, s::String) = parse_numeric(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{IntervalType}, s::String) = parse_interval(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{UInt8}}, s::String) = decode_bytea(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{JSONType}, s::String) = JSON.lazy(s), nothing
@@ -948,7 +997,6 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Date}}, s::String) = par
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Time}}, s::String) = parse_array(s, Time), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{DateTime}}, s::String) = parse_array(s, DateTime), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{UUID}}, s::String) = parse_array(s, UUID), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Numeric}}, s::String) = parse_array(s, Numeric), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Char}}, s::String) = parse_array(s, Char), nothing
 
 # For array-typed fields the generic `make` takes its arraylike branch (applyeach
@@ -957,3 +1005,10 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Char}}, s::String) = par
 # through the lifts above.
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, s::String) where {T <: AbstractVector} = StructUtils.lift(st, T, s)
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, s::String, tags) where {T <: AbstractVector} = StructUtils.lift(st, T, s)
+
+StructUtils.structlike(::AbstractPostgresStyle, ::Type{<:Durations.Timestamp}) = false
+StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, s::String) where {T<:Durations.Timestamp} = pg_parse_timestamp(s, T), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{T}}, s::String) where {T<:Durations.Timestamp} = parse_array(s, T), nothing
+
+StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, s::String) where {T<:DataDecimals.AbstractDecimal} = parse_decimal(T, s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{T}}, s::String) where {T<:DataDecimals.AbstractDecimal} = parse_array(s, T), nothing

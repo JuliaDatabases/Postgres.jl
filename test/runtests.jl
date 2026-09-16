@@ -1,6 +1,7 @@
 using Test
 using Aqua
 using Dates
+import Durations, DataDecimals
 using Distributed
 using UUIDs
 using DBInterface
@@ -48,7 +49,7 @@ StructUtils.@defaults struct TypeRow
     bool_col::Bool = false
     float4_col::Float32 = 0
     float8_col::Float64 = 0
-    numeric_col::Postgres.Numeric = Postgres.Numeric(BigInt(0), 0)
+    numeric_col::DataDecimals.DecimalValue{DataDecimals.Int256} = DataDecimals.DecimalValue{DataDecimals.Int256}(0, 0)
     text_col::String = ""
     varchar_col::String = ""
     bpchar_col::String = ""
@@ -482,7 +483,12 @@ function random_array_string(rng::AbstractRNG)
     return String(rand(rng, alphabet, rand(rng, 0:12)))
 end
 
+include("timestamps.jl")
+include("decimals.jl")
+
 @testset "Postgres" begin
+    test_timestamps()
+    test_decimals()
     Aqua.test_all(Postgres)
 
     @testset "Export Surface" begin
@@ -491,7 +497,7 @@ end
             # names() includes `public` declarations on Julia 1.11+
             public_names = Set([
                 :Connection, :ConnectionPool, :ConnectionParams, :PostgresInterfaceError,
-                :Error, :Notification, :Numeric, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
+                :Error, :Notification, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
                 :query_logging_enabled, :query_logger, :notice_callback, :notification_callback, :parse_dsn,
                 :transaction, Symbol("@transaction"), :start_transaction, :commit, :rollback, :in_transaction,
                 :cursor, :copy_from, :copy_to, :listen!, :unlisten!, :notify!, :wait_for_notification,
@@ -672,11 +678,11 @@ end
         @test string(Postgres.API.parse_numeric("123.4500")) == "123.4500"
         @test string(Postgres.API.parse_numeric("-0.00120")) == "-0.00120"
         @test string(Postgres.API.parse_numeric("1.23e3")) == "1230"
-        @test Postgres.API.parse_numeric("+42") == Postgres.Numeric(BigInt(42), 0)
+        @test Postgres.API.parse_numeric("+42") == DataDecimals.DecimalValue(42, 0)
         # numeric special values can't be represented and must fail clearly
-        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("NaN")
-        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("Infinity")
-        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("-Infinity")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("NaN", :error)
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("Infinity", :error)
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("-Infinity", :error)
         # an absurd exponent must be rejected, not turned into a huge BigInt
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e999999999999")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e99999999999999999999999999")
@@ -928,7 +934,57 @@ end
         end
     end
 
+    @testset "Seeded Protocol And DSN Fuzz" begin
+        rng = MersenneTwister(0xf022)
+        registry = Dict(Postgres.API.DEFAULT_TYPE_REGISTRY)
+        alphabet = collect("ab ,;'\"\\=(){}[]\t\nα🙂")
+        random_text() = String(rand(rng, alphabet, rand(rng, 0:80)))
+        quote_dsn(value) = "'" * replace(value, "\\" => "\\\\", "'" => "\\'") * "'"
+        for _ in 1:250
+            user, password, dbname = random_text(), random_text(), random_text()
+            params = Postgres.parse_dsn("user=$(quote_dsn(user)) password=$(quote_dsn(password)) dbname=$(quote_dsn(dbname))")
+            @test (params.user, params.password, params.dbname) == (user, password, dbname)
+
+            values = [rand(rng) < 0.2 ? nothing : random_text() for _ in 1:rand(rng, 0:12)]
+            names = [Symbol("c", i) for i in eachindex(values)]
+            types = fill(25, length(values))
+            io = IOBuffer()
+            write(io, hton(Int16(length(values))))
+            for value in values
+                if value === nothing
+                    write(io, hton(Int32(-1)))
+                else
+                    write(io, hton(Int32(sizeof(value))))
+                    write(io, value)
+                end
+            end
+            bytes = take!(io)
+            consume = function (body)
+                parsed = Any[]
+                row = Postgres.API.DataRow(body, names, types, registry)
+                StructUtils.applyeach(Postgres.PostgresStyle(), (key, value) -> push!(parsed, value), row)
+                return parsed
+            end
+            @test isequal(consume(bytes), values)
+            @test_throws Postgres.API.Error consume(bytes[1:rand(rng, 0:length(bytes)-1)])
+            @test_throws Postgres.API.Error consume(vcat(bytes, rand(rng, UInt8)))
+
+            wire_length = rand(rng, Int32)
+            header = IOBuffer()
+            write(header, UInt8('D'), hton(wire_length))
+            seekstart(header)
+            if 4 <= Int64(wire_length) <= Int64(Postgres.API.MAX_MESSAGE_LEN) + 4
+                @test Postgres.API.readheader(header) == (UInt8('D'), Int64(wire_length) - 4)
+            else
+                @test_throws Postgres.API.Error Postgres.API.readheader(header)
+                @test !isopen(header)
+            end
+        end
+    end
+
+    require_integration = get(ENV, "POSTGRES_REQUIRE_INTEGRATION", "false") == "true"
     if !docker_available()
+        require_integration && error("PostgreSQL integration tests require a running Linux Docker daemon")
         @info "Docker not available; skipping Postgres integration tests."
         @test true
     else
@@ -1172,8 +1228,107 @@ end
                     """)))
                     @test array_types_row.uuid_array == UUID[UUID("12345678-1234-5678-1234-567812345678")]
                     @test array_types_row.date_array == Date[Date(2024, 1, 28)]
-                    @test isequal(array_types_row.numeric_array, Union{Missing, Postgres.Numeric}[Postgres.API.parse_numeric("123.45"), missing])
+                    @test isequal(array_types_row.numeric_array, [Postgres.API.parse_numeric("123.45"), missing])
                     @test JSON.parse(only(array_types_row.jsonb_array))["a"] == 1
+                end
+
+                @testset "Binary Array Round Trips" begin
+                    rng = MersenneTwister(0xb17ea)
+                    stmt = DBInterface.prepare(conn, raw"SELECT $1::bytea[] AS value")
+                    try
+                        cases = Any[
+                            Vector{UInt8}[], [UInt8[]], [UInt8[0, 1, 255]],
+                            [collect(UInt8(0):UInt8(255))],
+                            [missing, UInt8[], nothing, UInt8[0x5c, 0x22]],
+                        ]
+                        for _ in 1:100
+                            push!(cases, [rand(rng) < 0.2 ? missing : rand(rng, UInt8, rand(rng, 0:80))
+                                          for _ in 1:rand(rng, 0:12)])
+                        end
+                        for values in cases
+                            expected = [v === nothing ? missing : v for v in values]
+                            @test isequal(only(DBInterface.execute(conn, raw"SELECT $1::bytea[] AS value", (values,))).value, expected)
+                            @test isequal(only(DBInterface.execute(stmt, (values,))).value, expected)
+                        end
+                    finally
+                        DBInterface.close!(stmt)
+                    end
+                end
+
+                @testset "Composite Round Trips" begin
+                    DBInterface.execute(conn, "CREATE TYPE fuzz_pair AS (a text, b text)")
+                    DBInterface.execute(conn, "CREATE TYPE fuzz_single AS (a text)")
+                    Postgres.register_composite!(conn, "fuzz_pair")
+                    Postgres.register_composite!(conn, "fuzz_single")
+                    rng = MersenneTwister(0xc0a905)
+                    alphabet = collect("ab ,(){}[]\"\\\t\nα🙂")
+                    cases = Any[("a\"b", "tail"), ("hello", missing), (missing, missing),
+                                ("", ""), (missing, ""), ("\\", "\"\"")]
+                    for _ in 1:200
+                        push!(cases, ntuple(_ -> rand(rng) < 0.2 ? missing :
+                            String(rand(rng, alphabet, rand(rng, 0:40))), 2))
+                    end
+                    try
+                        for values in cases
+                            expected = (a=values[1], b=values[2])
+                            row = only(DBInterface.execute(conn, raw"SELECT ROW($1::text, $2::text)::fuzz_pair AS value", values))
+                            @test isequal(row.value, expected)
+                            arr = only(DBInterface.execute(conn, raw"SELECT ARRAY[ROW($1::text, $2::text)::fuzz_pair, NULL] AS value", values))
+                            @test isequal(arr.value, [expected, missing])
+                        end
+                        @test ismissing(only(DBInterface.execute(conn, "SELECT ROW(NULL)::fuzz_single AS value")).value.a)
+                        @test only(DBInterface.execute(conn, "SELECT ROW('')::fuzz_single AS value")).value.a == ""
+                    finally
+                        DBInterface.execute(conn, "DROP TYPE fuzz_pair")
+                        DBInterface.execute(conn, "DROP TYPE fuzz_single")
+                    end
+                end
+
+                test_timestamp_roundtrips(conn)
+                test_decimal_roundtrips(conn)
+                test_numeric_policy_roundtrips(conn)
+
+                @testset "Microsecond Round Trips" begin
+                    rng = MersenneTwister(0x71ae)
+                    for us in [0, 1, 999, 1_001, 123_456, 999_999, rand(rng, 0:999_999, 100)...]
+                        expected = Time(12, 34, 56) + Microsecond(us)
+                        sql = raw"SELECT $1::time AS value"
+                        @test only(DBInterface.execute(conn, sql, (expected,))).value == expected
+                        typed = DBInterface.execute(conn, sql, (expected,), NamedTuple{(:value,), Tuple{Time}})
+                        @test typed.value == expected
+                        @test only(DBInterface.execute(conn, raw"SELECT $1::time[] AS value", ([expected],))).value == [expected]
+                        for sign in (-1, 1)
+                            text = string(sign * us, " microseconds")
+                            value = only(DBInterface.execute(conn, raw"SELECT $1::interval AS value", (text,))).value
+                            @test convert(Microsecond, value) == Microsecond(sign * us)
+                        end
+                    end
+                    # Timestamp also retains all six fractional digits.
+                    @test only(DBInterface.execute(conn, "SELECT '2024-01-02 03:04:05.123456'::timestamp AS value")).value == Durations.Timestamp{Microsecond}(2024, 1, 2, 3, 4, 5, 123, 456)
+                end
+
+                @testset "Boolean Conversion Does Not Lose Bits" begin
+                    rng = MersenneTwister(0xb175)
+                    for _ in 1:50
+                        bits = String(rand(rng, ['0', '1'], rand(rng, 2:128)))
+                        sql = "SELECT B'$bits' AS value"
+                        @test_throws Postgres.PostgresInterfaceError DBInterface.execute(conn, sql)
+                        @test_throws Postgres.PostgresInterfaceError DBInterface.execute(conn, sql, (), NamedTuple{(:value,), Tuple{Bool}})
+                        @test only(DBInterface.execute(conn, "SELECT B'$bits'::text AS value")).value == bits
+                    end
+                    for (literal, expected) in (("true", true), ("false", false), ("B'0'", false), ("B'1'", true))
+                        @test only(DBInterface.execute(conn, "SELECT $literal AS value")).value === expected
+                    end
+                    @test only(DBInterface.execute(conn, "SELECT 42 AS value")).value == 42
+                end
+
+                @testset "README Quick Start" begin
+                    text = read(joinpath(@__DIR__, "..", "README.md"), String)
+                    examples = collect(eachmatch(r"```julia\n(.*?)```"s, text))
+                    params = "Postgres.ConnectionParams(host=$(repr(cfg.host)), port=$(cfg.port), user=$(repr(cfg.user)), password=$(repr(cfg.password)), dbname=$(repr(cfg.dbname)), sslmode=\"disable\")"
+                    example = replace(examples[2].captures[1],
+                        "\"host=127.0.0.1;port=5432;user=postgres;password=postgres;dbname=postgres\"" => params)
+                    @test include_string(Module(:ReadmeQuickStart), example) == 1
                 end
 
                 @testset "Type Registry" begin
@@ -2449,6 +2604,7 @@ end
 
         @testset "SSL Certificate Fixture" begin
             if Sys.which("openssl") === nothing
+                require_integration && error("PostgreSQL certificate tests require the OpenSSL executable")
                 @info "OpenSSL executable not available; skipping certificate-backed SSL tests."
                 @test true
             else

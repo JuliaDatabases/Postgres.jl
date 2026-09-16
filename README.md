@@ -41,7 +41,7 @@ Connection options support:
 - `connect_timeout` (seconds) and `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
 
-See the [1.0 support policy](https://JuliaDatabases.github.io/Postgres.jl/dev/support/)
+See the [support policy](https://JuliaDatabases.github.io/Postgres.jl/dev/support/)
 for tested Julia and PostgreSQL versions, TLS limits, and transaction-pooler
 requirements.
 
@@ -191,9 +191,10 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 DBInterface.close!(conn)
 ```
 
-`Numeric` values are returned as `Postgres.Numeric`, `interval` values as `Dates.Period` or `Dates.CompoundPeriod`, and range types as `Postgres.PostgresRange{T}`.
+`numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with a warning and exact text fallback for values beyond its storage range), `interval` values as `Dates.Period` or `Dates.CompoundPeriod`, and range types as `Postgres.PostgresRange{T}`.
+Timestamps use `Durations.Timestamp{Dates.Microsecond}` and retain all six fractional digits.
 Custom enum, composite, and range registration controls result decoding. Those
-custom Julia values are not accepted as direct query parameters in 1.0; bind a
+custom Julia values are not accepted as direct query parameters; bind a
 PostgreSQL text representation with an explicit SQL cast instead.
 
 ## Query logging and driver styles
@@ -227,9 +228,14 @@ DBInterface.close!(pool)
 
 `Postgres.Error` represents server errors and includes SQLSTATE codes; `Postgres.PostgresInterfaceError` covers client-side failures. Use `Postgres.cancel_query!(conn)` to send a CancelRequest to the server.
 
-## Development disclosure
+## Testing and contributing
 
-The 1.0 release preparation used Claude Code and OpenAI Codex for implementation
-assistance and adversarial review. Maintainer decisions, source history, review
-discussion, and validation results are recorded in
-[pull request #5](https://github.com/JuliaDatabases/Postgres.jl/pull/5).
+Run `julia --project -e 'using Pkg; Pkg.test()'` from this repository.
+Database tests need a running Linux Docker daemon and OpenSSL on `PATH`.
+Set `POSTGRES_REQUIRE_INTEGRATION=true` to fail if those tests cannot run.
+Without Docker, the suite runs parser and API checks only.
+
+The suite includes seeded fuzz tests for connection strings, protocol framing,
+binary arrays, composite values, and temporal precision. For a bug report,
+include the Julia, Postgres.jl, and PostgreSQL versions and a small reproducer.
+Remove passwords, connection secrets, and private data first.

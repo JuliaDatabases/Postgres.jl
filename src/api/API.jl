@@ -3,7 +3,9 @@ module API
 using UUIDs, Dates, Reseau, SASLAuth, MD5, Parsers, StructUtils, JSON, Random
 import ..PostgresInterfaceError
 
-export PostgresStyle, AbstractPostgresStyle, query_logging_enabled, query_logger, notice_callback, notification_callback, Error, Notification, Numeric, PostgresRange, cancel_request
+import Durations, DataDecimals
+
+export PostgresStyle, AbstractPostgresStyle, query_logging_enabled, query_logger, notice_callback, notification_callback, Error, Notification, PostgresRange, cancel_request
 
 const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
 const SKIP_BUFFER_SIZE = 8192

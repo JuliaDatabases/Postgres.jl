@@ -261,6 +261,14 @@ Base.close(cursor::Cursor) = DBInterface.close!(cursor)
 
 _param(x::AbstractString)::String = String(x)
 _param(x)::String = string(x)
+function _param(x::Durations.Timestamp)::String
+    # PostgreSQL would round finer fractions. Require an exact conversion.
+    timestamp = x isa Durations.Timestamp{Dates.Nanosecond} ? convert(API.PGTimestamp, x) : x
+    Dates.year(timestamp) >= 1 || throw(PostgresInterfaceError("BC timestamp parameters are not supported"))
+    # Timestamp counts from the Unix epoch. Make that UTC meaning explicit
+    # for timestamptz; PostgreSQL ignores the zone for timestamp columns.
+    return string(timestamp, "Z")
+end
 _param(x::Missing) = x
 _param(::Nothing) = missing
 _param(x::AbstractVector{UInt8})::String = string("\\x", bytes2hex(x))
@@ -268,6 +276,9 @@ _param(x::AbstractVector{UInt8})::String = string("\\x", bytes2hex(x))
 # strings must be double-quoted and double quotes and backslashes escaped
 # missing values are NULL
 _aparam(x::AbstractString)::String = string("\"", replace(x, r"([\"\\])" => s"\\\1"), "\"")
+# bytea's text representation contains a backslash. Protect it from the
+# enclosing array parser before PostgreSQL's bytea parser consumes it.
+_aparam(x::AbstractVector{UInt8})::String = _aparam(_param(x))
 _aparam(::Missing)::String = "NULL"
 _aparam(::Nothing)::String = "NULL"
 _aparam(x)::String = _param(x)

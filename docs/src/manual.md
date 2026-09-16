@@ -1,6 +1,6 @@
 # Manual
 
-Postgres.jl intentionally keeps its export surface small: `using Postgres` re-exports `DBInterface`, while package-specific APIs are accessed through the `Postgres.` namespace.
+`using Postgres` re-exports `DBInterface`. Access package-specific APIs through the `Postgres.` namespace.
 
 ## Connecting
 
@@ -245,7 +245,8 @@ Postgres.jl maps common PostgreSQL types to Julia values:
 
 - integers, floats, booleans, text, UUIDs, dates, times, timestamps, and bytea map to their natural Julia types.
 - `json` and `jsonb` are returned as lazy JSON values from JSON.jl.
-- `numeric` maps to `Postgres.Numeric` to preserve decimal scale.
+- `numeric` maps to `DataDecimals.DecimalValue{DataDecimals.Int256}` to preserve the value and decimal scale. Values outside its signed 256-bit coefficient range return their original text with a warning.
+- `timestamp` and `timestamptz` map to `Durations.Timestamp{Dates.Microsecond}`.
 - `interval` maps to `Dates.Period` or `Dates.CompoundPeriod`.
 - arrays map to Julia arrays, preserving `missing` for SQL `NULL`.
 - PostgreSQL range types map to `Postgres.PostgresRange{T}`.
@@ -263,7 +264,7 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 Registering composite and range types follows the same pattern.
 
 Registration controls result decoding. Direct parameter binding for registered
-enum, composite, and range Julia values is not part of the 1.0 interface. Bind
+enum, composite, and range Julia values is not supported. Bind
 their PostgreSQL text representation and add an explicit SQL cast when needed.
 
 ### Session Formats
@@ -279,7 +280,60 @@ mid-session breaks decoding — intervals and unparseable dates raise errors
 rather than silently returning wrong values.
 
 Transaction-mode poolers cannot preserve session settings between logical
-connections. See the [1.0 Support Policy](@ref) before using this mode.
+connections. See the [Support Policy](@ref) before using this mode.
+
+### Precision And Bit Strings
+
+`time`, `interval`, `timestamp`, and `timestamptz` values retain microseconds.
+Timestamps use `Durations.Timestamp{Dates.Microsecond}`. `timestamptz` values
+are normalized to UTC. Select a timestamp as `::text` to retain its
+server-rendered timezone offset. Values outside the Unix-epoch `Int64`
+microsecond range raise an error; its upper limit falls in year 294247,
+before PostgreSQL's upper limit in year 294276. Read those values as text,
+request `Timestamp{Second}` or `Timestamp{Millisecond}` in a typed result, or
+register a custom parser.
+
+Typed results can request another `Durations.Timestamp{P}` resolution.
+Conversion must be exact and in range. Explicit `DateTime` fields truncate to
+milliseconds. Timestamp parameters carry an explicit UTC marker, including in non-UTC sessions. Parameters finer than a
+microsecond raise `InexactError` rather than letting PostgreSQL round.
+
+Typed numeric fields can use `DataDecimals.Decimal{P,S}` or
+`DataDecimals.DecimalValue{T}`. Conversion preserves the exact value or throws;
+it does not round to the target scale. Both decimal types support scalar and
+array parameters. Explicit decimal fields always throw if conversion cannot be exact.
+
+For untyped numeric results, `numeric_overflow=:warn` (the default) returns
+values that cannot fit `DecimalValue{Int256}` as their original text and emits a
+warning. The fallback preserves every digit and trailing zero. It also applies
+to numeric array elements, range bounds, and the special values `NaN`, `Infinity`,
+and `-Infinity`. Such results can therefore contain decimals and strings.
+
+Use `numeric_overflow=:error` to reject these values. Set it on
+`ConnectionParams`, `Connection`, `DBInterface.connect`, or `ConnectionPool`.
+For a DSN, use `numeric_overflow=error`. To read large values without a warning,
+select them as SQL `text` or register a custom numeric parser.
+
+```julia
+params = Postgres.ConnectionParams(host="localhost", dbname="postgres",
+                                   numeric_overflow=:error)
+```
+
+```julia
+using Dates, Durations, DataDecimals
+
+struct Measurement
+    recorded_at::Durations.Timestamp{Microsecond}
+    value::DataDecimals.Decimal64{4}
+end
+
+measurement = DBInterface.execute(conn,
+    "SELECT '2024-01-02 03:04:05.123456'::timestamp AS recorded_at, 12.3400::numeric AS value",
+    (), Measurement)
+```
+
+`boolean` and `bit(1)` map to `Bool`. Read wider `bit(n)` values as `::text`;
+decoding them as `Bool` raises `Postgres.PostgresInterfaceError`.
 
 ### Values Without A Julia Representation
 
