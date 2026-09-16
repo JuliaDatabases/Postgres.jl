@@ -30,7 +30,7 @@ Durations = "1.2.0"
 Harbor = "1"
 JSON = "1"
 MD5 = "0.2"
-Parsers = "2.5.4"
+Parsers = "2.7"
 Random = "1.10"
 # Reseau 1.4.1-1.4.3 withhold valid client certificates when the server
 # lists acceptable CAs. Reopen the upper bound after the upstream repair.
