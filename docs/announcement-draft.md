@@ -45,6 +45,6 @@ Implementation and review used Claude Code and OpenAI Codex. The repository reco
 
 [Documentation](https://JuliaDatabases.github.io/Postgres.jl/dev/) · [Source](https://github.com/JuliaDatabases/Postgres.jl)
 
-<!-- Maintainer: publish after the hardening PR is merged, a patch release is
+<!-- Maintainer: publish after the hardening PR is merged, a release with these changes is
 registered, and a clean install of that release passes this example. Recheck
 links and the support policy against the released version before posting. -->

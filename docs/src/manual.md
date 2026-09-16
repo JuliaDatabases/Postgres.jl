@@ -289,13 +289,15 @@ Timestamps use `Durations.Timestamp{Dates.Microsecond}`. `timestamptz` values
 are normalized to UTC. Select a timestamp as `::text` to retain its
 server-rendered timezone offset. Values outside the Unix-epoch `Int64`
 microsecond range raise an error; its upper limit falls in year 294247,
-before PostgreSQL's upper limit in year 294276. Read those values as text, request `Timestamp{Second}` or
-`Timestamp{Millisecond}` in a typed result, or register a custom parser.
+before PostgreSQL's upper limit in year 294276. Read those values as text,
+request `Timestamp{Second}` or `Timestamp{Millisecond}` in a typed result, or
+register a custom parser.
 
 Typed results can request another `Durations.Timestamp{P}` resolution.
 Conversion must be exact and in range. Explicit `DateTime` fields keep the
-legacy behavior of truncating to milliseconds. Timestamp parameters carry an explicit UTC marker, including in non-UTC
-sessions. Parameters finer than a microsecond raise `InexactError` rather than letting PostgreSQL round.
+legacy behavior of truncating to milliseconds. Timestamp parameters carry an
+explicit UTC marker, including in non-UTC sessions. Parameters finer than a
+microsecond raise `InexactError` rather than letting PostgreSQL round.
 
 Typed numeric fields can use `DataDecimals.Decimal{P,S}` or
 `DataDecimals.DecimalValue{T}`. Conversion preserves the exact value or throws;
