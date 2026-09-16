@@ -928,6 +928,54 @@ end
         end
     end
 
+    @testset "Seeded Protocol And DSN Fuzz" begin
+        rng = MersenneTwister(0xf022)
+        registry = Dict(Postgres.API.DEFAULT_TYPE_REGISTRY)
+        alphabet = collect("ab ,;'\"\\=(){}[]\t\nα🙂")
+        random_text() = String(rand(rng, alphabet, rand(rng, 0:80)))
+        quote_dsn(value) = "'" * replace(value, "\\" => "\\\\", "'" => "\\'") * "'"
+        for _ in 1:250
+            user, password, dbname = random_text(), random_text(), random_text()
+            params = Postgres.parse_dsn("user=$(quote_dsn(user)) password=$(quote_dsn(password)) dbname=$(quote_dsn(dbname))")
+            @test (params.user, params.password, params.dbname) == (user, password, dbname)
+
+            values = [rand(rng) < 0.2 ? nothing : random_text() for _ in 1:rand(rng, 0:12)]
+            names = [Symbol("c", i) for i in eachindex(values)]
+            types = fill(25, length(values))
+            io = IOBuffer()
+            write(io, hton(Int16(length(values))))
+            for value in values
+                if value === nothing
+                    write(io, hton(Int32(-1)))
+                else
+                    write(io, hton(Int32(sizeof(value))))
+                    write(io, value)
+                end
+            end
+            bytes = take!(io)
+            consume = function (body)
+                parsed = Any[]
+                row = Postgres.API.DataRow(body, names, types, registry)
+                StructUtils.applyeach(Postgres.PostgresStyle(), (key, value) -> push!(parsed, value), row)
+                return parsed
+            end
+            @test isequal(consume(bytes), values)
+            @test_throws Postgres.API.Error consume(bytes[1:rand(rng, 0:length(bytes)-1)])
+            @test_throws Postgres.API.Error consume(vcat(bytes, rand(rng, UInt8)))
+
+            wire_length = rand(rng, Int32)
+            header = IOBuffer()
+            write(header, UInt8('D'), hton(wire_length))
+            seekstart(header)
+            if 4 <= Int64(wire_length) <= Int64(Postgres.API.MAX_MESSAGE_LEN) + 4
+                @test Postgres.API.readheader(header) == (UInt8('D'), Int64(wire_length) - 4)
+            else
+                @test_throws Postgres.API.Error Postgres.API.readheader(header)
+                @test !isopen(header)
+            end
+        end
+    end
+
     if !docker_available()
         @info "Docker not available; skipping Postgres integration tests."
         @test true
