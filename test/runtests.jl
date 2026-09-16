@@ -1199,6 +1199,35 @@ end
                     end
                 end
 
+                @testset "Composite Round Trips" begin
+                    DBInterface.execute(conn, "CREATE TYPE fuzz_pair AS (a text, b text)")
+                    DBInterface.execute(conn, "CREATE TYPE fuzz_single AS (a text)")
+                    Postgres.register_composite!(conn, "fuzz_pair")
+                    Postgres.register_composite!(conn, "fuzz_single")
+                    rng = MersenneTwister(0xc0a905)
+                    alphabet = collect("ab ,(){}[]\"\\\t\nα🙂")
+                    cases = Any[("a\"b", "tail"), ("hello", missing), (missing, missing),
+                                ("", ""), (missing, ""), ("\\", "\"\"")]
+                    for _ in 1:200
+                        push!(cases, ntuple(_ -> rand(rng) < 0.2 ? missing :
+                            String(rand(rng, alphabet, rand(rng, 0:40))), 2))
+                    end
+                    try
+                        for values in cases
+                            expected = (a=values[1], b=values[2])
+                            row = only(DBInterface.execute(conn, raw"SELECT ROW($1::text, $2::text)::fuzz_pair AS value", values))
+                            @test isequal(row.value, expected)
+                            arr = only(DBInterface.execute(conn, raw"SELECT ARRAY[ROW($1::text, $2::text)::fuzz_pair, NULL] AS value", values))
+                            @test isequal(arr.value, [expected, missing])
+                        end
+                        @test ismissing(only(DBInterface.execute(conn, "SELECT ROW(NULL)::fuzz_single AS value")).value.a)
+                        @test only(DBInterface.execute(conn, "SELECT ROW('')::fuzz_single AS value")).value.a == ""
+                    finally
+                        DBInterface.execute(conn, "DROP TYPE fuzz_pair")
+                        DBInterface.execute(conn, "DROP TYPE fuzz_single")
+                    end
+                end
+
                 @testset "Type Registry" begin
                     DBInterface.execute(conn, "DROP TABLE IF EXISTS custom_types")
                     DBInterface.execute(conn, "DROP TYPE IF EXISTS mood")

@@ -715,54 +715,48 @@ function parse_array_by_oid(val::String, typeId::Int, registry::Dict{Int, TypeIn
     return parse_array_scalar(typeId, registry, parsed)
 end
 
+@noinline invalid_composite() = throw(PostgresInterfaceError("invalid postgres composite value"))
+
 function parse_composite_fields(val::String)
     code = codeunits(val)
-    pos = 1
+    n = length(code)
+    (n >= 2 && code[1] == UInt8('(') && code[n] == UInt8(')')) || invalid_composite()
+    pos = 2
     fields = Vector{Union{String, Missing}}()
-    if pos <= length(code) && code[pos] == UInt8('(')
-        pos += 1
-    end
-    while pos <= length(code)
-        pos > length(code) && break
-        if code[pos] == UInt8(')')
-            pos += 1
-            break
-        end
-        if code[pos] == UInt8('"')
-            pos += 1
-            buf = UInt8[]
-            while pos <= length(code)
-                c = code[pos]
-                if c == UInt8('\\')
-                    pos += 1
-                    pos <= length(code) || break
-                    push!(buf, code[pos])
-                    pos += 1
-                elseif c == UInt8('"')
-                    pos += 1
-                    break
-                else
+    # Even "()" contains one NULL field. The registered field count resolves
+    # the otherwise ambiguous zero-column composite representation.
+    while true
+        buf = UInt8[]
+        quoted = false
+        in_quotes = false
+        while pos < n
+            c = code[pos]
+            if c == UInt8('\\')
+                pos += 1
+                pos < n || invalid_composite()
+                push!(buf, code[pos])
+            elseif c == UInt8('"')
+                quoted = true
+                if in_quotes && pos + 1 < n && code[pos + 1] == UInt8('"')
                     push!(buf, c)
                     pos += 1
+                else
+                    in_quotes = !in_quotes
                 end
+            elseif !in_quotes && c == UInt8(',')
+                break
+            elseif !in_quotes && (c == UInt8('(') || c == UInt8(')'))
+                invalid_composite()
+            else
+                push!(buf, c)
             end
-            push!(fields, String(buf))
-        else
-            start = pos
-            while pos <= length(code)
-                c = code[pos]
-                if c == UInt8(',') || c == UInt8(')')
-                    break
-                end
-                pos += 1
-            end
-            token = String(code[start:pos - 1])
-            token == "" ? push!(fields, missing) : push!(fields, token)
+            pos += 1
         end
-        pos <= length(code) && code[pos] == UInt8(',') && (pos += 1)
-        pos <= length(code) && code[pos] == UInt8(')') && (pos += 1; break)
+        in_quotes && invalid_composite()
+        push!(fields, isempty(buf) && !quoted ? missing : String(buf))
+        pos == n && return fields
+        pos += 1 # comma; the next iteration also records a trailing NULL
     end
-    return fields
 end
 
 @inline function hexnibble(b::UInt8)
