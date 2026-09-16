@@ -43,10 +43,15 @@ jobs:
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
+      # One complete database run is the coverage source. Platform-only runs
+      # can omit Docker and must not become a partial coverage baseline.
       - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.os == 'ubuntu-latest' && matrix.version == '1'
       - uses: codecov/codecov-action@v6
+        if: matrix.os == 'ubuntu-latest' && matrix.version == '1'
         with:
           files: lcov.info
+          fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
   auth-modes:
