@@ -30,7 +30,7 @@ Durations = "1.2.0"
 Harbor = "1"
 JSON = "1"
 MD5 = "0.2"
-Parsers = "2.7"
+Parsers = "2.7, 3"
 Random = "1.10"
 # Reseau 1.4.4 repairs client-certificate authority matching.
 Reseau = "1.4.4"
