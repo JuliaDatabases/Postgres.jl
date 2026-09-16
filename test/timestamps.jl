@@ -16,7 +16,7 @@ function test_timestamps()
         @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_timestamp("294276-12-31 23:59:59.999999")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_timestamp(string(typemax(MicroTimestamp), "-00:00:01"))
         @test_throws InexactError Postgres._param(Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1))
-        @test Postgres._param(Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1000)) == "1970-01-01T00:00:00.000001"
+        @test Postgres._param(Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1000)) == "1970-01-01T00:00:00.000001Z"
         @test_throws Postgres.PostgresInterfaceError Postgres._param(MicroTimestamp(0))
         @test_throws InexactError StructUtils.lift(Postgres.PostgresStyle(), Durations.Timestamp{Millisecond}, "1970-01-01 00:00:00.000001")
         # Explicit DateTime targets retain their historical millisecond floor.
@@ -26,6 +26,15 @@ function test_timestamps()
 end
 
 function test_timestamp_roundtrips(conn)
+    DBInterface.execute(conn, "SET TimeZone = 'Asia/Kolkata'")
+    try
+        _test_timestamp_roundtrips(conn)
+    finally
+        DBInterface.execute(conn, "RESET TimeZone")
+    end
+end
+
+function _test_timestamp_roundtrips(conn)
     @testset "Timestamp server round trips" begin
         rng = MersenneTwister(0x7157a)
         for ticks in [Int64(-1), 0, 1, rand(rng, -62_135_596_800_000_000:253_402_300_799_999_999, 100)...]
@@ -42,6 +51,8 @@ function test_timestamp_roundtrips(conn)
         end
         @test only(DBInterface.execute(conn, raw"SELECT $1::timestamp AS value", (typemax(MicroTimestamp),))).value === typemax(MicroTimestamp)
         @test_throws InexactError DBInterface.execute(conn, raw"SELECT $1::timestamp AS value", (Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1),))
+        value = MicroTimestamp(2024, 1, 2, 3, 4, 5, 123, 456)
+        @test DBInterface.execute(conn, raw"SELECT $1::timestamptz[] AS value", ([value],), NamedTuple{(:value,), Tuple{Vector{MicroTimestamp}}}).value == [value]
         @test only(DBInterface.execute(conn, "SELECT 1 AS value")).value == 1
     end
 end
