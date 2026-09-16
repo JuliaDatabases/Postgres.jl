@@ -60,10 +60,11 @@ error. Read those values as text, request a wider-range Timestamp resolution in
 a typed result, or use a custom parser. Explicit typed `DateTime` fields
 truncate to milliseconds. Timestamp parameters with submicrosecond precision raise an error.
 
-`numeric` uses `DataDecimals.DecimalValue{DataDecimals.Int256}`. Larger
-coefficients use `Postgres.Numeric`, preserving every digit and the scale.
-Typed `DataDecimals.Decimal{P,S}` results require an exact conversion; excess
-precision raises an error. Numeric `NaN` and infinities are not supported.
+`numeric` uses `DataDecimals.DecimalValue{DataDecimals.Int256}`. Values that
+cannot fit exactly, including `NaN` and infinities, return their original text
+with a warning. Set `numeric_overflow=:error` to throw instead. This policy also
+applies to numeric array elements and range bounds. Explicitly typed decimal
+results always require an exact conversion; excess precision raises an error.
 
 `boolean` and `bit(1)` decode to `Bool`. Wider `bit(n)` values cannot be
 represented as a Boolean and raise an error. Select them as text, for example

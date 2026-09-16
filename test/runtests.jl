@@ -497,7 +497,7 @@ include("decimals.jl")
             # names() includes `public` declarations on Julia 1.11+
             public_names = Set([
                 :Connection, :ConnectionPool, :ConnectionParams, :PostgresInterfaceError,
-                :Error, :Notification, :Numeric, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
+                :Error, :Notification, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
                 :query_logging_enabled, :query_logger, :notice_callback, :notification_callback, :parse_dsn,
                 :transaction, Symbol("@transaction"), :start_transaction, :commit, :rollback, :in_transaction,
                 :cursor, :copy_from, :copy_to, :listen!, :unlisten!, :notify!, :wait_for_notification,
@@ -680,9 +680,9 @@ include("decimals.jl")
         @test string(Postgres.API.parse_numeric("1.23e3")) == "1230"
         @test Postgres.API.parse_numeric("+42") == DataDecimals.DecimalValue(42, 0)
         # numeric special values can't be represented and must fail clearly
-        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("NaN")
-        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("Infinity")
-        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("-Infinity")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("NaN", :error)
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("Infinity", :error)
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("-Infinity", :error)
         # an absurd exponent must be rejected, not turned into a huge BigInt
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e999999999999")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e99999999999999999999999999")
@@ -1286,6 +1286,7 @@ include("decimals.jl")
 
                 test_timestamp_roundtrips(conn)
                 test_decimal_roundtrips(conn)
+                test_numeric_policy_roundtrips(conn)
 
                 @testset "Microsecond Round Trips" begin
                     rng = MersenneTwister(0x71ae)

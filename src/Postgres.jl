@@ -73,6 +73,9 @@ Supported keyword arguments. All are also available as DSN/URI options except
   statements (default 100; `0` disables)
 - `reconnect`: automatically reconnect and re-prepare statements if the
   connection is found dead (default `false`; never reconnects mid-transaction)
+- `numeric_overflow`: `:warn` returns numerics that cannot fit `DecimalValue{Int256}`
+  as text with a warning; `:error` throws. Typed decimal results always require an
+  exact conversion. This also applies to numeric array elements and range bounds.
 - `style`: a custom [`AbstractPostgresStyle`](@ref Postgres.API.AbstractPostgresStyle)
   for query logging / notice / notification behavior
 - `debug`: log wire protocol messages. Authentication messages are redacted,
@@ -131,7 +134,8 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
     # commit/rollback must not COMMIT/ROLLBACK the caller's work
     owns_base_transaction::Bool
 
-    function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, style::API.AbstractPostgresStyle=PostgresStyle())
+    function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
+        numeric_overflow in (:warn, :error) || throw(ArgumentError("numeric_overflow must be :warn or :error"))
         host = String(host)
         user = String(user)
         dbname = String(dbname)
@@ -157,6 +161,7 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         maxsize = max(0, Int(statement_cache_maxsize))
         socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
+        registry[1700] = API.TypeInfo(API.NumericValue, (val, registry) -> API.parse_numeric(val, numeric_overflow))
         return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, String[], 1, false, true)
     end
 end
@@ -783,17 +788,17 @@ function checkconn(conn::Connection)
     return
 end
 
-function DBInterface.connect(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, style::API.AbstractPostgresStyle=PostgresStyle())
-    Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, style=style)
+function DBInterface.connect(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
+    Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, style=style)
 end
 
-function DBInterface.connect(::Type{Connection}, dsn::String; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
-    return DBInterface.connect(Connection, parse_dsn(dsn); debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, style=style)
+function DBInterface.connect(::Type{Connection}, dsn::String; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, numeric_overflow::Union{Symbol, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
+    return DBInterface.connect(Connection, parse_dsn(dsn); debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, style=style)
 end
 
-function DBInterface.connect(::Type{Connection}, params::ConnectionParams; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
+function DBInterface.connect(::Type{Connection}, params::ConnectionParams; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, numeric_overflow::Union{Symbol, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
     actual_maxsize = isnothing(statement_cache_maxsize) ? params.statement_cache_maxsize : statement_cache_maxsize
-    Connection(host=params.host, user=params.user, password=params.password, dbname=params.dbname, port=params.port, debug=something(debug, params.debug), reconnect=something(reconnect, params.reconnect), application_name=params.application_name, connect_timeout=params.connect_timeout, sslmode=params.sslmode, sslrootcert=params.sslrootcert, sslcert=params.sslcert, sslkey=params.sslkey, sslcapath=params.sslcapath, sslservername=params.sslservername, statement_timeout=params.statement_timeout, statement_cache_maxsize=actual_maxsize, style=style)
+    Connection(host=params.host, user=params.user, password=params.password, dbname=params.dbname, port=params.port, debug=something(debug, params.debug), reconnect=something(reconnect, params.reconnect), application_name=params.application_name, connect_timeout=params.connect_timeout, sslmode=params.sslmode, sslrootcert=params.sslrootcert, sslcert=params.sslcert, sslkey=params.sslkey, sslcapath=params.sslcapath, sslservername=params.sslservername, statement_timeout=params.statement_timeout, statement_cache_maxsize=actual_maxsize, numeric_overflow=something(numeric_overflow, params.numeric_overflow), style=style)
 end
 
 function DBInterface.connect(f::Function, ::Type{Connection}, args...; kwargs...)
@@ -847,17 +852,17 @@ end
 
 Base.isopen(pool::ConnectionPool) = !pool.closed[]
 
-function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
-    connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, style=style)
+function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
+    connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, style=style)
     return ConnectionPool(connector; limit=limit)
 end
 
-function ConnectionPool(dsn::String; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
-    return ConnectionPool(parse_dsn(dsn); debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, limit=limit, style=style)
+function ConnectionPool(dsn::String; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, limit::Integer=10, numeric_overflow::Union{Symbol, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
+    return ConnectionPool(parse_dsn(dsn); debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, limit=limit, style=style)
 end
 
-function ConnectionPool(params::ConnectionParams; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
-    connector = () -> DBInterface.connect(Connection, params; debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, style=style)
+function ConnectionPool(params::ConnectionParams; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, limit::Integer=10, numeric_overflow::Union{Symbol, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
+    connector = () -> DBInterface.connect(Connection, params; debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, style=style)
     return ConnectionPool(connector; limit=limit)
 end
 
@@ -1387,7 +1392,7 @@ end
 @static if VERSION >= v"1.11"
     eval(Meta.parse(
         "public Connection, ConnectionPool, ConnectionParams, PostgresInterfaceError, " *
-        "Error, Notification, Numeric, PostgresRange, AbstractPostgresStyle, PostgresStyle, " *
+        "Error, Notification, PostgresRange, AbstractPostgresStyle, PostgresStyle, " *
         "query_logging_enabled, query_logger, notice_callback, notification_callback, parse_dsn, " *
         "transaction, @transaction, start_transaction, commit, rollback, in_transaction, " *
         "cursor, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, " *

@@ -191,7 +191,7 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 DBInterface.close!(conn)
 ```
 
-`numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with `Postgres.Numeric` for values beyond its storage range), `interval` values as `Dates.Period` or `Dates.CompoundPeriod`, and range types as `Postgres.PostgresRange{T}`.
+`numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with a warning and exact text fallback for values beyond its storage range), `interval` values as `Dates.Period` or `Dates.CompoundPeriod`, and range types as `Postgres.PostgresRange{T}`.
 Timestamps use `Durations.Timestamp{Dates.Microsecond}` and retain all six fractional digits.
 Custom enum, composite, and range registration controls result decoding. Those
 custom Julia values are not accepted as direct query parameters; bind a

@@ -245,7 +245,7 @@ Postgres.jl maps common PostgreSQL types to Julia values:
 
 - integers, floats, booleans, text, UUIDs, dates, times, timestamps, and bytea map to their natural Julia types.
 - `json` and `jsonb` are returned as lazy JSON values from JSON.jl.
-- `numeric` maps to `DataDecimals.DecimalValue{DataDecimals.Int256}` to preserve the value and decimal scale. Values outside its signed 256-bit coefficient range use the exact `Postgres.Numeric` fallback.
+- `numeric` maps to `DataDecimals.DecimalValue{DataDecimals.Int256}` to preserve the value and decimal scale. Values outside its signed 256-bit coefficient range return their original text with a warning.
 - `timestamp` and `timestamptz` map to `Durations.Timestamp{Dates.Microsecond}`.
 - `interval` maps to `Dates.Period` or `Dates.CompoundPeriod`.
 - arrays map to Julia arrays, preserving `missing` for SQL `NULL`.
@@ -301,7 +301,23 @@ microsecond raise `InexactError` rather than letting PostgreSQL round.
 Typed numeric fields can use `DataDecimals.Decimal{P,S}` or
 `DataDecimals.DecimalValue{T}`. Conversion preserves the exact value or throws;
 it does not round to the target scale. Both decimal types support scalar and
-array parameters. Typed results can also use `Postgres.Numeric` fields.
+array parameters. Explicit decimal fields always throw if conversion cannot be exact.
+
+For untyped numeric results, `numeric_overflow=:warn` (the default) returns
+values that cannot fit `DecimalValue{Int256}` as their original text and emits a
+warning. The fallback preserves every digit and trailing zero. It also applies
+to numeric array elements, range bounds, and the special values `NaN`, `Infinity`,
+and `-Infinity`. Such results can therefore contain decimals and strings.
+
+Use `numeric_overflow=:error` to reject these values. Set it on
+`ConnectionParams`, `Connection`, `DBInterface.connect`, or `ConnectionPool`.
+For a DSN, use `numeric_overflow=error`. To read large values without a warning,
+select them as SQL `text` or register a custom numeric parser.
+
+```julia
+params = Postgres.ConnectionParams(host="localhost", dbname="postgres",
+                                   numeric_overflow=:error)
+```
 
 ```julia
 using Dates, Durations, DataDecimals

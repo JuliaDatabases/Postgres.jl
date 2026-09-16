@@ -162,7 +162,7 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 DBInterface.close!(conn)
 ```
 
-`numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with `Postgres.Numeric` for values beyond its storage range), `interval` values use `Dates.Period` or `Dates.CompoundPeriod`, and range types use `Postgres.PostgresRange{T}`.
+`numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with a warning and exact text fallback for values beyond its storage range), `interval` values use `Dates.Period` or `Dates.CompoundPeriod`, and range types use `Postgres.PostgresRange{T}`.
 Timestamps use `Durations.Timestamp{Dates.Microsecond}` and retain all six fractional digits.
 
 ## Query logging
@@ -205,7 +205,6 @@ Modules = [Postgres]
 ```@docs
 Postgres.Error
 Postgres.Notification
-Postgres.Numeric
 Postgres.PostgresRange
 Postgres.ConnectionParams
 Postgres.parse_dsn

@@ -15,7 +15,9 @@ Also produced by `Postgres.parse_dsn`. Supported keyword
 arguments mirror the connection keywords: `application_name`,
 `connect_timeout`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`,
 `sslservername`, `statement_timeout`, `statement_cache_maxsize`, `debug`, and
-`reconnect`.
+`reconnect`. `numeric_overflow` accepts `:warn` (return out-of-range numeric
+values as text with a warning) or `:error` (throw). DSN strings use `warn` or
+`error` without the colon.
 """
 struct ConnectionParams
     host::String
@@ -35,10 +37,12 @@ struct ConnectionParams
     statement_cache_maxsize::Int
     debug::Bool
     reconnect::Bool
+    numeric_overflow::Symbol
 end
 
-function ConnectionParams(; host::String="localhost", port::Int=5432, user::String="", password::Union{String, Nothing}=nothing, dbname::String="", application_name::Union{String, Nothing}=nothing, connect_timeout::Union{Int, Nothing}=nothing, sslmode::Union{String, Nothing}=nothing, sslrootcert::Union{String, Nothing}=nothing, sslcert::Union{String, Nothing}=nothing, sslkey::Union{String, Nothing}=nothing, sslcapath::Union{String, Nothing}=nothing, sslservername::Union{String, Nothing}=nothing, statement_timeout::Union{Int, Nothing}=nothing, statement_cache_maxsize::Int=100, debug::Bool=false, reconnect::Bool=false)
-    return ConnectionParams(host, port, user, password, dbname, application_name, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, sslservername, statement_timeout, statement_cache_maxsize, debug, reconnect)
+function ConnectionParams(; host::String="localhost", port::Int=5432, user::String="", password::Union{String, Nothing}=nothing, dbname::String="", application_name::Union{String, Nothing}=nothing, connect_timeout::Union{Int, Nothing}=nothing, sslmode::Union{String, Nothing}=nothing, sslrootcert::Union{String, Nothing}=nothing, sslcert::Union{String, Nothing}=nothing, sslkey::Union{String, Nothing}=nothing, sslcapath::Union{String, Nothing}=nothing, sslservername::Union{String, Nothing}=nothing, statement_timeout::Union{Int, Nothing}=nothing, statement_cache_maxsize::Int=100, debug::Bool=false, reconnect::Bool=false, numeric_overflow::Symbol=:warn)
+    numeric_overflow in (:warn, :error) || throw(ArgumentError("numeric_overflow must be :warn or :error"))
+    return ConnectionParams(host, port, user, password, dbname, application_name, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, sslservername, statement_timeout, statement_cache_maxsize, debug, reconnect, numeric_overflow)
 end
 
 function Base.show(io::IO, params::ConnectionParams)
@@ -91,7 +95,7 @@ const KNOWN_PARAMS = Set([
     "host", "port", "user", "password", "dbname", "application_name",
     "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey",
     "sslcapath", "sslservername", "statement_timeout",
-    "statement_cache_maxsize", "debug", "reconnect",
+    "statement_cache_maxsize", "debug", "reconnect", "numeric_overflow",
 ])
 
 # libpq keywords this driver doesn't implement. They are accepted and ignored
@@ -191,6 +195,7 @@ function params_from_values(values::Dict{String, String})
         statement_timeout=parse_optional_int(get(merged, "statement_timeout", nothing), "statement_timeout"),
         statement_cache_maxsize=something(parse_optional_int(get(merged, "statement_cache_maxsize", nothing), "statement_cache_maxsize"), 100),
         debug=parse_bool_param(get(merged, "debug", nothing), false, "debug"),
+        numeric_overflow=Symbol(get(merged, "numeric_overflow", "warn")),
         reconnect=parse_bool_param(get(merged, "reconnect", nothing), false, "reconnect"),
     )
 end

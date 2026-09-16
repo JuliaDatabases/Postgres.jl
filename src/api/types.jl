@@ -20,8 +20,7 @@ database.
 Custom styles inherit the default row-materialization traits (lift/structlike/...),
 which dispatch on `AbstractPostgresStyle`, and are used as the StructUtils style when
 materializing query results — so `StructUtils.lift` overloads on a custom style apply
-to row values too. Static dispatch on the style (rather than `Function`-typed callback
-fields) also keeps the driver compilable under `juliac --trim`.
+to row values too.
 """
 abstract type AbstractPostgresStyle <: StructUtils.StructStyle end
 
@@ -87,30 +86,10 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, x::T) where {T<:JSON.LazyVa
 StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, x::T, tags) where {T<:JSON.LazyValue} = x, nothing
 
 
-"""
-    Postgres.Numeric
-
-Exact fallback for PostgreSQL `numeric`/`decimal` values that exceed
-`DataDecimals.DecimalValue{DataDecimals.Int256}` storage:
-`coeff * 10^-scale`, where `coeff` is a `BigInt` and `scale` the number of
-digits after the decimal point. Preserves the value and scale exactly (no
-floating-point rounding). `print`/`string` produce the decimal text form.
-
-The PostgreSQL special values `NaN`, `Infinity`, and `-Infinity` cannot be
-represented and throw an error when encountered.
-"""
-struct Numeric
-    coeff::BigInt
-    scale::Int
-end
-StructUtils.structlike(::AbstractPostgresStyle, ::Type{Numeric}) = false
-
 const PGDecimal = DataDecimals.DecimalValue{DataDecimals.Int256}
-const NumericValue = Union{PGDecimal, Numeric}
+const NumericValue = Union{PGDecimal, String}
 const MIN_DECIMAL_COEFFICIENT = BigInt(typemin(DataDecimals.Int256))
 const MAX_DECIMAL_COEFFICIENT = BigInt(typemax(DataDecimals.Int256))
-
-Base.:(==)(a::Numeric, b::Numeric) = a.coeff == b.coeff && a.scale == b.scale
 
 """
     Postgres.PostgresRange{T}
@@ -468,46 +447,32 @@ end
     return dt - Dates.Second(seconds)
 end
 
-function numeric_string(num::Numeric)
-    coeff = num.coeff
-    scale = num.scale
-    sign = coeff < 0 ? "-" : ""
-    digits = string(abs(coeff))
-    scale <= 0 && return sign * digits * repeat("0", -scale)
-    if length(digits) <= scale
-        padding = repeat("0", scale - length(digits))
-        return sign * "0." * padding * digits
-    end
-    split_at = length(digits) - scale
-    return sign * digits[1:split_at] * "." * digits[split_at + 1:end]
-end
-
-Base.show(io::IO, num::Numeric) = print(io, numeric_string(num))
-
-function parse_numeric(val::String)::NumericValue
-    # Parse once without a precision cap. Keep both coefficient and scale;
-    # narrowing a long coefficient via a decimal string parser can discard
-    # trailing zeroes and change PostgreSQL's declared scale.
-    num = parse_numeric_big(val)
-    if num.scale <= 16383 && MIN_DECIMAL_COEFFICIENT <= num.coeff <= MAX_DECIMAL_COEFFICIENT
+function parse_numeric(val::String, on_overflow::Symbol=:warn)::NumericValue
+    num = parse_numeric_parts(val)
+    if num !== nothing && num.scale <= 16383 && MIN_DECIMAL_COEFFICIENT <= num.coeff <= MAX_DECIMAL_COEFFICIENT
         return PGDecimal(DataDecimals.Int256(num.coeff), num.scale)
     end
-    return num
+    message = "postgres numeric cannot be represented exactly as DecimalValue{Int256}; select it as text or use a custom parser"
+    on_overflow === :error && throw(PostgresInterfaceError(message))
+    # Do not put database values in the warning: they can contain private data.
+    @warn message * "; returning the original text (numeric_overflow=:error makes this an error)"
+    return val
 end
 
 function parse_decimal(::Type{T}, val::String) where {T<:DataDecimals.AbstractDecimal}
-    num = parse_numeric(val)
-    # Decimal string constructors can round to a declared scale. Conversion
-    # from an exact number must instead preserve the value or throw.
-    return num isa PGDecimal ? T(num) : T(num.coeff // big(10)^num.scale)
+    num = parse_numeric_parts(val)
+    num === nothing && throw(InexactError(:parse_decimal, T, val))
+    # Preserve the requested scale for variable-scale values. Fixed-scale
+    # conversion from an exact rational must preserve the value or throw.
+    T <: DataDecimals.DecimalValue && return T(num.coeff, num.scale)
+    return T(num.coeff // big(10)^num.scale)
 end
 
-function parse_numeric_big(val::String)
+function parse_numeric_parts(val::String)
     stripped = strip(val)
-    stripped == "" && return Numeric(BigInt(0), 0)
+    stripped == "" && throw(PostgresInterfaceError("invalid numeric text"))
     lowered = lowercase(stripped)
-    (lowered == "nan" || lowered == "infinity" || lowered == "-infinity" || lowered == "+infinity") &&
-        throw(PostgresInterfaceError("postgres numeric special value \"$stripped\" cannot be represented as a finite decimal"))
+    (lowered == "nan" || lowered == "infinity" || lowered == "-infinity" || lowered == "+infinity") && return nothing
     sign = 1
     if stripped[1] == '-'
         sign = -1
@@ -535,13 +500,13 @@ function parse_numeric_big(val::String)
     frac_part = length(parts) == 2 ? parts[2] : ""
     scale = length(frac_part) - exp_val
     digits = int_part * frac_part
-    digits == "" && return Numeric(BigInt(0), 0)
+    digits == "" && throw(PostgresInterfaceError("invalid numeric text"))
     coeff = parse(BigInt, digits)
     if scale < 0
         coeff *= big(10) ^ (-scale)
         scale = 0
     end
-    return Numeric(sign * coeff, scale)
+    return (coeff=sign * coeff, scale=scale)
 end
 
 function parse_interval_time(token::AbstractString)
@@ -703,7 +668,6 @@ function _range_typed(@nospecialize(T), @nospecialize(lower), @nospecialize(uppe
     T === Int64 && return _make_range(Int64, lower, upper, li, ui, empty)
     T === Float64 && return _make_range(Float64, lower, upper, li, ui, empty)
     T === NumericValue && return _make_range(NumericValue, lower, upper, li, ui, empty)
-    T === Numeric && return _make_range(Numeric, lower, upper, li, ui, empty)
     T === Date && return _make_range(Date, lower, upper, li, ui, empty)
     T === PGTimestamp && return _make_range(PGTimestamp, lower, upper, li, ui, empty)
     T === DateTime && return _make_range(DateTime, lower, upper, li, ui, empty)
@@ -914,8 +878,6 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
         return pg_parse_datetime(val)
     elseif T == UUID
         return UUID(val)
-    elseif T == Numeric
-        return parse_numeric_big(val)
     elseif T == Int16
         return Parsers.parse(Int16, val)
     elseif T == Int32
@@ -975,7 +937,7 @@ struct FieldValue
     registry::Dict{Int, TypeInfo}
 end
 
-const WireFieldScalar = Union{Durations.Timestamp, DataDecimals.AbstractDecimal, Numeric, DateTime}
+const WireFieldScalar = Union{Durations.Timestamp, DataDecimals.AbstractDecimal, DateTime}
 _wire_field(::Type{T}) where {T} = T <: Union{Missing, WireFieldScalar}
 _wire_field(::Type{<:AbstractVector{T}}) where {T} = T <: WireFieldScalar
 _field_source(::Type{T}, v::FieldValue) where {T} = _wire_field(T) ? v.text : parse_value(v.oid, v.text, v.registry)
@@ -1021,7 +983,6 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Date}, s::String) = pg_parse_da
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Time}, s::String) = pg_parse_time(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{DateTime}, s::String) = pg_parse_datetime_any(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{UUID}, s::String) = UUID(s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Numeric}, s::String) = parse_numeric_big(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{IntervalType}, s::String) = parse_interval(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{UInt8}}, s::String) = decode_bytea(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{JSONType}, s::String) = JSON.lazy(s), nothing
@@ -1036,7 +997,6 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Date}}, s::String) = par
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Time}}, s::String) = parse_array(s, Time), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{DateTime}}, s::String) = parse_array(s, DateTime), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{UUID}}, s::String) = parse_array(s, UUID), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Numeric}}, s::String) = parse_array(s, Numeric), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Char}}, s::String) = parse_array(s, Char), nothing
 
 # For array-typed fields the generic `make` takes its arraylike branch (applyeach
