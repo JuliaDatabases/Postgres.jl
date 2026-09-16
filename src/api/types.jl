@@ -837,6 +837,12 @@ end
     return decode_bytea_escape(val)
 end
 
+function parse_boolean(val::String)
+    (val == "t" || val == "1") && return true
+    (val == "f" || val == "0") && return false
+    throw(PostgresInterfaceError("postgres value cannot be represented as Bool; select multi-bit bit(n) values as text"))
+end
+
 function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
     info = type_info(registry, typeId)
     if info.parser !== nothing
@@ -844,10 +850,7 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
     end
     T = info.julia_type
     if T == Bool
-        if typeId == 1560
-            return val == "1"
-        end
-        return val == "t"
+        return parse_boolean(val)
     elseif T == Char
         return pg_parse_char(val)
     elseif T == DateTime
@@ -920,7 +923,7 @@ end
 end
 
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int8}, s::String) = Parsers.parse(Int8, s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = (s == "t" || s == "1"), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = parse_boolean(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Char}, s::String) = pg_parse_char(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int16}, s::String) = Parsers.parse(Int16, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int32}, s::String) = Parsers.parse(Int32, s), nothing

@@ -1248,6 +1248,21 @@ end
                     @test only(DBInterface.execute(conn, "SELECT '2024-01-02 03:04:05.123456'::timestamp AS value")).value == DateTime(2024, 1, 2, 3, 4, 5, 123)
                 end
 
+                @testset "Boolean Conversion Does Not Lose Bits" begin
+                    rng = MersenneTwister(0xb175)
+                    for _ in 1:50
+                        bits = String(rand(rng, ['0', '1'], rand(rng, 2:128)))
+                        sql = "SELECT B'$bits' AS value"
+                        @test_throws Postgres.PostgresInterfaceError DBInterface.execute(conn, sql)
+                        @test_throws Postgres.PostgresInterfaceError DBInterface.execute(conn, sql, (), NamedTuple{(:value,), Tuple{Bool}})
+                        @test only(DBInterface.execute(conn, "SELECT B'$bits'::text AS value")).value == bits
+                    end
+                    for (literal, expected) in (("true", true), ("false", false), ("B'0'", false), ("B'1'", true))
+                        @test only(DBInterface.execute(conn, "SELECT $literal AS value")).value === expected
+                    end
+                    @test only(DBInterface.execute(conn, "SELECT 42 AS value")).value == 42
+                end
+
                 @testset "Type Registry" begin
                     DBInterface.execute(conn, "DROP TABLE IF EXISTS custom_types")
                     DBInterface.execute(conn, "DROP TYPE IF EXISTS mood")
