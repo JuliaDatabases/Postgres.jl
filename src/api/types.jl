@@ -283,8 +283,8 @@ end
 # "YYYY-MM-DD HH:MM:SS[.ffffff][±TZ]"), so direct digit extraction is both faster
 # than the generic Dates machinery and — decisive under `juliac --trim` — fully
 # static: Parsers' dateformat path iterates a type-erased Vector{AbstractDateToken},
-# which is dynamic dispatch per token. Fractional seconds beyond millisecond
-# precision are truncated (DateTime/Time storage precision).
+# which is dynamic dispatch per token. Time supports nanoseconds; DateTime supports only milliseconds. Keep the
+# fraction until the target type is known.
 @inline _pg_digit(b::UInt8)::Int = Int(b - UInt8('0'))
 @inline _pg_isdigit(b::UInt8)::Bool = UInt8('0') <= b <= UInt8('9')
 
@@ -319,20 +319,20 @@ end
     h = _pg_digit(c[o]) * 10 + _pg_digit(c[o+1])
     mi = _pg_digit(c[o+3]) * 10 + _pg_digit(c[o+4])
     se = _pg_digit(c[o+6]) * 10 + _pg_digit(c[o+7])
-    ms = 0
+    ns = 0
     i = o + 8
     if i <= length(c) && c[i] == UInt8('.')
         i += 1
-        mult = 100
+        mult = 100_000_000
         while i <= length(c) && _pg_isdigit(c[i])
             if mult > 0
-                ms += _pg_digit(c[i]) * mult
+                ns += _pg_digit(c[i]) * mult
                 mult ÷= 10
             end
             i += 1
         end
     end
-    return h, mi, se, ms
+    return h, mi, se, ns
 end
 
 # `"char"` output: byte 0 renders as an empty string. High bytes render as
@@ -367,10 +367,12 @@ end
 function pg_parse_time(s::AbstractString)::Time
     c = codeunits(s)
     length(c) >= 8 || throw(ArgumentError("invalid postgres time"))
-    h, mi, se, ms = _pg_hms_at(c, 1)
+    h, mi, se, ns = _pg_hms_at(c, 1)
     # postgres permits '24:00:00' as a time value; Julia's Time does not
     h == 24 && throw(PostgresInterfaceError("postgres time value \"$s\" cannot be represented as a Julia Time"))
-    return Time(h, mi, se, ms)
+    ms, remainder = divrem(ns, 1_000_000)
+    us, ns = divrem(remainder, 1_000)
+    return Time(h, mi, se, ms, us, ns)
 end
 
 @noinline _reject_temporal_special(s::AbstractString, what::String) =
@@ -390,8 +392,8 @@ function pg_parse_datetime(s::AbstractString)::DateTime
     length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
     # the time starts one space past the date, whose year may be wider than 4
     d, after_date = _pg_date_at_end(c, 1)
-    h, mi, se, ms = _pg_hms_at(c, after_date + 1)
-    return DateTime(Dates.year(d), Dates.month(d), Dates.day(d), h, mi, se, ms)
+    h, mi, se, ns = _pg_hms_at(c, after_date + 1)
+    return DateTime(Dates.year(d), Dates.month(d), Dates.day(d), h, mi, se, ns ÷ 1_000_000)
 end
 
 # timestamptz column into a DateTime field: sniff a trailing offset/Z
@@ -502,11 +504,13 @@ function parse_interval_time(token::AbstractString)
     seconds_part = parts[3]
     seconds = 0
     milliseconds = 0
+    microseconds = 0
     if occursin('.', seconds_part)
         whole, frac = split(seconds_part, '.'; limit=2)
         seconds = parse(Int, whole)
-        fs = frac[1:min(end, 3)]
-        milliseconds = parse(Int, fs) * 10^(3 - length(fs))
+        fs = frac[1:min(end, 6)]
+        fraction_us = parse(Int, fs) * 10^(6 - length(fs))
+        milliseconds, microseconds = divrem(fraction_us, 1_000)
     else
         seconds = parse(Int, seconds_part)
     end
@@ -515,6 +519,7 @@ function parse_interval_time(token::AbstractString)
     minutes != 0 && push!(periods, Dates.Minute(minutes))
     seconds != 0 && push!(periods, Dates.Second(sign * seconds))
     milliseconds != 0 && push!(periods, Dates.Millisecond(sign * milliseconds))
+    microseconds != 0 && push!(periods, Dates.Microsecond(sign * microseconds))
     return periods
 end
 

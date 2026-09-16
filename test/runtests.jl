@@ -1228,6 +1228,26 @@ end
                     end
                 end
 
+                @testset "Microsecond Round Trips" begin
+                    rng = MersenneTwister(0x71ae)
+                    for us in [0, 1, 999, 1_001, 123_456, 999_999, rand(rng, 0:999_999, 100)...]
+                        expected = Time(12, 34, 56) + Microsecond(us)
+                        sql = raw"SELECT $1::time AS value"
+                        @test only(DBInterface.execute(conn, sql, (expected,))).value == expected
+                        typed = DBInterface.execute(conn, sql, (expected,), NamedTuple{(:value,), Tuple{Time}})
+                        @test typed.value == expected
+                        @test only(DBInterface.execute(conn, raw"SELECT $1::time[] AS value", ([expected],))).value == [expected]
+                        for sign in (-1, 1)
+                            text = string(sign * us, " microseconds")
+                            value = only(DBInterface.execute(conn, raw"SELECT $1::interval AS value", (text,))).value
+                            @test convert(Microsecond, value) == Microsecond(sign * us)
+                        end
+                    end
+                    # DateTime's millisecond limit is intentional and distinct
+                    # from Time and Period, which can retain all six digits.
+                    @test only(DBInterface.execute(conn, "SELECT '2024-01-02 03:04:05.123456'::timestamp AS value")).value == DateTime(2024, 1, 2, 3, 4, 5, 123)
+                end
+
                 @testset "Type Registry" begin
                     DBInterface.execute(conn, "DROP TABLE IF EXISTS custom_types")
                     DBInterface.execute(conn, "DROP TYPE IF EXISTS mood")
