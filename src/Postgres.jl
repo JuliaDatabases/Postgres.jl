@@ -2,6 +2,8 @@ module Postgres
 
 using DBInterface, Dates, UUIDs, Parsers, Tables, StructUtils, JSON, ConcurrentUtilities, Reseau
 
+import Durations
+
 export DBInterface
 
 """

@@ -187,6 +187,8 @@ end
     return out[]
 end
 
+const PGTimestamp = Durations.Timestamp{Dates.Microsecond}
+
 const IntervalType = Union{Dates.Period, Dates.CompoundPeriod}
 
 # Populated in `_populate_default_type_registry!` (called from API.__init__): the
@@ -213,8 +215,8 @@ function _populate_default_type_registry!()
     700 => TypeInfo(Float32, nothing),
     701 => TypeInfo(Float64, nothing),
     1700 => TypeInfo(Numeric, (val, registry) -> parse_numeric(val)),
-    1114 => TypeInfo(DateTime, nothing),
-    1184 => TypeInfo(DateTime, nothing),
+    1114 => TypeInfo(PGTimestamp, (val, registry) -> pg_parse_timestamp(val)),
+    1184 => TypeInfo(PGTimestamp, (val, registry) -> pg_parse_timestamp(val)),
     1082 => TypeInfo(Date, nothing),
     1083 => TypeInfo(Time, nothing),
     1186 => TypeInfo(IntervalType, (val, registry) -> parse_interval(val)),
@@ -232,10 +234,10 @@ function _populate_default_type_registry!()
     1009 => TypeInfo(Vector{String}, nothing),
     1014 => TypeInfo(Vector{String}, nothing),
     1015 => TypeInfo(Vector{String}, nothing),
-    1115 => TypeInfo(Vector{DateTime}, (val, registry) -> parse_array_by_oid(val, 1114, registry)),
+    1115 => TypeInfo(Vector{PGTimestamp}, (val, registry) -> parse_array_by_oid(val, 1114, registry)),
     1182 => TypeInfo(Vector{Date}, (val, registry) -> parse_array_by_oid(val, 1082, registry)),
     1183 => TypeInfo(Vector{Time}, (val, registry) -> parse_array_by_oid(val, 1083, registry)),
-    1185 => TypeInfo(Vector{DateTime}, (val, registry) -> parse_array_by_oid(val, 1184, registry)),
+    1185 => TypeInfo(Vector{PGTimestamp}, (val, registry) -> parse_array_by_oid(val, 1184, registry)),
     1187 => TypeInfo(Vector{IntervalType}, (val, registry) -> parse_array_by_oid(val, 1186, registry)),
     1231 => TypeInfo(Vector{Numeric}, (val, registry) -> parse_array_by_oid(val, 1700, registry)),
     199 => TypeInfo(Vector{JSONType}, (val, registry) -> parse_array_by_oid(val, 114, registry)),
@@ -244,8 +246,8 @@ function _populate_default_type_registry!()
     3904 => TypeInfo(PostgresRange{Int32}, (val, registry) -> parse_range(val, 23, registry)),
     3926 => TypeInfo(PostgresRange{Int64}, (val, registry) -> parse_range(val, 20, registry)),
     3906 => TypeInfo(PostgresRange{Numeric}, (val, registry) -> parse_range(val, 1700, registry)),
-    3908 => TypeInfo(PostgresRange{DateTime}, (val, registry) -> parse_range(val, 1114, registry)),
-    3910 => TypeInfo(PostgresRange{DateTime}, (val, registry) -> parse_range(val, 1184, registry)),
+    3908 => TypeInfo(PostgresRange{PGTimestamp}, (val, registry) -> parse_range(val, 1114, registry)),
+    3910 => TypeInfo(PostgresRange{PGTimestamp}, (val, registry) -> parse_range(val, 1184, registry)),
     3912 => TypeInfo(PostgresRange{Date}, (val, registry) -> parse_range(val, 1082, registry)),
     ))
     return nothing
@@ -394,6 +396,26 @@ function pg_parse_datetime(s::AbstractString)::DateTime
     d, after_date = _pg_date_at_end(c, 1)
     h, mi, se, ns = _pg_hms_at(c, after_date + 1)
     return DateTime(Dates.year(d), Dates.month(d), Dates.day(d), h, mi, se, ns ÷ 1_000_000)
+end
+
+# Decode in wide Unix-epoch ticks so both timezone adjustment and the final
+# range check happen before narrowing. Timestamp arithmetic itself wraps at
+# Int64 limits, and a local time can be outside the range while UTC fits.
+function pg_parse_timestamp(s::AbstractString)::PGTimestamp
+    _check_temporal_special(s, "timestamp")
+    c = codeunits(s)
+    length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
+    d, after_date = _pg_date_at_end(c, 1)
+    h, mi, se, ns = _pg_hms_at(c, after_date + 1)
+    Time(h, mi, se) # validate the clock fields
+    ns % 1000 == 0 || throw(InexactError(:pg_parse_timestamp, PGTimestamp, s))
+    offset_at = findnext(ch -> ch == '+' || ch == '-', s, after_date + 1)
+    offset = offset_at === nothing ? 0 : tzoffset_seconds(SubString(s, offset_at))
+    days = Int128(Dates.value(d)) - Dates.value(Date(1970, 1, 1))
+    ticks = days * 86_400_000_000 + (h * 3600 + mi * 60 + se - offset) * Int128(1_000_000) + ns ÷ 1000
+    typemin(Int64) <= ticks <= typemax(Int64) ||
+        throw(PostgresInterfaceError("postgres timestamp is outside the range of Durations.Timestamp{Microsecond}; select it as text or register a custom parser"))
+    return PGTimestamp(Dates.UTInstant(Dates.Microsecond(Int64(ticks))))
 end
 
 # timestamptz column into a DateTime field: sniff a trailing offset/Z
@@ -654,6 +676,7 @@ function _range_typed(@nospecialize(T), @nospecialize(lower), @nospecialize(uppe
     T === Float64 && return _make_range(Float64, lower, upper, li, ui, empty)
     T === Numeric && return _make_range(Numeric, lower, upper, li, ui, empty)
     T === Date && return _make_range(Date, lower, upper, li, ui, empty)
+    T === PGTimestamp && return _make_range(PGTimestamp, lower, upper, li, ui, empty)
     T === DateTime && return _make_range(DateTime, lower, upper, li, ui, empty)
     throw(PostgresInterfaceError("no trim-safe range constructor registered for this element type; " *
                                  "register a parser function for the range type"))
@@ -853,6 +876,8 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
         return parse_boolean(val)
     elseif T == Char
         return pg_parse_char(val)
+    elseif T == PGTimestamp
+        return pg_parse_timestamp(val)
     elseif T == DateTime
         if typeId == 1184
             return parse_timestamptz(val)
@@ -959,3 +984,7 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Char}}, s::String) = par
 # through the lifts above.
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, s::String) where {T <: AbstractVector} = StructUtils.lift(st, T, s)
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, s::String, tags) where {T <: AbstractVector} = StructUtils.lift(st, T, s)
+
+StructUtils.structlike(::AbstractPostgresStyle, ::Type{<:Durations.Timestamp}) = false
+StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, s::String) where {T<:Durations.Timestamp} = convert(T, pg_parse_timestamp(s)), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{T}}, s::String) where {T<:Durations.Timestamp} = parse_array(s, T), nothing

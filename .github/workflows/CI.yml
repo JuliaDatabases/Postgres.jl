@@ -95,6 +95,7 @@ jobs:
               Pkg.add([
                   Pkg.PackageSpec(name="ConcurrentUtilities", version="2.1.0"),
                   Pkg.PackageSpec(name="DBInterface", version="2.5.0"),
+                  Pkg.PackageSpec(name="Durations", version="1.2.0"),
                   Pkg.PackageSpec(name="JSON", version="1.0.0"),
                   Pkg.PackageSpec(name="MD5", version="0.2.0"),
                   Pkg.PackageSpec(name="Parsers", version="2.5.4"),

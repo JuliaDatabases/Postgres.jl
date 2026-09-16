@@ -261,6 +261,12 @@ Base.close(cursor::Cursor) = DBInterface.close!(cursor)
 
 _param(x::AbstractString)::String = String(x)
 _param(x)::String = string(x)
+function _param(x::Durations.Timestamp)::String
+    # PostgreSQL would round finer fractions. Require an exact conversion.
+    timestamp = convert(API.PGTimestamp, x)
+    Dates.year(timestamp) >= 1 || throw(PostgresInterfaceError("BC timestamp parameters are not supported"))
+    return string(timestamp)
+end
 _param(x::Missing) = x
 _param(::Nothing) = missing
 _param(x::AbstractVector{UInt8})::String = string("\\x", bytes2hex(x))
