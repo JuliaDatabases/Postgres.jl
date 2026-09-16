@@ -976,7 +976,9 @@ end
         end
     end
 
+    require_integration = get(ENV, "POSTGRES_REQUIRE_INTEGRATION", "false") == "true"
     if !docker_available()
+        require_integration && error("PostgreSQL integration tests require a running Linux Docker daemon")
         @info "Docker not available; skipping Postgres integration tests."
         @test true
     else
@@ -2584,6 +2586,7 @@ end
 
         @testset "SSL Certificate Fixture" begin
             if Sys.which("openssl") === nothing
+                require_integration && error("PostgreSQL certificate tests require the OpenSSL executable")
                 @info "OpenSSL executable not available; skipping certificate-backed SSL tests."
                 @test true
             else

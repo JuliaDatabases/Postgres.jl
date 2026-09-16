@@ -14,6 +14,8 @@ concurrency:
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
+    env:
+      POSTGRES_REQUIRE_INTEGRATION: ${{ matrix.os == 'ubuntu-latest' && 'true' || 'false' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -58,6 +60,7 @@ jobs:
           - scram-sha-256
           - md5
     env:
+      POSTGRES_REQUIRE_INTEGRATION: 'true'
       POSTGRES_HOST_AUTH_METHOD: ${{ matrix.auth }}
       POSTGRES_INITDB_ARGS: --auth-host=${{ matrix.auth }}
     steps:
@@ -72,6 +75,8 @@ jobs:
 
   lower-bounds:
     name: Lower dependency bounds - Julia 1.10 - ubuntu-latest
+    env:
+      POSTGRES_REQUIRE_INTEGRATION: 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -113,6 +118,7 @@ jobs:
         # PostgreSQL 16 is covered by the main OS and Julia-version matrix.
         postgres: ['14', '15', '17', '18']
     env:
+      POSTGRES_REQUIRE_INTEGRATION: 'true'
       POSTGRES_IMAGE: postgres:${{ matrix.postgres }}
     steps:
       - uses: actions/checkout@v6
