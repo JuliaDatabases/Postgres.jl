@@ -37,7 +37,7 @@ The example disables TLS for local testing. For a remote database, use `sslmode=
 
 The package supports Julia 1.10 and later. Database integration tests cover PostgreSQL 14–18, including SCRAM and MD5 authentication, certificate verification, cancellation, and recovery after errors. The suite also uses seeded randomized tests to check values against a real PostgreSQL server.
 
-There are limits to call out. Connections use TCP; Unix-domain sockets are not supported. Julia `DateTime` results have millisecond precision. Custom composite, enum, and range registration controls result decoding; use text parameters with explicit casts when writing those types. See the [support policy](https://JuliaDatabases.github.io/Postgres.jl/dev/support/) for TLS and transaction-pooler details.
+There are limits to call out. Connections use TCP; Unix-domain sockets are not supported. Timestamps use Durations.jl with microsecond precision. Decimals use DataDecimals.jl, with an exact fallback for larger PostgreSQL numeric values. Custom composite, enum, and range registration controls result decoding; use text parameters with explicit casts when writing those types. See the [support policy](https://JuliaDatabases.github.io/Postgres.jl/dev/support/) for TLS and transaction-pooler details.
 
 I would welcome reports from real workloads, especially type conversion, managed PostgreSQL services, and connection-pooler setups. Please include a small example and version information in [an issue](https://github.com/JuliaDatabases/Postgres.jl/issues), with credentials and private data removed.
 

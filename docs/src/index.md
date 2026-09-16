@@ -162,7 +162,8 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 DBInterface.close!(conn)
 ```
 
-`Numeric` values are represented by `Postgres.Numeric`, `interval` values by `Dates.Period` or `Dates.CompoundPeriod`, and range types by `Postgres.PostgresRange{T}`.
+`numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with `Postgres.Numeric` for values beyond its storage range), `interval` values by `Dates.Period` or `Dates.CompoundPeriod`, and range types by `Postgres.PostgresRange{T}`.
+Timestamps use `Durations.Timestamp{Dates.Microsecond}` and retain all six fractional digits.
 
 ## Query logging
 

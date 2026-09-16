@@ -63,11 +63,18 @@ result-decoding feature in 1.0. Bind a text representation with an explicit SQL
 cast when writing those custom values. Multidimensional Julia arrays are not a
 supported parameter form in 1.0.
 
-`time` and `interval` decoding retains PostgreSQL's microsecond precision.
-`timestamp` and `timestamptz` map to Julia `DateTime`, which stores milliseconds;
-additional fractional digits are truncated. Select these values as text when
-microsecond timestamp precision is required. `timestamptz` is returned in UTC
-without retaining the original timezone.
+`time`, `interval`, `timestamp`, and `timestamptz` decoding retains PostgreSQL's
+microsecond precision. Timestamps use `Durations.Timestamp{Dates.Microsecond}`.
+`timestamptz` is returned in UTC without retaining the original timezone.
+The final 29 years of PostgreSQL's upper timestamp range exceed this type's
+Unix-epoch `Int64` range and raise an error. Read those values as text or use a
+custom parser. Explicit typed `DateTime` fields still truncate to milliseconds.
+Timestamp parameters with submicrosecond precision raise an error.
+
+`numeric` uses `DataDecimals.DecimalValue{DataDecimals.Int256}`. Larger
+coefficients use `Postgres.Numeric`, preserving every digit and the scale.
+Typed `DataDecimals.Decimal{P,S}` results require an exact conversion; excess
+precision raises an error. Numeric `NaN` and infinities remain unsupported.
 
 `boolean` and `bit(1)` decode to `Bool`. Wider `bit(n)` values cannot be
 represented as a Boolean and raise an error. Select them as text, for example
