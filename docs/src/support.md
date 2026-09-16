@@ -67,8 +67,8 @@ supported parameter form in 1.0.
 microsecond precision. Timestamps use `Durations.Timestamp{Dates.Microsecond}`.
 `timestamptz` is returned in UTC without retaining the original timezone.
 The final 29 years of PostgreSQL's upper timestamp range exceed this type's
-Unix-epoch `Int64` range and raise an error. Read those values as text or use a
-custom parser. Explicit typed `DateTime` fields still truncate to milliseconds.
+Unix-epoch `Int64` range and raise an error. Read those values as text, request a wider-range Timestamp resolution in
+a typed result, or use a custom parser. Explicit typed `DateTime` fields still truncate to milliseconds.
 Timestamp parameters with submicrosecond precision raise an error.
 
 `numeric` uses `DataDecimals.DecimalValue{DataDecimals.Int256}`. Larger

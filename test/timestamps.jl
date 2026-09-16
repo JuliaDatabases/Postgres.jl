@@ -19,6 +19,10 @@ function test_timestamps()
         @test Postgres._param(Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1000)) == "1970-01-01T00:00:00.000001Z"
         @test_throws Postgres.PostgresInterfaceError Postgres._param(MicroTimestamp(0))
         @test_throws InexactError StructUtils.lift(Postgres.PostgresStyle(), Durations.Timestamp{Millisecond}, "1970-01-01 00:00:00.000001")
+        wide = Durations.Timestamp{Second}(294276, 12, 31, 23, 59, 59)
+        @test first(StructUtils.lift(Postgres.PostgresStyle(), typeof(wide), "294276-12-31 23:59:59")) === wide
+        @test Postgres.API.parse_array("{\"294276-12-31 23:59:59\"}", typeof(wide)) == [wide]
+        @test first(StructUtils.lift(Postgres.PostgresStyle(), Durations.Timestamp{Nanosecond}, "1970-01-01 00:00:00.000001")) === Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1000)
         # Explicit DateTime targets retain their historical millisecond floor.
         @test first(StructUtils.lift(Postgres.PostgresStyle(), DateTime, "1969-12-31 23:59:59.999999")) == DateTime(1969, 12, 31, 23, 59, 59, 999)
         @test Postgres.API.parse_array("{\"1969-12-31 23:59:59.999999\"}", MicroTimestamp) == [expected]
@@ -51,6 +55,10 @@ function _test_timestamp_roundtrips(conn)
         end
         @test only(DBInterface.execute(conn, raw"SELECT $1::timestamp AS value", (typemax(MicroTimestamp),))).value === typemax(MicroTimestamp)
         @test_throws InexactError DBInterface.execute(conn, raw"SELECT $1::timestamp AS value", (Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1),))
+        wide = DBInterface.execute(conn, "SELECT '294276-12-31 23:59:59'::timestamp AS value", (), NamedTuple{(:value,), Tuple{Durations.Timestamp{Second}}})
+        @test DBInterface.execute(conn, "SELECT 42 AS value", (), NamedTuple{(:value,), Tuple{Any}}).value === Int32(42)
+        @test wide.value === Durations.Timestamp{Second}(294276, 12, 31, 23, 59, 59)
+        @test DBInterface.execute(conn, raw"SELECT $1::timestamp AS value", (wide.value,), typeof(wide)).value === wide.value
         value = MicroTimestamp(2024, 1, 2, 3, 4, 5, 123, 456)
         @test DBInterface.execute(conn, raw"SELECT $1::timestamptz[] AS value", ([value],), NamedTuple{(:value,), Tuple{Vector{MicroTimestamp}}}).value == [value]
         @test only(DBInterface.execute(conn, "SELECT 1 AS value")).value == 1

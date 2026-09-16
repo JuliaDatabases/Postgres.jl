@@ -263,7 +263,7 @@ _param(x::AbstractString)::String = String(x)
 _param(x)::String = string(x)
 function _param(x::Durations.Timestamp)::String
     # PostgreSQL would round finer fractions. Require an exact conversion.
-    timestamp = convert(API.PGTimestamp, x)
+    timestamp = x isa Durations.Timestamp{Dates.Nanosecond} ? convert(API.PGTimestamp, x) : x
     Dates.year(timestamp) >= 1 || throw(PostgresInterfaceError("BC timestamp parameters are not supported"))
     # Timestamp counts from the Unix epoch. Make that UTC meaning explicit
     # for timestamptz; PostgreSQL ignores the zone for timestamp columns.

@@ -407,21 +407,25 @@ end
 # Decode in wide Unix-epoch ticks so both timezone adjustment and the final
 # range check happen before narrowing. Timestamp arithmetic itself wraps at
 # Int64 limits, and a local time can be outside the range while UTC fits.
-function pg_parse_timestamp(s::AbstractString)::PGTimestamp
+pg_parse_timestamp(s::AbstractString) = pg_parse_timestamp(s, PGTimestamp)
+pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp}) = pg_parse_timestamp(s, Durations.Timestamp{Dates.Nanosecond})
+
+function pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp{P}}) where {P}
     _check_temporal_special(s, "timestamp")
     c = codeunits(s)
     length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
     d, after_date = _pg_date_at_end(c, 1)
     h, mi, se, ns = _pg_hms_at(c, after_date + 1)
     Time(h, mi, se) # validate the clock fields
-    ns % 1000 == 0 || throw(InexactError(:pg_parse_timestamp, PGTimestamp, s))
     offset_at = findnext(ch -> ch == '+' || ch == '-', s, after_date + 1)
     offset = offset_at === nothing ? 0 : tzoffset_seconds(SubString(s, offset_at))
     days = Int128(Dates.value(d)) - Dates.value(Date(1970, 1, 1))
-    ticks = days * 86_400_000_000 + (h * 3600 + mi * 60 + se - offset) * Int128(1_000_000) + ns ÷ 1000
+    nanoseconds = days * 86_400_000_000_000 + (h * 3600 + mi * 60 + se - offset) * Int128(1_000_000_000) + ns
+    ticks, remainder = divrem(nanoseconds, Dates.value(convert(Dates.Nanosecond, P(1))))
+    iszero(remainder) || throw(InexactError(:pg_parse_timestamp, Durations.Timestamp{P}, s))
     typemin(Int64) <= ticks <= typemax(Int64) ||
-        throw(PostgresInterfaceError("postgres timestamp is outside the range of Durations.Timestamp{Microsecond}; select it as text or register a custom parser"))
-    return PGTimestamp(Dates.UTInstant(Dates.Microsecond(Int64(ticks))))
+        throw(PostgresInterfaceError("postgres timestamp is outside the range of Durations.Timestamp{$P}; select it as text or request a wider-range Timestamp resolution"))
+    return Durations.Timestamp{P}(Dates.UTInstant(P(Int64(ticks))))
 end
 
 # timestamptz column into a DateTime field: sniff a trailing offset/Z
@@ -962,14 +966,39 @@ end
     return
 end
 
-# ── typed-struct materialization: parse by the declared field type ───────────
+# Typed fields can require a wider range than the default OID mapping. Defer
+# decoding until StructUtils supplies the declared field type. Other targets,
+# including Any and registered composites, retain the OID parser behavior.
+struct FieldValue
+    text::String
+    oid::Int
+    registry::Dict{Int, TypeInfo}
+end
+
+const WireFieldScalar = Union{Durations.Timestamp, DataDecimals.AbstractDecimal, Numeric, DateTime}
+_wire_field(::Type{T}) where {T} = T <: Union{Missing, WireFieldScalar}
+_wire_field(::Type{<:AbstractVector{T}}) where {T} = T <: WireFieldScalar
+_field_source(::Type{T}, v::FieldValue) where {T} = _wire_field(T) ? v.text : parse_value(v.oid, v.text, v.registry)
+StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue) where {T} = StructUtils.make(st, T, _field_source(T, v))
+StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue, tags) where {T} = StructUtils.make(st, T, _field_source(T, v), tags)
+
 @static if isdefined(StructUtils, :InterpClosure) && isdefined(StructUtils, :HotStructClosure)
-    # Typed targets know each field type, so let their PostgresStyle lift parse
-    # the wire string directly. Untyped destinations keep the OID parser above.
     @inline function applycast(f::Union{StructUtils.InterpClosure, StructUtils.HotStructClosure}, name, typeId, val::String, registry::Dict{Int, TypeInfo})
-        f(name, val)
+        f(name, FieldValue(val, typeId, registry))
         return
     end
+end
+
+@static if isdefined(StructUtils, :FieldSink)
+    @inline function applycast(f::StructUtils.FieldSink, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+        f(name, FieldValue(val, typeId, registry))
+        return
+    end
+end
+
+@inline function applycast(f::StructUtils.TupleClosure, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+    f(name, FieldValue(val, typeId, registry))
+    return
 end
 
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int8}, s::String) = Parsers.parse(Int8, s), nothing
@@ -1011,7 +1040,7 @@ StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, s::String) where {T <: Ab
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, s::String, tags) where {T <: AbstractVector} = StructUtils.lift(st, T, s)
 
 StructUtils.structlike(::AbstractPostgresStyle, ::Type{<:Durations.Timestamp}) = false
-StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, s::String) where {T<:Durations.Timestamp} = convert(T, pg_parse_timestamp(s)), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, s::String) where {T<:Durations.Timestamp} = pg_parse_timestamp(s, T), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{T}}, s::String) where {T<:Durations.Timestamp} = parse_array(s, T), nothing
 
 StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, s::String) where {T<:DataDecimals.AbstractDecimal} = parse_decimal(T, s), nothing

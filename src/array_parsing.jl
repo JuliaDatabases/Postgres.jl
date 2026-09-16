@@ -95,7 +95,7 @@ function parse_scalar(token::String, inner_type::Type{T}, quoted::Bool) where {T
     inner_type === Float64 && return Parsers.parse(Float64, token)
     inner_type === Date && return pg_parse_date(token)
     inner_type === Time && return pg_parse_time(token)
-    inner_type <: Durations.Timestamp && return convert(inner_type, pg_parse_timestamp(token))
+    inner_type <: Durations.Timestamp && return pg_parse_timestamp(token, inner_type)
     inner_type === DateTime && return pg_parse_datetime_any(token)
     inner_type === UUID && return UUID(token)
     inner_type === Numeric && return parse_numeric_big(token)

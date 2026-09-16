@@ -57,6 +57,7 @@ function test_decimal_roundtrips(conn)
         @test row.values[3] == wide
         @test row.span.lower == WireDecimal(123, 2)
         @test row.span.upper == wide
+        @test DBInterface.execute(conn, "SELECT 1.2300::numeric AS value", (), NamedTuple{(:value,), Tuple{Postgres.Numeric}}).value == Postgres.Numeric(BigInt(12300), 4)
         fixed = DataDecimals.Decimal64{2}("12.34")
         @test DBInterface.execute(conn, raw"SELECT $1::numeric AS value", (fixed,), NamedTuple{(:value,), Tuple{typeof(fixed)}}).value == fixed
         @test DBInterface.execute(conn, raw"SELECT $1::numeric[] AS value", ([fixed],), NamedTuple{(:value,), Tuple{Vector{typeof(fixed)}}}).value == [fixed]
