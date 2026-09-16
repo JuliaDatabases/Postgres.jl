@@ -8,12 +8,10 @@ they also run database tests when a Linux Docker daemon is available.
 
 ## Dependency Compatibility
 
-The current compatibility range ends at Reseau 1.4.0. Reseau 1.4.1–1.4.3 can
-withhold a valid client certificate when the server lists acceptable certificate
-authorities. The upstream repair is tracked in
-[Reseau PR #162](https://github.com/JuliaServices/Reseau.jl/pull/162).
-The upper bound can be reopened after a fixed release passes the certificate
-integration tests.
+Postgres.jl requires Reseau 1.4.4 or later in the 1.x series. This version
+repairs client-certificate authority matching. Reseau 1.4.1–1.4.3 can withhold
+a valid client certificate when the server lists acceptable certificate
+authorities. See [Reseau PR #162](https://github.com/JuliaServices/Reseau.jl/pull/162).
 
 ## TLS
 
