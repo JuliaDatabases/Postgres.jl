@@ -1176,6 +1176,29 @@ end
                     @test JSON.parse(only(array_types_row.jsonb_array))["a"] == 1
                 end
 
+                @testset "Binary Array Round Trips" begin
+                    rng = MersenneTwister(0xb17ea)
+                    stmt = DBInterface.prepare(conn, raw"SELECT $1::bytea[] AS value")
+                    try
+                        cases = Any[
+                            Vector{UInt8}[], [UInt8[]], [UInt8[0, 1, 255]],
+                            [collect(UInt8(0):UInt8(255))],
+                            [missing, UInt8[], nothing, UInt8[0x5c, 0x22]],
+                        ]
+                        for _ in 1:100
+                            push!(cases, [rand(rng) < 0.2 ? missing : rand(rng, UInt8, rand(rng, 0:80))
+                                          for _ in 1:rand(rng, 0:12)])
+                        end
+                        for values in cases
+                            expected = [v === nothing ? missing : v for v in values]
+                            @test isequal(only(DBInterface.execute(conn, raw"SELECT $1::bytea[] AS value", (values,))).value, expected)
+                            @test isequal(only(DBInterface.execute(stmt, (values,))).value, expected)
+                        end
+                    finally
+                        DBInterface.close!(stmt)
+                    end
+                end
+
                 @testset "Type Registry" begin
                     DBInterface.execute(conn, "DROP TABLE IF EXISTS custom_types")
                     DBInterface.execute(conn, "DROP TYPE IF EXISTS mood")
