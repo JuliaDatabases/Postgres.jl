@@ -28,7 +28,9 @@ JSON = "1"
 MD5 = "0.2"
 Parsers = "2.5.4"
 Random = "1.10"
-Reseau = "1.3.5"
+# Reseau 1.4.1-1.4.3 withhold valid client certificates when the server
+# lists acceptable CAs. Reopen the upper bound after the upstream repair.
+Reseau = "1.3.5 - 1.4.0"
 SASLAuth = "1"
 Sockets = "1.10"
 StructUtils = "2.3"
