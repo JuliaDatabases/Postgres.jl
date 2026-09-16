@@ -7,4 +7,4 @@ Postgres = {path = ".."}
 
 [compat]
 Documenter = "1"
-Postgres = "1"
+Postgres = "2"

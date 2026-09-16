@@ -1,6 +1,6 @@
 name = "Postgres"
 uuid = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
-version = "1.0.1"
+version = "2.0.0"
 
 [deps]
 ConcurrentUtilities = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
