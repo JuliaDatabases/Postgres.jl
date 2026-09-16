@@ -1313,6 +1313,15 @@ end
                     @test only(DBInterface.execute(conn, "SELECT 42 AS value")).value == 42
                 end
 
+                @testset "Announcement Example" begin
+                    text = read(joinpath(@__DIR__, "..", "docs", "announcement-draft.md"), String)
+                    examples = collect(eachmatch(r"```julia\n(.*?)```"s, text))
+                    params = "Postgres.ConnectionParams(host=$(repr(cfg.host)), port=$(cfg.port), user=$(repr(cfg.user)), password=$(repr(cfg.password)), dbname=$(repr(cfg.dbname)), sslmode=\"disable\")"
+                    example = replace(examples[2].captures[1],
+                        "\"postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable\"" => params)
+                    @test isnothing(include_string(Module(:AnnouncementExample), example))
+                end
+
                 @testset "Type Registry" begin
                     DBInterface.execute(conn, "DROP TABLE IF EXISTS custom_types")
                     DBInterface.execute(conn, "DROP TYPE IF EXISTS mood")

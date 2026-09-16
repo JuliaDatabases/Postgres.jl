@@ -281,6 +281,16 @@ rather than silently returning wrong values.
 Transaction-mode poolers cannot preserve session settings between logical
 connections. See the [1.0 Support Policy](@ref) before using this mode.
 
+### Precision And Bit Strings
+
+`time` and `interval` values retain microseconds. `timestamp` and `timestamptz`
+map to `DateTime` and truncate fractional seconds beyond milliseconds.
+`timestamptz` values are normalized to UTC. Select a timestamp as `::text` to
+retain all fractional digits or its server-rendered timezone offset.
+
+`boolean` and `bit(1)` map to `Bool`. Read wider `bit(n)` values as `::text`;
+decoding them as `Bool` raises `Postgres.PostgresInterfaceError`.
+
 ### Values Without A Julia Representation
 
 A few PostgreSQL values have no faithful Julia equivalent and raise

@@ -2,7 +2,18 @@
 
 Postgres.jl 1.0 supports Julia 1.10 and later. The release test matrix covers
 PostgreSQL 14 through 18 on TCP connections. Unix-domain sockets are not
-supported.
+supported. Database and certificate integration tests run on Linux with Docker
+and OpenSSL. The Windows and macOS CI jobs run the parser and API checks;
+they also run database tests when a Linux Docker daemon is available.
+
+## Dependency Compatibility
+
+The current compatibility range ends at Reseau 1.4.0. Reseau 1.4.1–1.4.3 can
+withhold a valid client certificate when the server lists acceptable certificate
+authorities. The upstream repair is tracked in
+[Reseau PR #162](https://github.com/JuliaServices/Reseau.jl/pull/162).
+The upper bound can be reopened after a fixed release passes the certificate
+integration tests.
 
 ## TLS
 
@@ -51,6 +62,16 @@ be bound as parameters. Custom enum, composite, and range registration is a
 result-decoding feature in 1.0. Bind a text representation with an explicit SQL
 cast when writing those custom values. Multidimensional Julia arrays are not a
 supported parameter form in 1.0.
+
+`time` and `interval` decoding retains PostgreSQL's microsecond precision.
+`timestamp` and `timestamptz` map to Julia `DateTime`, which stores milliseconds;
+additional fractional digits are truncated. Select these values as text when
+microsecond timestamp precision is required. `timestamptz` is returned in UTC
+without retaining the original timezone.
+
+`boolean` and `bit(1)` decode to `Bool`. Wider `bit(n)` values cannot be
+represented as a Boolean and raise an error. Select them as text, for example
+`SELECT flags::text FROM my_table`.
 
 ## Native Compilation
 

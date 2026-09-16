@@ -227,6 +227,18 @@ DBInterface.close!(pool)
 
 `Postgres.Error` represents server errors and includes SQLSTATE codes; `Postgres.PostgresInterfaceError` covers client-side failures. Use `Postgres.cancel_query!(conn)` to send a CancelRequest to the server.
 
+## Testing and contributing
+
+Run `julia --project -e 'using Pkg; Pkg.test()'` from this repository.
+Database tests need a running Linux Docker daemon and OpenSSL on `PATH`.
+Set `POSTGRES_REQUIRE_INTEGRATION=true` to fail if those tests cannot run.
+Without Docker, the suite runs parser and API checks only.
+
+The suite includes seeded fuzz tests for connection strings, protocol framing,
+binary arrays, composite values, and temporal precision. For a bug report,
+include the Julia, Postgres.jl, and PostgreSQL versions and a small reproducer.
+Remove passwords, connection secrets, and private data first.
+
 ## Development disclosure
 
 The 1.0 release preparation used Claude Code and OpenAI Codex for implementation
