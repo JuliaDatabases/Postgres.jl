@@ -1,6 +1,6 @@
 # Manual
 
-Postgres.jl intentionally keeps its export surface small: `using Postgres` re-exports `DBInterface`, while package-specific APIs are accessed through the `Postgres.` namespace.
+`using Postgres` re-exports `DBInterface`. Access package-specific APIs through the `Postgres.` namespace.
 
 ## Connecting
 
@@ -264,7 +264,7 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 Registering composite and range types follows the same pattern.
 
 Registration controls result decoding. Direct parameter binding for registered
-enum, composite, and range Julia values is not part of the 1.0 interface. Bind
+enum, composite, and range Julia values is not supported. Bind
 their PostgreSQL text representation and add an explicit SQL cast when needed.
 
 ### Session Formats
@@ -280,7 +280,7 @@ mid-session breaks decoding — intervals and unparseable dates raise errors
 rather than silently returning wrong values.
 
 Transaction-mode poolers cannot preserve session settings between logical
-connections. See the [1.0 Support Policy](@ref) before using this mode.
+connections. See the [Support Policy](@ref) before using this mode.
 
 ### Precision And Bit Strings
 
@@ -294,15 +294,14 @@ request `Timestamp{Second}` or `Timestamp{Millisecond}` in a typed result, or
 register a custom parser.
 
 Typed results can request another `Durations.Timestamp{P}` resolution.
-Conversion must be exact and in range. Explicit `DateTime` fields keep the
-legacy behavior of truncating to milliseconds. Timestamp parameters carry an
-explicit UTC marker, including in non-UTC sessions. Parameters finer than a
+Conversion must be exact and in range. Explicit `DateTime` fields truncate to
+milliseconds. Timestamp parameters carry an explicit UTC marker, including in non-UTC sessions. Parameters finer than a
 microsecond raise `InexactError` rather than letting PostgreSQL round.
 
 Typed numeric fields can use `DataDecimals.Decimal{P,S}` or
 `DataDecimals.DecimalValue{T}`. Conversion preserves the exact value or throws;
 it does not round to the target scale. Both decimal types support scalar and
-array parameters. Explicit `Postgres.Numeric` fields remain supported.
+array parameters. Typed results can also use `Postgres.Numeric` fields.
 
 ```julia
 using Dates, Durations, DataDecimals

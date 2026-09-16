@@ -41,7 +41,7 @@ Connection options support:
 - `connect_timeout` (seconds) and `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
 
-See the [1.0 support policy](https://JuliaDatabases.github.io/Postgres.jl/dev/support/)
+See the [support policy](https://JuliaDatabases.github.io/Postgres.jl/dev/support/)
 for tested Julia and PostgreSQL versions, TLS limits, and transaction-pooler
 requirements.
 
@@ -194,7 +194,7 @@ DBInterface.close!(conn)
 `numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with `Postgres.Numeric` for values beyond its storage range), `interval` values as `Dates.Period` or `Dates.CompoundPeriod`, and range types as `Postgres.PostgresRange{T}`.
 Timestamps use `Durations.Timestamp{Dates.Microsecond}` and retain all six fractional digits.
 Custom enum, composite, and range registration controls result decoding. Those
-custom Julia values are not accepted as direct query parameters in 1.0; bind a
+custom Julia values are not accepted as direct query parameters; bind a
 PostgreSQL text representation with an explicit SQL cast instead.
 
 ## Query logging and driver styles
@@ -239,10 +239,3 @@ The suite includes seeded fuzz tests for connection strings, protocol framing,
 binary arrays, composite values, and temporal precision. For a bug report,
 include the Julia, Postgres.jl, and PostgreSQL versions and a small reproducer.
 Remove passwords, connection secrets, and private data first.
-
-## Development disclosure
-
-The 1.0 release preparation used Claude Code and OpenAI Codex for implementation
-assistance and adversarial review. Maintainer decisions, source history, review
-discussion, and validation results are recorded in
-[pull request #5](https://github.com/JuliaDatabases/Postgres.jl/pull/5).

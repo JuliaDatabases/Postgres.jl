@@ -3,7 +3,7 @@
 Postgres.jl is a PostgreSQL client that speaks the v3 wire protocol with `DBInterface` and `Tables` integration.
 
 See the [Manual](@ref) for a guided walk through connections, queries, prepared statements, transactions, cancellation, notifications, and type translation.
-See the [1.0 Support Policy](@ref) for tested versions and explicit limits.
+See the [Support Policy](@ref) for tested versions and explicit limits.
 
 ## Installation
 
@@ -162,7 +162,7 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 DBInterface.close!(conn)
 ```
 
-`numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with `Postgres.Numeric` for values beyond its storage range), `interval` values by `Dates.Period` or `Dates.CompoundPeriod`, and range types by `Postgres.PostgresRange{T}`.
+`numeric` values use `DataDecimals.DecimalValue{DataDecimals.Int256}` (with `Postgres.Numeric` for values beyond its storage range), `interval` values use `Dates.Period` or `Dates.CompoundPeriod`, and range types use `Postgres.PostgresRange{T}`.
 Timestamps use `Durations.Timestamp{Dates.Microsecond}` and retain all six fractional digits.
 
 ## Query logging
