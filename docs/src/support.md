@@ -40,6 +40,11 @@ transaction mode. Configure PostgreSQL or the pooler defaults with
 formats for correct decoding. Use direct connections or session pooling when
 the application needs session state.
 
+PgBouncer 1.20 and later accept the `options` startup keyword but reject
+parameters inside it that they do not track. `search_path` is tracked by
+default only when the server reports it, which PostgreSQL 18 does; for older
+servers add it to PgBouncer's `track_extra_parameters`.
+
 `set_statement_timeout!` is rejected while a transaction is open. This keeps
 the durable reconnect setting consistent with PostgreSQL's transactional `SET`
 semantics.

@@ -26,6 +26,17 @@ conn = DBInterface.connect(
 )
 ```
 
+Session defaults such as the schema search path are set with libpq's `options`
+keyword (or the `PGOPTIONS` environment variable). The value is sent to the
+server in the startup packet, so it also applies after an automatic reconnect.
+
+```julia
+conn = DBInterface.connect(
+    Postgres.Connection,
+    "host=127.0.0.1 user=postgres password=postgres dbname=postgres options='-c search_path=myschema'",
+)
+```
+
 ## Querying
 
 `DBInterface.execute` returns a Tables.jl-compatible result. For small result sets, `Tables.rowtable` is a convenient way to materialize rows.
