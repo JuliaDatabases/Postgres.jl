@@ -299,14 +299,19 @@ function writestartupmessage(
     user::String,
     dbname::String,
     application_name::Union{Nothing, String},
+    options::Union{Nothing, String},
     statement_timeout::Union{Nothing, Int},
 )::Nothing
     # statement_timeout is applied with a SET after connect rather than through
     # the startup `options` parameter: poolers (pgbouncer) reject unknown
     # startup options outright, so sending it here fails the whole connection.
+    # A caller-supplied `options` value is different: it is passed through as
+    # given, like libpq does, and an empty value is not sent at all.
+    send_options = options !== nothing && !isempty(options)
     len = 8 + msgsizeof(("user", user)) + msgsizeof(("database", dbname)) +
           msgsizeof(("client_encoding", "UTF8")) + 1
     application_name !== nothing && (len += msgsizeof(("application_name", application_name)))
+    send_options && (len += msgsizeof(("options", options)))
     debug && @info "sending startup message"
     buf = IOBuffer(Vector{UInt8}(undef, len); write=true)
     write(buf, hton(Int32(len)))
@@ -315,6 +320,7 @@ function writestartupmessage(
     _write_startup_param(buf, "database", dbname)
     _write_startup_param(buf, "client_encoding", "UTF8")
     application_name !== nothing && _write_startup_param(buf, "application_name", application_name)
+    send_options && _write_startup_param(buf, "options", options)
     write(buf, UInt8(0))
     write(socket, take!(buf))
     flush(socket)
@@ -708,13 +714,14 @@ end
 # sslservername: TLS SNI override for when `host` is a pre-resolved address —
 # SNI-routed servers (e.g. Neon) need the hostname on the TLS handshake even
 # when the TCP dial goes to an IP.
-function connect(host::String, port::Integer, dbname::String, user::String, @nospecialize(password::Union{String, Nothing}), debug::Bool, @nospecialize(application_name::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}))
+function connect(host::String, port::Integer, dbname::String, user::String, @nospecialize(password::Union{String, Nothing}), debug::Bool, @nospecialize(application_name::Union{String, Nothing}), @nospecialize(options::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}))
     # re-assert the @nospecialize'd params to their declared unions: the asserts give
     # inference the (static) union types without re-introducing per-argument
     # specialization, so the kwarg NamedTuples below have static types instead of
     # runtime apply_type — which `juliac --trim` can't resolve
     password_v = password::Union{String, Nothing}
     application_name_v = application_name::Union{String, Nothing}
+    options_v = options::Union{String, Nothing}
     connect_timeout_v = connect_timeout::Union{Int, Nothing}
     sslmode_v = sslmode::Union{String, Nothing}
     sslrootcert_v = sslrootcert::Union{String, Nothing}
@@ -756,9 +763,9 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
     end
     # socket-union isa split (post-TLS-upgrade φ) so the call resolves under --trim
     if socket isa Reseau.TCP.Conn
-        writestartupmessage(socket::Reseau.TCP.Conn, debug, user, dbname, application_name_v, statement_timeout_v)
+        writestartupmessage(socket::Reseau.TCP.Conn, debug, user, dbname, application_name_v, options_v, statement_timeout_v)
     else
-        writestartupmessage(socket::Reseau.TLS.Conn, debug, user, dbname, application_name_v, statement_timeout_v)
+        writestartupmessage(socket::Reseau.TLS.Conn, debug, user, dbname, application_name_v, options_v, statement_timeout_v)
     end
     # read initial response
     mt, len = readheader(socket, debug, MAX_PREAUTH_MESSAGE_LEN)

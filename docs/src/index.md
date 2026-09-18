@@ -17,11 +17,12 @@ Pkg.add("Postgres")
 Postgres.jl accepts DSN strings or PostgreSQL URIs and supports:
 
 - libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
-- Environment defaults from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
+- Environment defaults from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, `PGOPTIONS`, and TLS-related `PGSSL*` variables.
 - `sslmode` values: `disable`, `prefer` (the default), `require`, `verify-full`. Only `verify-full` verifies the server's certificate; `require` encrypts without authenticating the server, and the default `prefer` falls back to an unencrypted connection if the server declines TLS. Use `verify-full` with `sslrootcert` when the connection needs to be authenticated.
 - TLS files: `sslrootcert`, `sslcert`, `sslkey`, and `sslcapath` (`sslcapath` is a fallback CA bundle or directory, used only when `sslrootcert` is unset and ignored otherwise). `sslservername` overrides the TLS server name when connecting to a pre-resolved address; under `verify-full` it is also the name the certificate is verified against, so it must name the server you intend to authenticate.
 - `connect_timeout` (seconds), `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
+- `options`: server command-line options applied when the session starts, as in libpq (`PGOPTIONS`). For example `options='-c search_path=myschema'` sets the default schema. The value is sent in the startup packet, so it also applies after an automatic reconnect.
 
 Options that request unsupported security or server-selection behavior are
 rejected. They are not silently ignored.
