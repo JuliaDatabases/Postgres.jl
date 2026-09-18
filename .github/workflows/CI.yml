@@ -41,11 +41,6 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v3
-      # TEMPORARY until SASLAuth 1.1.0 is registered: GSSAPI support needs the
-      # unreleased SASLAuth.GSSAPI bindings (JuliaServices/SASLAuth.jl#2).
-      - name: Use unreleased SASLAuth
-        shell: bash
-        run: julia --project=. -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/SASLAuth.jl", rev="gssapi-bindings")'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       # One complete database run is the coverage source. Platform-only runs
@@ -80,11 +75,6 @@ jobs:
           version: '1'
           arch: x64
       - uses: julia-actions/cache@v3
-      # TEMPORARY until SASLAuth 1.1.0 is registered: GSSAPI support needs the
-      # unreleased SASLAuth.GSSAPI bindings (JuliaServices/SASLAuth.jl#2).
-      - name: Use unreleased SASLAuth
-        shell: bash
-        run: julia --project=. -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/SASLAuth.jl", rev="gssapi-bindings")'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
 
@@ -107,11 +97,6 @@ jobs:
           version: '1'
           arch: x64
       - uses: julia-actions/cache@v3
-      # TEMPORARY until SASLAuth 1.1.0 is registered: GSSAPI support needs the
-      # unreleased SASLAuth.GSSAPI bindings (JuliaServices/SASLAuth.jl#2).
-      - name: Use unreleased SASLAuth
-        shell: bash
-        run: julia --project=. -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/SASLAuth.jl", rev="gssapi-bindings")'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
 
@@ -126,13 +111,6 @@ jobs:
         with:
           version: '1'
       - uses: julia-actions/cache@v3
-      # TEMPORARY until SASLAuth 1.1.0 is registered: GSSAPI support needs the
-      # unreleased SASLAuth.GSSAPI bindings (JuliaServices/SASLAuth.jl#2).
-      - name: Use unreleased SASLAuth
-        shell: bash
-        run: |
-          julia --project=. -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/SASLAuth.jl", rev="gssapi-bindings")'
-          julia --project=docs -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/SASLAuth.jl", rev="gssapi-bindings"); Pkg.develop(path=".")'
       - uses: julia-actions/julia-buildpkg@latest
       - uses: julia-actions/julia-docdeploy@latest
         env:
