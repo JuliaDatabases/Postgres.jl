@@ -24,6 +24,37 @@ Keep a manual transaction or streaming cursor on the task that created it.
 Do not run unrelated operations on that connection until the scope ends. Use
 `ConnectionPool` to give concurrent tasks separate connections.
 
+## GSSAPI (Kerberos)
+
+GSSAPI authentication and `gssencmode` encryption use the operating system's
+Kerberos library, loaded at runtime: MIT `libgssapi_krb5.so.2` on Linux and
+the `GSS.framework` on macOS. Nothing is bundled, so the system `krb5.conf`,
+ticket cache (`kinit`, `klist`), and keytabs apply as they do for libpq. On
+Windows the same path works with MIT Kerberos for Windows installed; native
+SSPI is not supported yet. A missing library is reported at connect time
+only when GSSAPI is actually needed.
+
+`gssencmode` defaults to `disable`. libpq defaults to `prefer`, which
+silently replaces TLS with GSS encryption for anyone holding a ticket; set
+`prefer` or `require` explicitly. Encryption needs PostgreSQL 12 or later.
+Under `prefer`, a GSS attempt the server accepted but that then fails is
+retried once without GSS, as libpq does. GSS encryption is only attempted
+when a ticket can be acquired; `require` without one fails before dialing.
+
+The service principal is `krbsrvname@host` (default `postgres@host`), so
+`host` must be the server's Kerberos host name rather than an IP address.
+`gssdelegation` needs a forwardable ticket (`kinit -f`) and a PostgreSQL 16+
+server with `gss_accept_delegation = on`. Kerberos traffic to the KDC runs
+inside the library call and is not bounded by `connect_timeout`.
+
+Server errors received before the encryption handshake completes (the
+`E` answer to `SSLRequest` or `GSSENCRequest`) are reported without the
+server's text, as libpq does since CVE-2024-10977.
+
+CI exercises the protocol paths against a scripted mechanism and server on
+every platform; there is no KDC in CI, so a full Kerberos round trip is not
+tested automatically.
+
 ## Transaction Poolers
 
 Connection-form `DBInterface.execute(conn, sql, params)` is safe through a

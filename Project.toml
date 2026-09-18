@@ -34,7 +34,7 @@ Parsers = "2.7, 3"
 Random = "1.10"
 # Reseau 1.4.4 repairs client-certificate authority matching.
 Reseau = "1.4.4"
-SASLAuth = "1"
+SASLAuth = "1.1"
 Sockets = "1.10"
 StructUtils = "2.3"
 Tables = "1"

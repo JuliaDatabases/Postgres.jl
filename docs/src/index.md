@@ -17,9 +17,10 @@ Pkg.add("Postgres")
 Postgres.jl accepts DSN strings or PostgreSQL URIs and supports:
 
 - libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
-- Environment defaults from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
+- Environment defaults from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, TLS-related `PGSSL*` variables, and `PGGSSENCMODE`, `PGKRBSRVNAME`, `PGGSSDELEGATION`.
 - `sslmode` values: `disable`, `prefer` (the default), `require`, `verify-full`. Only `verify-full` verifies the server's certificate; `require` encrypts without authenticating the server, and the default `prefer` falls back to an unencrypted connection if the server declines TLS. Use `verify-full` with `sslrootcert` when the connection needs to be authenticated.
 - TLS files: `sslrootcert`, `sslcert`, `sslkey`, and `sslcapath` (`sslcapath` is a fallback CA bundle or directory, used only when `sslrootcert` is unset and ignored otherwise). `sslservername` overrides the TLS server name when connecting to a pre-resolved address; under `verify-full` it is also the name the certificate is verified against, so it must name the server you intend to authenticate.
+- `gssencmode` values: `disable` (the default), `prefer`, `require`. GSSAPI (Kerberos) encryption is negotiated before TLS, as in libpq, through the operating system's Kerberos library and ticket cache (`kinit`); `prefer` only tries it when a ticket is available and otherwise follows `sslmode`. `krbsrvname` sets the Kerberos service name (default `postgres`; Active Directory servers often need `POSTGRES`) and `gssdelegation` forwards the ticket to the server. GSSAPI authentication (`gss` in `pg_hba.conf`) is answered automatically with the same library.
 - `connect_timeout` (seconds), `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
 

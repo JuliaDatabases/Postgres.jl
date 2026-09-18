@@ -485,6 +485,7 @@ end
 
 include("timestamps.jl")
 include("decimals.jl")
+include("gssapi.jl")
 
 @testset "Postgres" begin
     test_timestamps()
@@ -597,7 +598,16 @@ include("decimals.jl")
         @test_throws ArgumentError Postgres.parse_dsn("host=h options=-csearch_path=x")
         @test_throws ArgumentError Postgres.parse_dsn("host=h sslcrl=/tmp/crl.pem")
         @test_throws ArgumentError Postgres.parse_dsn("host=h requiressl=1")
-        @test_throws ArgumentError Postgres.parse_dsn("host=h gssencmode=require")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h gsslib=sspi")
+        gss_params = Postgres.parse_dsn("host=h gssencmode=Require krbsrvname=POSTGRES gssdelegation=1")
+        @test gss_params.gssencmode == "require" && gss_params.krbsrvname == "POSTGRES" && gss_params.gssdelegation
+        @test Postgres.parse_dsn("host=h").gssencmode === nothing
+        @test !Postgres.parse_dsn("host=h").gssdelegation
+        withenv("PGGSSENCMODE" => "prefer", "PGKRBSRVNAME" => "svc", "PGGSSDELEGATION" => "on") do
+            env_params = Postgres.parse_dsn("host=h")
+            @test env_params.gssencmode == "prefer" && env_params.krbsrvname == "svc" && env_params.gssdelegation
+        end
+        @test_throws ArgumentError Postgres.parse_dsn("host=h gssdelegation=maybe")
         @test_throws ArgumentError Postgres.parse_dsn("host=h requirepeer=postgres")
         @test_throws ArgumentError Postgres.parse_dsn("host=h hostaddr=203.0.113.1")
         @test_throws ArgumentError Postgres.parse_dsn("host=h client_encoding=LATIN1")
@@ -981,6 +991,8 @@ include("decimals.jl")
             end
         end
     end
+
+    test_gssapi()
 
     require_integration = get(ENV, "POSTGRES_REQUIRE_INTEGRATION", "false") == "true"
     if !docker_available()
@@ -2599,6 +2611,16 @@ include("decimals.jl")
 
             finally
                 isopen(conn) && DBInterface.close!(conn)
+            end
+        end
+
+        @testset "Kerberos" begin
+            if !GSSAPI.available()
+                require_integration && error("PostgreSQL Kerberos tests require the system GSSAPI library")
+                @info "GSSAPI library not available; skipping Kerberos integration tests."
+                @test true
+            else
+                test_kerberos_integration()
             end
         end
 

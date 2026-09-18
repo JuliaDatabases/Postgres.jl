@@ -7,7 +7,6 @@ import Durations, DataDecimals
 
 export PostgresStyle, AbstractPostgresStyle, query_logging_enabled, query_logger, notice_callback, notification_callback, Error, Notification, PostgresRange, cancel_request
 
-const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
 const SKIP_BUFFER_SIZE = 8192
 
 """
@@ -211,6 +210,9 @@ function parameterStatus!(parameters::Dict{String, String}, len, socket)
 end
 
 include("types.jl")
+include("gss.jl")
+
+const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn, GSSConn}
 
 struct Params
     params::Vector{Union{String, Missing}}
@@ -510,7 +512,7 @@ function write_password_message(socket, debug::Bool, password::String)
     return
 end
 
-function authRequest(debug, len, socket, user, password, client::Union{Nothing, SASLAuth.SCRAMSHA256Client}=nothing)
+function authRequest(debug, len, socket, user, password, host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle, client::Union{Nothing, SASLAuth.SCRAMSHA256Client}=nothing)
     auth_code = ntoh(read(socket, Int32))
     debug && @info "auth code: $auth_code"
     if auth_code == 0
@@ -562,18 +564,13 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         else
             close_and_throw(socket, Error("unexpected message type: $(Char(mt))"))
         end
-    elseif auth_code == 7
-        # GSSAPI
-        close_and_throw(socket, Error("GSSAPI authentication not supported"))
-
+    elseif auth_code == 7 || auth_code == 9
+        # GSSAPI, or SSPI served by the GSSAPI library as a Unix libpq does
+        gss_authenticate!(socket, style, host, krbsrvname, gssdelegation, debug)
+        return socket
     elseif auth_code == 8
-        # Specifies that this message contains GSSAPI or SSPI data.
-        close_and_throw(socket, Error("GSSAPI/SSPI continuation not supported"))
-
-    elseif auth_code == 9
-        # Specifies that SSPI authentication is required.
-        close_and_throw(socket, Error("SSPI authentication not supported"))
-
+        # a GSSAPI continuation is only valid inside gss_authenticate!
+        close_and_throw(socket, Error("unexpected GSSAPI continuation message"))
     elseif auth_code == 10
         # SASL Authentication Required
         data = String(read(socket, len - 4))
@@ -592,7 +589,7 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         writemessage(socket, false, 'p', "SCRAM-SHA-256", Int32(length(bytes)), bytes)
         mt, len = readheader(socket, debug, MAX_PREAUTH_MESSAGE_LEN)
         expect_auth_message(socket, debug, mt, len)
-        return authRequest(debug, len, socket, user, password, client)
+        return authRequest(debug, len, socket, user, password, host, krbsrvname, gssdelegation, style, client)
     elseif auth_code == 11
         # SASL Challenge
         challenge = String(read(socket, len - 4))
@@ -601,7 +598,7 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         writemessage(socket, false, 'p', Vector{UInt8}(msg))
         mt, len = readheader(socket, debug, MAX_PREAUTH_MESSAGE_LEN)
         expect_auth_message(socket, debug, mt, len)
-        return authRequest(debug, len, socket, user, password, client)
+        return authRequest(debug, len, socket, user, password, host, krbsrvname, gssdelegation, style, client)
     elseif auth_code == 12
         # SASL Final Message
         final_msg = String(read(socket, len - 4))
@@ -617,7 +614,7 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
     end
 end
 
-function authRequest(debug, len, socket, user, ::Nothing, client::Nothing=nothing)
+function authRequest(debug, len, socket, user, ::Nothing, host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle, client::Nothing=nothing)
     auth_code = ntoh(read(socket, Int32))
     debug && @info "auth code: $auth_code"
     if auth_code == 0
@@ -626,12 +623,11 @@ function authRequest(debug, len, socket, user, ::Nothing, client::Nothing=nothin
         close_and_throw(socket, Error("kerberos v5 authentication not supported"))
     elseif auth_code == 3 || auth_code == 5 || auth_code == 10 || auth_code == 11 || auth_code == 12
         close_and_throw(socket, Error("server requested password authentication but no password was provided"))
-    elseif auth_code == 7
-        close_and_throw(socket, Error("GSSAPI authentication not supported"))
+    elseif auth_code == 7 || auth_code == 9
+        gss_authenticate!(socket, style, host, krbsrvname, gssdelegation, debug)
+        return socket
     elseif auth_code == 8
-        close_and_throw(socket, Error("GSSAPI/SSPI continuation not supported"))
-    elseif auth_code == 9
-        close_and_throw(socket, Error("SSPI authentication not supported"))
+        close_and_throw(socket, Error("unexpected GSSAPI continuation message"))
     else
         close_and_throw(socket, Error("unknown authentication code: $auth_code"))
     end
@@ -708,7 +704,12 @@ end
 # sslservername: TLS SNI override for when `host` is a pre-resolved address —
 # SNI-routed servers (e.g. Neon) need the hostname on the TLS handshake even
 # when the TCP dial goes to an IP.
-function connect(host::String, port::Integer, dbname::String, user::String, @nospecialize(password::Union{String, Nothing}), debug::Bool, @nospecialize(application_name::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}))
+#
+# Encryption is negotiated in libpq's order: GSSAPI first when `gssencmode`
+# asks for it and a ticket can be acquired, then TLS per `sslmode`. A GSS
+# attempt that fails after the server accepted it (`prefer` only) is retried
+# once on a fresh connection without GSSAPI, as libpq does.
+function connect(host::String, port::Integer, dbname::String, user::String, @nospecialize(password::Union{String, Nothing}), debug::Bool, @nospecialize(application_name::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), @nospecialize(gssencmode::Union{String, Nothing}=nothing), @nospecialize(krbsrvname::Union{String, Nothing}=nothing), gssdelegation::Bool=false, style::AbstractPostgresStyle=PostgresStyle())
     # re-assert the @nospecialize'd params to their declared unions: the asserts give
     # inference the (static) union types without re-introducing per-argument
     # specialization, so the kwarg NamedTuples below have static types instead of
@@ -723,12 +724,60 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
     sslcapath_v = sslcapath::Union{String, Nothing}
     sslservername_v = sslservername::Union{String, Nothing}
     statement_timeout_v = statement_timeout::Union{Int, Nothing}
+    gssencmode_str = gssencmode === nothing ? "disable" : lowercase(gssencmode::String)
+    gssencmode_str == "disable" || gssencmode_str == "prefer" || gssencmode_str == "require" || throw(Error("invalid gssencmode: $gssencmode_str"))
+    krbsrvname_str = krbsrvname === nothing ? "postgres" : krbsrvname::String
+    # GSS encryption is only attempted when initiator credentials (a ticket)
+    # can be acquired; `require` without them fails before any dial, as in libpq
+    try_gss = gssencmode_str != "disable"
+    if try_gss && !gss_has_credentials(style)
+        gssencmode_str == "require" && throw(Error("GSSAPI encryption required but no credential cache"))
+        try_gss = false
+    end
+    if try_gss
+        socket = connectsocket(host, port, connect_timeout_v)
+        gss_used = true
+        try
+            gss = gss_encrypt(socket, style, host, krbsrvname_str, gssdelegation, debug)
+            gss !== nothing && return _startup!(gss, debug, user, dbname, password_v, application_name_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+            gssencmode_str == "require" && throw(Error("server doesn't support GSSAPI encryption, but it was required"))
+            # 'N': nothing was consumed beyond the one byte, so continue on
+            # this connection with TLS or plaintext, as libpq does
+            gss_used = false
+            return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, connect_timeout_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+        catch err
+            close(socket)
+            (gss_used && gssencmode_str == "prefer") || rethrow()
+            debug && @info "GSSAPI encryption attempt failed; retrying without it" exception=(err, catch_backtrace())
+        end
+    end
     socket = connectsocket(host, port, connect_timeout_v)
     # Any failure from here on must close the socket: nothing else holds a
     # reference to it, and the transport has no finalizer, so an escaping
     # exception would leak the descriptor for the life of the process —
     # a pool or reconnect loop against a flapping server would hit EMFILE.
     try
+        return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, connect_timeout_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+    catch
+        close(socket)
+        rethrow()
+    end
+end
+
+# SSLRequest per `sslmode`, then the startup exchange on whichever transport
+# resulted. Each branch calls `_startup!` on a concrete socket type, so the
+# calls resolve statically.
+function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbname::String, @nospecialize(password::Union{String, Nothing}), @nospecialize(application_name::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle)
+    password_v = password::Union{String, Nothing}
+    application_name_v = application_name::Union{String, Nothing}
+    connect_timeout_v = connect_timeout::Union{Int, Nothing}
+    sslmode_v = sslmode::Union{String, Nothing}
+    sslrootcert_v = sslrootcert::Union{String, Nothing}
+    sslcert_v = sslcert::Union{String, Nothing}
+    sslkey_v = sslkey::Union{String, Nothing}
+    sslcapath_v = sslcapath::Union{String, Nothing}
+    sslservername_v = sslservername::Union{String, Nothing}
+    statement_timeout_v = statement_timeout::Union{Int, Nothing}
     sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(String(sslmode_v))
     sslmode_str == "disable" || sslmode_str == "prefer" || sslmode_str == "require" || sslmode_str == "verify-full" || throw(Error("invalid sslmode: $sslmode_str"))
     if sslmode_str != "disable"
@@ -737,36 +786,37 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
         mt = read(socket, UInt8)
         if mt == UInt8('S')
             # upgrade socket to tls and do handshake
-            socket = tlsupgrade(socket, connect_timeout_v,
-                                sslservername_v isa String ? sslservername_v : host,
-                                sslmode_str == "verify-full",
-                                sslcert_v, sslkey_v, sslrootcert_v, sslcapath_v)
+            tls = tlsupgrade(socket, connect_timeout_v,
+                             sslservername_v isa String ? sslservername_v : host,
+                             sslmode_str == "verify-full",
+                             sslcert_v, sslkey_v, sslrootcert_v, sslcapath_v)
+            return _startup!(tls, debug, user, dbname, password_v, application_name_v, statement_timeout_v, host, krbsrvname, gssdelegation, style)
         elseif mt == UInt8('N')
             (sslmode_str == "require" || sslmode_str == "verify-full") && throw(Error("server does not support SSL"))
         elseif mt == UInt8('E')
-            # server may answer SSLRequest with a full ErrorResponse. This is
-            # pre-TLS and pre-auth, so bound the length like readheader does
-            # before handing it to the allocating read.
-            len = ntoh(read(socket, Int32)) - 4
-            (len < 0 || len > MAX_PREAUTH_MESSAGE_LEN) && close_and_throw(socket, Error("invalid message length $len from server"))
-            close_and_throw_error_response(socket, len, debug)
+            # The server may answer SSLRequest with an ErrorResponse (it could
+            # not fork a backend, say). It is not authenticated yet, so its
+            # text is not read or shown (CVE-2024-10977), as libpq does.
+            close_and_throw(socket, Error("server sent an error response during SSL exchange"))
         else
             close_and_throw(socket, Error("unexpected response to SSLRequest: $(Char(mt))"))
         end
     end
-    # socket-union isa split (post-TLS-upgrade φ) so the call resolves under --trim
-    if socket isa Reseau.TCP.Conn
-        writestartupmessage(socket::Reseau.TCP.Conn, debug, user, dbname, application_name_v, statement_timeout_v)
-    else
-        writestartupmessage(socket::Reseau.TLS.Conn, debug, user, dbname, application_name_v, statement_timeout_v)
-    end
+    return _startup!(socket, debug, user, dbname, password_v, application_name_v, statement_timeout_v, host, krbsrvname, gssdelegation, style)
+end
+
+function _startup!(socket, debug::Bool, user::String, dbname::String, @nospecialize(password::Union{String, Nothing}), @nospecialize(application_name::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle)
+    password_v = password::Union{String, Nothing}
+    application_name_v = application_name::Union{String, Nothing}
+    statement_timeout_v = statement_timeout::Union{Int, Nothing}
+    writestartupmessage(socket, debug, user, dbname, application_name_v, statement_timeout_v)
     # read initial response
     mt, len = readheader(socket, debug, MAX_PREAUTH_MESSAGE_LEN)
     if mt == UInt8('E')
         # error
         close_and_throw_error_response(socket, len, debug)
     elseif mt == UInt8('R')
-        authRequest(debug, len, socket, user, password_v)
+        authRequest(debug, len, socket, user, password_v, host, krbsrvname, gssdelegation, style)
     elseif mt == UInt8('v')
         # server version too old
         close_and_throw(socket, Error("server version too old"))
@@ -774,17 +824,8 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
     pid, skey, server_params = waitfor(socket, debug, 'K', 'Z'; max_message_len=MAX_PREAUTH_MESSAGE_LEN)
     uppercase(replace(get(server_params, "client_encoding", ""), "-" => "")) == "UTF8" ||
         close_and_throw(socket, Error("server did not confirm UTF8 client_encoding"))
-    # socket-union isa split so the call resolves under --trim, as above
-    if socket isa Reseau.TCP.Conn
-        align_session_formats!(socket::Reseau.TCP.Conn, server_params, debug, statement_timeout_v)
-    else
-        align_session_formats!(socket::Reseau.TLS.Conn, server_params, debug, statement_timeout_v)
-    end
+    align_session_formats!(socket, server_params, debug, statement_timeout_v)
     return socket, pid, skey, server_params
-    catch
-        close(socket)
-        rethrow()
-    end
 end
 
 # The text-format parsers only understand ISO dates and postgres-style
@@ -1409,8 +1450,9 @@ function close_statement(socket, name::String, debug::Bool,
 end
 
 # The cancel key is a credential: anyone holding it can cancel that backend's
-# queries for the life of the connection, so the CancelRequest goes over TLS
-# whenever the connection it cancels uses TLS.
+# queries for the life of the connection, so the CancelRequest goes over the
+# same kind of encryption the connection it cancels uses: GSSAPI when that
+# connection is GSS-encrypted, TLS when it is on TLS.
 function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug::Bool=false,
                         @nospecialize(sslmode::Union{String, Nothing}=nothing),
                         @nospecialize(sslrootcert::Union{String, Nothing}=nothing),
@@ -1418,49 +1460,63 @@ function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug:
                         @nospecialize(sslkey::Union{String, Nothing}=nothing),
                         @nospecialize(sslcapath::Union{String, Nothing}=nothing),
                         @nospecialize(sslservername::Union{String, Nothing}=nothing),
-                        @nospecialize(connect_timeout::Union{Int, Nothing}=nothing))
+                        @nospecialize(connect_timeout::Union{Int, Nothing}=nothing),
+                        @nospecialize(gssencmode::Union{String, Nothing}=nothing),
+                        @nospecialize(krbsrvname::Union{String, Nothing}=nothing),
+                        gssdelegation::Bool=false, style::AbstractPostgresStyle=PostgresStyle())
     sslmode_v = sslmode::Union{String, Nothing}
     connect_timeout_v = connect_timeout::Union{Int, Nothing}
     sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(String(sslmode_v))
     tls_required = sslmode_str == "require" || sslmode_str == "verify-full"
+    gssencmode_str = gssencmode === nothing ? "disable" : lowercase(gssencmode::String)
+    gss_required = gssencmode_str == "require"
+    krbsrvname_str = krbsrvname === nothing ? "postgres" : krbsrvname::String
     socket = connectsocket(host, port, connect_timeout_v)
-    refused_cleartext = false
+    stream = socket
+    refused = nothing
     sent = false
     try
-        send_key = true
-        if sslmode_str != "disable"
+        if gssencmode_str != "disable" && (gss_required || gss_has_credentials(style))
+            gss = gss_encrypt(socket, style, host, krbsrvname_str, gssdelegation, debug)
+            if gss !== nothing
+                stream = gss
+            elseif gss_required
+                # never send the cancel key in the clear when GSS encryption was required
+                refused = "server refused GSSAPI encryption on the cancel connection; not sending the cancel key in cleartext under gssencmode=$gssencmode_str"
+            end
+        end
+        if stream === socket && refused === nothing && sslmode_str != "disable"
             writemessage(socket, debug, '\0', Int32(80877103))
             mt = read(socket, UInt8)
             if mt == UInt8('S')
-                socket = tlsupgrade(socket, connect_timeout_v,
+                stream = tlsupgrade(socket, connect_timeout_v,
                                     sslservername isa String ? sslservername::String : host,
                                     sslmode_str == "verify-full",
                                     sslcert::Union{String, Nothing}, sslkey::Union{String, Nothing},
                                     sslrootcert::Union{String, Nothing}, sslcapath::Union{String, Nothing})
             elseif tls_required
                 # never send the cancel key in the clear when TLS was required
-                refused_cleartext = true
-                send_key = false
+                refused = "server refused TLS on the cancel connection; not sending the cancel key in cleartext under sslmode=$sslmode_str"
             end
         end
-        if send_key
+        if refused === nothing
             buf = IOBuffer(Vector{UInt8}(undef, 16); write=true)
             write(buf, hton(Int32(16)))
             write(buf, hton(Int32(80877102)))  # CancelRequest code
             write(buf, hton(pid))
             write(buf, hton(skey))
-            write(socket, take!(buf))
-            flush(socket)
+            write(stream, take!(buf))
+            flush(stream)
             sent = true
         end
     catch
         sent = false
     finally
-        close(socket)
+        close(stream)
     end
     # refusing to send is a hard failure the caller must hear about, not a
     # silent no-op: the query they asked to cancel is still running
-    refused_cleartext && throw(PostgresInterfaceError("server refused TLS on the cancel connection; not sending the cancel key in cleartext under sslmode=$sslmode_str"))
+    refused === nothing || throw(PostgresInterfaceError(refused))
     return sent
 end
 
