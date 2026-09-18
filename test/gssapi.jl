@@ -537,16 +537,21 @@ cat > /etc/krb5kdc/kdc.conf <<'KDC'
         max_life = 10h 0m 0s
     }
 KDC
+# the mounted directory is only traversable by root (it is a 0700 host temp
+# dir on Linux), so the server's files live in a container-local directory
+# and only the ticket cache goes out through the mount
+mkdir -p /etc/pgkrb
+cp /keys/pg_hba.conf /etc/pgkrb/pg_hba.conf
 kdb5_util create -s -P master-secret -r $KRB_REALM >/dev/null
 kadmin.local -q "addprinc -randkey postgres/127.0.0.1@$KRB_REALM" >/dev/null
-kadmin.local -q "ktadd -k /keys/server.keytab postgres/127.0.0.1@$KRB_REALM" >/dev/null
+kadmin.local -q "ktadd -k /etc/pgkrb/server.keytab postgres/127.0.0.1@$KRB_REALM" >/dev/null
 kadmin.local -q "addprinc -pw user-secret $KRB_USER@$KRB_REALM" >/dev/null
 krb5kdc
 echo user-secret | kinit -c /keys/ccache $KRB_USER@$KRB_REALM
 chmod 644 /keys/ccache
-chown postgres:postgres /keys/server.keytab /keys/pg_hba.conf
-chmod 600 /keys/server.keytab
-exec docker-entrypoint.sh postgres -c krb_server_keyfile=/keys/server.keytab -c hba_file=/keys/pg_hba.conf
+chown postgres:postgres /etc/pgkrb/server.keytab /etc/pgkrb/pg_hba.conf
+chmod 600 /etc/pgkrb/server.keytab
+exec docker-entrypoint.sh postgres -c krb_server_keyfile=/etc/pgkrb/server.keytab -c hba_file=/etc/pgkrb/pg_hba.conf
 """
     return ["sh", "-c", setup_script]
 end

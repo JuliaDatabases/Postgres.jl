@@ -130,7 +130,7 @@ jobs:
       # unreleased SASLAuth.GSSAPI bindings (JuliaServices/SASLAuth.jl#2).
       - name: Use unreleased SASLAuth
         shell: bash
-        run: julia --project=docs -e 'using Pkg; Pkg.develop(path="."); Pkg.add(url="https://github.com/JuliaServices/SASLAuth.jl", rev="gssapi-bindings")'
+        run: julia --project=docs -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/SASLAuth.jl", rev="gssapi-bindings"); Pkg.develop(path=".")'
       - uses: julia-actions/julia-buildpkg@latest
       - uses: julia-actions/julia-docdeploy@latest
         env:
