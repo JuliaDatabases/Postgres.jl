@@ -12,7 +12,7 @@ Structured connection options, an alternative to DSN strings:
     conn = DBInterface.connect(Postgres.Connection, params)
 
 Also produced by `Postgres.parse_dsn`. Supported keyword
-arguments mirror the connection keywords: `application_name`,
+arguments mirror the connection keywords: `application_name`, `options`,
 `connect_timeout`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`,
 `sslservername`, `gssencmode`, `krbsrvname`, `gssdelegation`,
 `statement_timeout`, `statement_cache_maxsize`, `debug`, and `reconnect`. `numeric_overflow` accepts `:warn` (return out-of-range numeric
@@ -26,6 +26,7 @@ struct ConnectionParams
     password::Union{String, Nothing}
     dbname::String
     application_name::Union{String, Nothing}
+    options::Union{String, Nothing}
     connect_timeout::Union{Int, Nothing}
     sslmode::Union{String, Nothing}
     sslrootcert::Union{String, Nothing}
@@ -43,9 +44,9 @@ struct ConnectionParams
     numeric_overflow::Symbol
 end
 
-function ConnectionParams(; host::String="localhost", port::Int=5432, user::String="", password::Union{String, Nothing}=nothing, dbname::String="", application_name::Union{String, Nothing}=nothing, connect_timeout::Union{Int, Nothing}=nothing, sslmode::Union{String, Nothing}=nothing, sslrootcert::Union{String, Nothing}=nothing, sslcert::Union{String, Nothing}=nothing, sslkey::Union{String, Nothing}=nothing, sslcapath::Union{String, Nothing}=nothing, sslservername::Union{String, Nothing}=nothing, gssencmode::Union{String, Nothing}=nothing, krbsrvname::Union{String, Nothing}=nothing, gssdelegation::Bool=false, statement_timeout::Union{Int, Nothing}=nothing, statement_cache_maxsize::Int=100, debug::Bool=false, reconnect::Bool=false, numeric_overflow::Symbol=:warn)
+function ConnectionParams(; host::String="localhost", port::Int=5432, user::String="", password::Union{String, Nothing}=nothing, dbname::String="", application_name::Union{String, Nothing}=nothing, options::Union{String, Nothing}=nothing, connect_timeout::Union{Int, Nothing}=nothing, sslmode::Union{String, Nothing}=nothing, sslrootcert::Union{String, Nothing}=nothing, sslcert::Union{String, Nothing}=nothing, sslkey::Union{String, Nothing}=nothing, sslcapath::Union{String, Nothing}=nothing, sslservername::Union{String, Nothing}=nothing, gssencmode::Union{String, Nothing}=nothing, krbsrvname::Union{String, Nothing}=nothing, gssdelegation::Bool=false, statement_timeout::Union{Int, Nothing}=nothing, statement_cache_maxsize::Int=100, debug::Bool=false, reconnect::Bool=false, numeric_overflow::Symbol=:warn)
     numeric_overflow in (:warn, :error) || throw(ArgumentError("numeric_overflow must be :warn or :error"))
-    return ConnectionParams(host, port, user, password, dbname, application_name, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, sslservername, gssencmode, krbsrvname, gssdelegation, statement_timeout, statement_cache_maxsize, debug, reconnect, numeric_overflow)
+    return ConnectionParams(host, port, user, password, dbname, application_name, options, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, sslservername, gssencmode, krbsrvname, gssdelegation, statement_timeout, statement_cache_maxsize, debug, reconnect, numeric_overflow)
 end
 
 function Base.show(io::IO, params::ConnectionParams)
@@ -81,6 +82,7 @@ function apply_env_defaults!(values::Dict{String, String})
         "dbname" => "PGDATABASE",
         "password" => "PGPASSWORD",
         "application_name" => "PGAPPNAME",
+        "options" => "PGOPTIONS",
         "connect_timeout" => "PGCONNECT_TIMEOUT",
         "sslmode" => "PGSSLMODE",
         "sslrootcert" => "PGSSLROOTCERT",
@@ -99,7 +101,7 @@ end
 
 const KNOWN_PARAMS = Set([
     "host", "port", "user", "password", "dbname", "application_name",
-    "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey",
+    "options", "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey",
     "sslcapath", "sslservername", "gssencmode", "krbsrvname", "gssdelegation",
     "statement_timeout", "statement_cache_maxsize", "debug", "reconnect",
     "numeric_overflow",
@@ -110,7 +112,7 @@ const KNOWN_PARAMS = Set([
 # the connection URI they hand users, and failing on a DSN that names a real
 # libpq option would be worse than not honoring it.
 const IGNORED_PARAMS = Set([
-    "channel_binding", "target_session_attrs", "options",
+    "channel_binding", "target_session_attrs",
     "gsslib", "sslnegotiation", "sslcompression", "sslcrl",
     "sslcrldir", "sslpassword", "requiressl", "requirepeer", "hostaddr",
     "client_encoding", "passfile", "service", "fallback_application_name",
@@ -135,7 +137,6 @@ end
 const SECURITY_SENSITIVE_IGNORED = Dict(
     "channel_binding" => ("", "prefer", "disable"),
     "target_session_attrs" => ("", "any"),
-    "options" => ("",),
     "gsslib" => ("", "gssapi"),
     "sslnegotiation" => ("", "postgres"),
     "sslcompression" => ("", "0"),
@@ -189,6 +190,7 @@ function params_from_values(values::Dict{String, String})
         password=get(merged, "password", nothing),
         dbname=dbname,
         application_name=get(merged, "application_name", nothing),
+        options=get(merged, "options", nothing),
         connect_timeout=parse_optional_int(get(merged, "connect_timeout", nothing), "connect_timeout"),
         # deliberately NOT empty-tolerant, matching libpq: an unexpanded
         # ${PGSSLMODE} that was meant to be verify-full must fail loudly

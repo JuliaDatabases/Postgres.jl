@@ -301,14 +301,19 @@ function writestartupmessage(
     user::String,
     dbname::String,
     application_name::Union{Nothing, String},
+    options::Union{Nothing, String},
     statement_timeout::Union{Nothing, Int},
 )::Nothing
     # statement_timeout is applied with a SET after connect rather than through
     # the startup `options` parameter: poolers (pgbouncer) reject unknown
     # startup options outright, so sending it here fails the whole connection.
+    # A caller-supplied `options` value is different: it is passed through as
+    # given, like libpq does, and an empty value is not sent at all.
+    send_options = options !== nothing && !isempty(options)
     len = 8 + msgsizeof(("user", user)) + msgsizeof(("database", dbname)) +
           msgsizeof(("client_encoding", "UTF8")) + 1
     application_name !== nothing && (len += msgsizeof(("application_name", application_name)))
+    send_options && (len += msgsizeof(("options", options)))
     debug && @info "sending startup message"
     buf = IOBuffer(Vector{UInt8}(undef, len); write=true)
     write(buf, hton(Int32(len)))
@@ -317,6 +322,7 @@ function writestartupmessage(
     _write_startup_param(buf, "database", dbname)
     _write_startup_param(buf, "client_encoding", "UTF8")
     application_name !== nothing && _write_startup_param(buf, "application_name", application_name)
+    send_options && _write_startup_param(buf, "options", options)
     write(buf, UInt8(0))
     write(socket, take!(buf))
     flush(socket)
@@ -709,13 +715,14 @@ end
 # asks for it and a ticket can be acquired, then TLS per `sslmode`. A GSS
 # attempt that fails after the server accepted it (`prefer` only) is retried
 # once on a fresh connection without GSSAPI, as libpq does.
-function connect(host::String, port::Integer, dbname::String, user::String, @nospecialize(password::Union{String, Nothing}), debug::Bool, @nospecialize(application_name::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), @nospecialize(gssencmode::Union{String, Nothing}=nothing), @nospecialize(krbsrvname::Union{String, Nothing}=nothing), gssdelegation::Bool=false, style::AbstractPostgresStyle=PostgresStyle())
+function connect(host::String, port::Integer, dbname::String, user::String, @nospecialize(password::Union{String, Nothing}), debug::Bool, @nospecialize(application_name::Union{String, Nothing}), @nospecialize(options::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), @nospecialize(gssencmode::Union{String, Nothing}=nothing), @nospecialize(krbsrvname::Union{String, Nothing}=nothing), gssdelegation::Bool=false, style::AbstractPostgresStyle=PostgresStyle())
     # re-assert the @nospecialize'd params to their declared unions: the asserts give
     # inference the (static) union types without re-introducing per-argument
     # specialization, so the kwarg NamedTuples below have static types instead of
     # runtime apply_type — which `juliac --trim` can't resolve
     password_v = password::Union{String, Nothing}
     application_name_v = application_name::Union{String, Nothing}
+    options_v = options::Union{String, Nothing}
     connect_timeout_v = connect_timeout::Union{Int, Nothing}
     sslmode_v = sslmode::Union{String, Nothing}
     sslrootcert_v = sslrootcert::Union{String, Nothing}
@@ -739,12 +746,12 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
         gss_used = true
         try
             gss = gss_encrypt(socket, style, host, krbsrvname_str, gssdelegation, debug)
-            gss !== nothing && return _startup!(gss, debug, user, dbname, password_v, application_name_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+            gss !== nothing && return _startup!(gss, debug, user, dbname, password_v, application_name_v, options_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
             gssencmode_str == "require" && throw(Error("server doesn't support GSSAPI encryption, but it was required"))
             # 'N': nothing was consumed beyond the one byte, so continue on
             # this connection with TLS or plaintext, as libpq does
             gss_used = false
-            return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, connect_timeout_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+            return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, options_v, connect_timeout_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
         catch err
             close(socket)
             (gss_used && gssencmode_str == "prefer") || rethrow()
@@ -757,7 +764,7 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
     # exception would leak the descriptor for the life of the process —
     # a pool or reconnect loop against a flapping server would hit EMFILE.
     try
-        return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, connect_timeout_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+        return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, options_v, connect_timeout_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
     catch
         close(socket)
         rethrow()
@@ -767,9 +774,10 @@ end
 # SSLRequest per `sslmode`, then the startup exchange on whichever transport
 # resulted. Each branch calls `_startup!` on a concrete socket type, so the
 # calls resolve statically.
-function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbname::String, @nospecialize(password::Union{String, Nothing}), @nospecialize(application_name::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle)
+function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbname::String, @nospecialize(password::Union{String, Nothing}), @nospecialize(application_name::Union{String, Nothing}), @nospecialize(options::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle)
     password_v = password::Union{String, Nothing}
     application_name_v = application_name::Union{String, Nothing}
+    options_v = options::Union{String, Nothing}
     connect_timeout_v = connect_timeout::Union{Int, Nothing}
     sslmode_v = sslmode::Union{String, Nothing}
     sslrootcert_v = sslrootcert::Union{String, Nothing}
@@ -790,7 +798,7 @@ function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbnam
                              sslservername_v isa String ? sslservername_v : host,
                              sslmode_str == "verify-full",
                              sslcert_v, sslkey_v, sslrootcert_v, sslcapath_v)
-            return _startup!(tls, debug, user, dbname, password_v, application_name_v, statement_timeout_v, host, krbsrvname, gssdelegation, style)
+            return _startup!(tls, debug, user, dbname, password_v, application_name_v, options_v, statement_timeout_v, host, krbsrvname, gssdelegation, style)
         elseif mt == UInt8('N')
             (sslmode_str == "require" || sslmode_str == "verify-full") && throw(Error("server does not support SSL"))
         elseif mt == UInt8('E')
@@ -802,14 +810,15 @@ function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbnam
             close_and_throw(socket, Error("unexpected response to SSLRequest: $(Char(mt))"))
         end
     end
-    return _startup!(socket, debug, user, dbname, password_v, application_name_v, statement_timeout_v, host, krbsrvname, gssdelegation, style)
+    return _startup!(socket, debug, user, dbname, password_v, application_name_v, options_v, statement_timeout_v, host, krbsrvname, gssdelegation, style)
 end
 
-function _startup!(socket, debug::Bool, user::String, dbname::String, @nospecialize(password::Union{String, Nothing}), @nospecialize(application_name::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle)
+function _startup!(socket, debug::Bool, user::String, dbname::String, @nospecialize(password::Union{String, Nothing}), @nospecialize(application_name::Union{String, Nothing}), @nospecialize(options::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle)
     password_v = password::Union{String, Nothing}
     application_name_v = application_name::Union{String, Nothing}
+    options_v = options::Union{String, Nothing}
     statement_timeout_v = statement_timeout::Union{Int, Nothing}
-    writestartupmessage(socket, debug, user, dbname, application_name_v, statement_timeout_v)
+    writestartupmessage(socket, debug, user, dbname, application_name_v, options_v, statement_timeout_v)
     # read initial response
     mt, len = readheader(socket, debug, MAX_PREAUTH_MESSAGE_LEN)
     if mt == UInt8('E')

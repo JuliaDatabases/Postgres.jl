@@ -595,7 +595,17 @@ include("gssapi.jl")
         # routing guarantee to the caller.
         @test_throws ArgumentError Postgres.parse_dsn("postgresql://u:p@h/db?sslmode=require&channel_binding=require")
         @test_throws ArgumentError Postgres.parse_dsn("postgresql://u@h/db?target_session_attrs=read-write")
-        @test_throws ArgumentError Postgres.parse_dsn("host=h options=-csearch_path=x")
+        # libpq's `options` (server command-line switches) passes through to the
+        # startup packet; quoting or URI-escaping carries spaces in the value
+        @test Postgres.parse_dsn("host=h options=-csearch_path=x").options == "-csearch_path=x"
+        @test Postgres.parse_dsn("host=h options='-c search_path=x -c geqo=off'").options == "-c search_path=x -c geqo=off"
+        @test Postgres.parse_dsn("postgresql://u@h/db?options=-c%20search_path%3Dx").options == "-c search_path=x"
+        @test Postgres.parse_dsn("host=h").options === nothing
+        withenv("PGOPTIONS" => "-c search_path=envschema") do
+            @test Postgres.parse_dsn("host=h").options == "-c search_path=envschema"
+            @test Postgres.parse_dsn("host=h options=-cgeqo=off").options == "-cgeqo=off"
+        end
+        @test Postgres.ConnectionParams(host="h", options="-c geqo=off").options == "-c geqo=off"
         @test_throws ArgumentError Postgres.parse_dsn("host=h sslcrl=/tmp/crl.pem")
         @test_throws ArgumentError Postgres.parse_dsn("host=h requiressl=1")
         @test_throws ArgumentError Postgres.parse_dsn("host=h gsslib=sspi")
@@ -766,6 +776,7 @@ include("gssapi.jl")
         @test_throws Postgres.PostgresInterfaceError Postgres.escape_identifier("a\0b")
         @test_throws Postgres.PostgresInterfaceError Postgres.escape_literal("a\0b")
         @test_throws Postgres.PostgresInterfaceError Postgres.Connection(host="127.0.0.1", port=1, user="u\0x")
+        @test_throws Postgres.PostgresInterfaceError Postgres.Connection(host="127.0.0.1", port=1, user="u", options="-c a\0b")
 
         # severity must come from the non-localized 'V' field when the server
         # sends it: 'S' is translated, so comparing it to "FATAL" would depend
@@ -1019,6 +1030,44 @@ include("gssapi.jl")
                         @test err.code == "28P01"
                     end
                     @test isopen(conn)
+                end
+                @testset "Startup Options" begin
+                    DBInterface.execute(conn, "CREATE SCHEMA IF NOT EXISTS startup_opts")
+                    try
+                        # `options` rides in the startup packet, so it applies before
+                        # the first query and survives a reconnect without replay
+                        opt_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, options="-c search_path=startup_opts", reconnect=true)
+                        @test only(Tables.rowtable(DBInterface.execute(opt_conn, "SHOW search_path"))).search_path == "startup_opts"
+                        close(opt_conn.socket)
+                        @test only(Tables.rowtable(DBInterface.execute(opt_conn, "SHOW search_path"))).search_path == "startup_opts"
+                        DBInterface.close!(opt_conn)
+                        # DSN form, in libpq's space-free spelling, with two switches
+                        dsn_conn = DBInterface.connect(Postgres.Connection, "host=$(cfg.host) port=$(cfg.port) user=$(cfg.user) password=$(cfg.password) dbname=$(cfg.dbname) options='-csearch_path=startup_opts -c geqo=off'")
+                        dsn_row = only(Tables.rowtable(DBInterface.execute(dsn_conn, "SELECT current_setting('search_path') AS sp, current_setting('geqo') AS geqo")))
+                        @test dsn_row.sp == "startup_opts"
+                        @test dsn_row.geqo == "off"
+                        DBInterface.close!(dsn_conn)
+                        # the driver's own client_encoding startup parameter is applied
+                        # after `options`, so a conflicting switch cannot break decoding
+                        enc_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, options="-c client_encoding=LATIN1")
+                        @test only(Tables.rowtable(DBInterface.execute(enc_conn, "SHOW client_encoding"))).client_encoding == "UTF8"
+                        DBInterface.close!(enc_conn)
+                        # an empty value is not sent at all
+                        empty_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, options="")
+                        @test isopen(empty_conn)
+                        DBInterface.close!(empty_conn)
+                        # a bad switch is a server startup error, surfaced as Postgres.Error
+                        err = try
+                            DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, options="-c no_such_parameter=1")
+                            nothing
+                        catch e
+                            e
+                        end
+                        @test err isa Postgres.API.Error
+                        @test err.code == "42704"
+                    finally
+                        DBInterface.execute(conn, "DROP SCHEMA IF EXISTS startup_opts")
+                    end
                 end
                 @testset "Connection Lifecycle" begin
                     conn2 = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)

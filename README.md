@@ -35,12 +35,13 @@ Connection options support:
 
 - libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
 - PostgreSQL URIs such as `postgresql://postgres:postgres@127.0.0.1:5432/postgres`.
-- Environment defaults: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, TLS-related `PGSSL*` variables, and `PGGSSENCMODE`, `PGKRBSRVNAME`, `PGGSSDELEGATION`.
+- Environment defaults: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, `PGOPTIONS`, TLS-related `PGSSL*` variables, and `PGGSSENCMODE`, `PGKRBSRVNAME`, `PGGSSDELEGATION`.
 - `sslmode` values: `disable`, `prefer` (the default), `require`, `verify-full`. Only `verify-full` verifies the server's certificate; `require` encrypts without authenticating the server, and the default `prefer` falls back to an unencrypted connection if the server declines TLS. Use `verify-full` with `sslrootcert` when the connection needs to be authenticated.
 - TLS files: `sslrootcert`, `sslcert`, `sslkey`, and `sslcapath` (`sslcapath` is a fallback CA bundle or directory, used only when `sslrootcert` is unset and ignored otherwise). `sslservername` overrides the TLS server name when connecting to a pre-resolved address; under `verify-full` it is also the name the certificate is verified against, so it must name the server you intend to authenticate.
 - `gssencmode` values: `disable` (the default), `prefer`, `require`. GSSAPI (Kerberos) encryption is negotiated before TLS, as in libpq, through the operating system's Kerberos library and ticket cache (`kinit`); `prefer` only tries it when a ticket is available and otherwise follows `sslmode`. `krbsrvname` sets the Kerberos service name (default `postgres`; Active Directory servers often need `POSTGRES`) and `gssdelegation` forwards the ticket to the server. GSSAPI authentication (`gss` in `pg_hba.conf`) is answered automatically with the same library.
 - `connect_timeout` (seconds) and `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
+- `options`: server command-line options applied when the session starts, as in libpq (`PGOPTIONS`). For example `options='-c search_path=myschema'` sets the default schema. The value is sent in the startup packet, so it also applies after an automatic reconnect.
 
 See the [support policy](https://JuliaDatabases.github.io/Postgres.jl/dev/support/)
 for tested Julia and PostgreSQL versions, TLS limits, and transaction-pooler
