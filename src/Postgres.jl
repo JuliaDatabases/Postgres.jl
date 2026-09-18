@@ -27,7 +27,7 @@ include("connection_string.jl")
 using .ConnectionString
 
 const Pools = ConcurrentUtilities.Pools
-const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
+const ReseauConn = API.ReseauConn
 
 # Observability must not change whether a database operation succeeds. A
 # callback failure is reported, but never replaces the query result or error.
@@ -73,6 +73,16 @@ Supported keyword arguments. All are also available as DSN/URI options except
   name when the host is a pre-resolved address — note that under
   `verify-full` this is also the name the certificate is verified against,
   so it must name the server you intend to authenticate.
+- `gssencmode` (`"disable"` (default), `"prefer"`, `"require"`): GSSAPI
+  (Kerberos) encryption of the whole connection, negotiated before TLS as in
+  libpq. `prefer` tries it only when a Kerberos ticket is available and falls
+  back to `sslmode` behavior otherwise. `krbsrvname` is the Kerberos service
+  name (default `"postgres"`; Active Directory servers often need
+  `"POSTGRES"`), used both for encryption and for GSSAPI authentication, which
+  is answered automatically when the server requests it. `gssdelegation`
+  forwards the ticket to the server (default `false`). Kerberos comes from the
+  operating system library (`kinit` tickets, `krb5.conf`), with no bundled
+  Kerberos; see the support policy.
 - `statement_cache_maxsize`: LRU backend cache size for explicit named prepared
   statements (default 100; `0` disables)
 - `reconnect`: automatically reconnect and re-prepare statements if the
@@ -110,6 +120,9 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
     const sslkey::Union{String, Nothing}
     const sslcapath::Union{String, Nothing}
     const sslservername::Union{String, Nothing}
+    const gssencmode::Union{String, Nothing}
+    const krbsrvname::Union{String, Nothing}
+    const gssdelegation::Bool
     statement_timeout::Union{Int, Nothing}
     # pid/skey are used to send cancellation request to backend
     pid::Int32
@@ -139,7 +152,7 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
     # commit/rollback must not COMMIT/ROLLBACK the caller's work
     owns_base_transaction::Bool
 
-    function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, options::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
+    function Connection(; host::AbstractString="", user::AbstractString=ConnectionString.default_user(), password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, options::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, gssencmode::Union{AbstractString, Nothing}=nothing, krbsrvname::Union{AbstractString, Nothing}=nothing, gssdelegation::Bool=false, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
         numeric_overflow in (:warn, :error) || throw(ArgumentError("numeric_overflow must be :warn or :error"))
         host = String(host)
         user = String(user)
@@ -156,6 +169,8 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         sslcapath_val = sslcapath === nothing ? nothing : String(sslcapath)
         statement_timeout_val = statement_timeout === nothing ? nothing : Int(statement_timeout)
         sslservername_val = sslservername === nothing ? nothing : String(sslservername)
+        gssencmode_val = gssencmode === nothing ? nothing : String(gssencmode)
+        krbsrvname_val = krbsrvname === nothing ? nothing : String(krbsrvname)
         occursin('\0', host) && _reject_nul("host")
         occursin('\0', user) && _reject_nul("user")
         occursin('\0', dbname) && _reject_nul("dbname")
@@ -163,13 +178,14 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         app_name !== nothing && occursin('\0', app_name) && _reject_nul("application_name")
         options_val !== nothing && occursin('\0', options_val) && _reject_nul("options")
         sslservername_val !== nothing && occursin('\0', sslservername_val) && _reject_nul("sslservername")
+        krbsrvname_val !== nothing && occursin('\0', krbsrvname_val) && _reject_nul("krbsrvname")
         xor(sslcert_val === nothing, sslkey_val === nothing) &&
             throw(PostgresInterfaceError("sslcert and sslkey must be provided together"))
         maxsize = max(0, Int(statement_cache_maxsize))
-        socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, options_val, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val)
+        socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, options_val, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, gssencmode_val, krbsrvname_val, gssdelegation, style)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
         registry[1700] = API.TypeInfo(API.NumericValue, (val, registry) -> API.parse_numeric(val, numeric_overflow))
-        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, options_val, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, String[], 1, false, true)
+        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, options_val, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, gssencmode_val, krbsrvname_val, gssdelegation, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, String[], 1, false, true)
     end
 end
 
@@ -406,8 +422,10 @@ end
 @inline function _set_read_deadline!(socket::ReseauConn, deadline_ns::Int64)
     if socket isa Reseau.TCP.Conn
         Reseau.TCP.set_read_deadline!(socket, deadline_ns)
-    else
+    elseif socket isa Reseau.TLS.Conn
         Reseau.TLS.set_read_deadline!(socket, deadline_ns)
+    else
+        API.set_read_deadline!(socket::API.GSSConn, deadline_ns)
     end
     return nothing
 end
@@ -443,8 +461,8 @@ with a query are delivered to
 [`notification_callback`](@ref Postgres.API.notification_callback) only during
 the phases of a query that read result data.
 
-Over TLS the poll interval bounds a read on the underlying transport rather
-than on the TLS record layer, so a record that arrives split across a poll
+Over TLS or GSSAPI encryption the poll interval bounds a read on the
+underlying transport rather than on the record layer, so a record that arrives split across a poll
 boundary cannot be resumed. That is detected on the following poll and closes
 the connection with an error rather than returning corrupt data; a blocking
 wait (no `timeout`) is not affected.
@@ -732,6 +750,10 @@ function cancel_sslmode(socket_is_tls::Bool, sslmode::Union{String, Nothing})
     return sslmode
 end
 
+# Likewise for GSSAPI encryption: a connection that negotiated it cancels
+# over a GSS-encrypted connection too.
+cancel_gssencmode(socket_is_gss::Bool, gssencmode::Union{String, Nothing}) = socket_is_gss ? "require" : gssencmode
+
 """
     Postgres.cancel_query!(conn)
 
@@ -740,9 +762,9 @@ Send a PostgreSQL CancelRequest for the query currently running on `conn`
 The cancelled query fails with a [`Postgres.Error`](@ref Postgres.API.Error)
 with SQLSTATE `57014`.
 
-The cancel connection uses the same TLS settings as `conn`, since the cancel
-key it carries is a credential: if `conn` itself is on TLS, the cancel
-connection requires TLS too. Throws a `PostgresInterfaceError` if the cancel
+The cancel connection uses the same TLS and GSSAPI settings as `conn`, since
+the cancel key it carries is a credential: if `conn` itself is on TLS or
+GSSAPI encryption, the cancel connection requires the same. Throws a `PostgresInterfaceError` if the cancel
 request could not be delivered (rather than failing silently, which would
 leave the query running).
 """
@@ -757,6 +779,7 @@ function cancel_query!(conn::Connection)
     # trylock-guarded check would be skipped in the case that matters. Reading
     # the socket field unlocked matches how host/pid/skey are read below.
     sslmode = cancel_sslmode(conn.socket isa Reseau.TLS.Conn, conn.sslmode)
+    gssencmode = cancel_gssencmode(conn.socket isa API.GSSConn, conn.gssencmode)
     if trylock(conn.lock)
         try
             !isopen(conn.socket) && throw(PostgresInterfaceError("cannot cancel query: connection not open"))
@@ -766,7 +789,7 @@ function cancel_query!(conn::Connection)
             unlock(conn.lock)
         end
     end
-    ok = API.cancel_request(host, port, pid, skey, debug, sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.connect_timeout)
+    ok = API.cancel_request(host, port, pid, skey, debug, sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.connect_timeout, gssencmode, conn.krbsrvname, conn.gssdelegation, conn.style)
     ok || throw(PostgresInterfaceError("failed to deliver the cancel request to $(host):$(port)"))
     return conn
 end
@@ -779,7 +802,7 @@ function checkconn(conn::Connection)
         # connection is closed, but not explicitly, reconnect
         conn.in_transaction && throw(PostgresInterfaceError("postgres connection has been closed or disconnected; reconnect disabled during transaction"))
         conn.reconnect || throw(PostgresInterfaceError("postgres connection has been closed or disconnected; reconnect disabled"))
-        conn.socket, conn.pid, conn.skey, server_params = API.connect(conn.host, conn.port, conn.dbname, conn.user, conn.password, conn.debug, conn.application_name, conn.options, conn.connect_timeout, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.statement_timeout)
+        conn.socket, conn.pid, conn.skey, server_params = API.connect(conn.host, conn.port, conn.dbname, conn.user, conn.password, conn.debug, conn.application_name, conn.options, conn.connect_timeout, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.statement_timeout, conn.gssencmode, conn.krbsrvname, conn.gssdelegation, conn.style)
         empty!(conn.statements)
         conn.in_transaction = false
         conn.transaction_depth = 0
@@ -795,8 +818,8 @@ function checkconn(conn::Connection)
     return
 end
 
-function DBInterface.connect(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, options::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
-    Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, options=options, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, style=style)
+function DBInterface.connect(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, options::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, gssencmode::Union{AbstractString, Nothing}=nothing, krbsrvname::Union{AbstractString, Nothing}=nothing, gssdelegation::Bool=false, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
+    Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, options=options, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, gssencmode=gssencmode, krbsrvname=krbsrvname, gssdelegation=gssdelegation, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, style=style)
 end
 
 function DBInterface.connect(::Type{Connection}, dsn::String; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, numeric_overflow::Union{Symbol, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
@@ -805,7 +828,7 @@ end
 
 function DBInterface.connect(::Type{Connection}, params::ConnectionParams; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, numeric_overflow::Union{Symbol, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
     actual_maxsize = isnothing(statement_cache_maxsize) ? params.statement_cache_maxsize : statement_cache_maxsize
-    Connection(host=params.host, user=params.user, password=params.password, dbname=params.dbname, port=params.port, debug=something(debug, params.debug), reconnect=something(reconnect, params.reconnect), application_name=params.application_name, options=params.options, connect_timeout=params.connect_timeout, sslmode=params.sslmode, sslrootcert=params.sslrootcert, sslcert=params.sslcert, sslkey=params.sslkey, sslcapath=params.sslcapath, sslservername=params.sslservername, statement_timeout=params.statement_timeout, statement_cache_maxsize=actual_maxsize, numeric_overflow=something(numeric_overflow, params.numeric_overflow), style=style)
+    Connection(host=params.host, user=params.user, password=params.password, dbname=params.dbname, port=params.port, debug=something(debug, params.debug), reconnect=something(reconnect, params.reconnect), application_name=params.application_name, options=params.options, connect_timeout=params.connect_timeout, sslmode=params.sslmode, sslrootcert=params.sslrootcert, sslcert=params.sslcert, sslkey=params.sslkey, sslcapath=params.sslcapath, sslservername=params.sslservername, gssencmode=params.gssencmode, krbsrvname=params.krbsrvname, gssdelegation=params.gssdelegation, statement_timeout=params.statement_timeout, statement_cache_maxsize=actual_maxsize, numeric_overflow=something(numeric_overflow, params.numeric_overflow), style=style)
 end
 
 function DBInterface.connect(f::Function, ::Type{Connection}, args...; kwargs...)
@@ -859,8 +882,8 @@ end
 
 Base.isopen(pool::ConnectionPool) = !pool.closed[]
 
-function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, options::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
-    connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, options=options, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, style=style)
+function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, options::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, gssencmode::Union{AbstractString, Nothing}=nothing, krbsrvname::Union{AbstractString, Nothing}=nothing, gssdelegation::Bool=false, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10, numeric_overflow::Symbol=:warn, style::API.AbstractPostgresStyle=PostgresStyle())
+    connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, options=options, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, gssencmode=gssencmode, krbsrvname=krbsrvname, gssdelegation=gssdelegation, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, numeric_overflow=numeric_overflow, style=style)
     return ConnectionPool(connector; limit=limit)
 end
 

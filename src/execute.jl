@@ -514,8 +514,12 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
                     API.exec(style, socket::Reseau.TCP.Conn, stmt.name, stmt.params,
                              stmt.names, stmt.typeIds, stmt.conn.type_registry,
                              actual_debug, 0, stmt.conn.server_parameters)
-                else
+                elseif socket isa Reseau.TLS.Conn
                     API.exec(style, socket::Reseau.TLS.Conn, stmt.name, stmt.params,
+                             stmt.names, stmt.typeIds, stmt.conn.type_registry,
+                             actual_debug, 0, stmt.conn.server_parameters)
+                else
+                    API.exec(style, socket::API.GSSConn, stmt.name, stmt.params,
                              stmt.names, stmt.typeIds, stmt.conn.type_registry,
                              actual_debug, 0, stmt.conn.server_parameters)
                 end
@@ -559,8 +563,12 @@ function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothi
                 API.exec_unnamed(style, socket::Reseau.TCP.Conn, sql_str, params_vec,
                                  conn.type_registry, actual_debug, 0,
                                  conn.server_parameters)
-            else
+            elseif socket isa Reseau.TLS.Conn
                 API.exec_unnamed(style, socket::Reseau.TLS.Conn, sql_str, params_vec,
+                                 conn.type_registry, actual_debug, 0,
+                                 conn.server_parameters)
+            else
+                API.exec_unnamed(style, socket::API.GSSConn, sql_str, params_vec,
                                  conn.type_registry, actual_debug, 0,
                                  conn.server_parameters)
             end
