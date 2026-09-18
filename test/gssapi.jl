@@ -5,7 +5,7 @@
 
 const GSSAPI = Postgres.API.SASLAuth.GSSAPI
 
-mutable struct FakeGSS <: GSSAPI.AbstractContext
+mutable struct FakeGSS
     target::String
     delegate::Bool
     encrypt::Bool
@@ -16,29 +16,7 @@ const FAKE_CLIENT_TOKEN = Vector{UInt8}("client-token")
 const FAKE_SERVER_TOKEN = Vector{UInt8}("server-token")
 const FAKE_SEAL = 0xa5
 
-function GSSAPI.step!(ctx::FakeGSS, token)
-    if ctx.state == 0
-        token === nothing || throw(GSSAPI.GSSError("fake mechanism: unexpected token on the first step"))
-        ctx.state = 1
-        return copy(FAKE_CLIENT_TOKEN), false
-    elseif ctx.state == 1
-        token == FAKE_SERVER_TOKEN || throw(GSSAPI.GSSError("fake mechanism: bad server token"))
-        ctx.state = 2
-        return UInt8[], true
-    end
-    throw(GSSAPI.GSSError("fake mechanism: context already established"))
-end
-function GSSAPI.wrap(ctx::FakeGSS, data::AbstractVector{UInt8})
-    ctx.state == 2 || throw(GSSAPI.GSSError("fake mechanism: no context established"))
-    return vcat(FAKE_SEAL, data)
-end
-function GSSAPI.unwrap(ctx::FakeGSS, token::AbstractVector{UInt8})
-    (!isempty(token) && token[1] == FAKE_SEAL) || throw(GSSAPI.GSSError("fake mechanism: bad seal"))
-    return token[2:end]
-end
-# tiny, so every message the driver sends is split into several packets
-GSSAPI.wrap_size_limit(::FakeGSS, max_output::Integer) = 7
-Base.close(ctx::FakeGSS) = (ctx.closed = true; nothing)
+include("gssapi_native_mock.jl")
 
 mutable struct FakeGSSStyle <: Postgres.API.AbstractPostgresStyle
     credentials::Bool
@@ -47,8 +25,9 @@ end
 FakeGSSStyle(credentials::Bool=true) = FakeGSSStyle(credentials, FakeGSS[])
 Postgres.API.gss_has_credentials(style::FakeGSSStyle) = style.credentials
 function Postgres.API.gss_context(style::FakeGSSStyle, target::String, delegate::Bool, encrypt::Bool)
-    ctx = FakeGSS(target, delegate, encrypt, 0, false)
-    push!(style.contexts, ctx)
+    ctx = GSSAPI.Context(target; delegate, encrypt)
+    push!(FAKE_CONTEXTS, ctx)
+    push!(style.contexts, FAKE_NAMES[ctx.target])
     return ctx
 end
 
@@ -161,7 +140,7 @@ end
 connect_err(f) = try; f(); nothing; catch err; err; end
 errtext(err) = sprint(showerror, err)
 
-function test_gssapi()
+function test_gssapi_protocol()
 @testset "GSSAPI Without A KDC" begin
     @testset "GSS encryption: handshake, chunked framing, cancel, deadline" begin
         style = FakeGSSStyle()
@@ -174,6 +153,7 @@ function test_gssapi()
             if n == 1
                 params = read_startup(io)
                 params["user"] == "krbuser" && params["database"] == "db" || error("bad startup params: $params")
+                params["options"] == "-c search_path=public" || error("missing startup options")
                 ready!(io)
                 drain(io)
             else
@@ -184,8 +164,10 @@ function test_gssapi()
         end
         with_fake_server(handler) do port, accepted
             conn = Postgres.Connection(host="127.0.0.1", port=port, user="krbuser", dbname="db",
-                                       gssencmode="require", krbsrvname="POSTGRES", gssdelegation=true, style=style)
+                                       gssencmode="require", krbsrvname="POSTGRES", gssdelegation=true,
+                                       options="-c search_path=public", style=style)
             @test conn.socket isa Postgres.API.GSSConn
+            @test fieldtype(Postgres.API.GSSConn, :ctx) === GSSAPI.Context
             @test isopen(conn)
             @test conn.pid == 4242
             @test length(style.contexts) == 1

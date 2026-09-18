@@ -14,7 +14,7 @@ const GSS_AUTH_BUFFER_SIZE = 65536
 # The GSSAPI mechanism seam: gss_context(style, target, delegate, encrypt) and
 # gss_has_credentials(style). The defaults use the system Kerberos library
 # through SASLAuth.GSSAPI; overload on a custom AbstractPostgresStyle to supply
-# another context (a scripted one in tests, or SSPI).
+# a context factory or credential policy. Encrypted connections use Context.
 gss_context(::AbstractPostgresStyle, target::String, delegate::Bool, encrypt::Bool) =
     SASLAuth.GSSAPI.Context(target; delegate, encrypt)
 gss_has_credentials(::AbstractPostgresStyle) = SASLAuth.GSSAPI.has_credentials()
@@ -30,7 +30,7 @@ end
 # sealed token; reads unwrap one frame at a time into a plaintext buffer.
 mutable struct GSSConn <: IO
     tcp::Reseau.TCP.Conn
-    ctx::SASLAuth.GSSAPI.AbstractContext
+    ctx::SASLAuth.GSSAPI.Context
     max_plaintext::Int      # gss_wrap_size_limit for one packet
     buffer::Vector{UInt8}   # unwrapped plaintext not yet consumed
     pos::Int
