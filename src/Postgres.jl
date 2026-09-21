@@ -191,7 +191,85 @@ end
 
 _style_type(::Connection{T, S}) where {T, S} = S
 
+"""
+    isopen(conn::Connection) -> Bool
+
+Whether the local socket is open. This is local state only: a session the
+server terminated while the connection sat idle still reports open until a
+read observes the termination. Use [`isvalid`](@ref Base.isvalid(::Postgres.Connection))
+to check the server side without sending anything.
+"""
 Base.isopen(conn::Connection) = @lock conn.lock isopen(conn.socket)
+
+"""
+    isvalid(conn::Connection) -> Bool
+
+Check that the server session behind `conn` is still alive, without sending
+anything. The server signals a terminated session (`pg_terminate_backend`, a
+restart or failover, `idle_session_timeout`) with a FATAL error and a close,
+and those bytes wait in the socket until something reads them; `isopen` does
+not. `isvalid` reads whatever the server has already sent: asynchronous
+notices, notifications, and parameter changes are delivered to the style
+callbacks as usual, a terminating error or a closed stream marks the
+connection dead (its socket is closed, so `isopen` turns `false`), and a
+connection with nothing pending is alive.
+
+The connection lock is held, so a statement in flight on another task is
+never disturbed. A network path that dropped without delivering any bytes
+cannot be detected this way and still surfaces on the next operation.
+[`ConnectionPool`](@ref Postgres.ConnectionPool) calls this before handing out
+an idle connection; custom pools can do the same.
+"""
+function Base.isvalid(conn::Connection)
+    @lock conn.lock begin
+        conn.closed && return false
+        isopen(conn.socket) || return false
+        while true
+            pending = _pending_input(conn.socket)
+            pending === :none && return true
+            if pending === :eof
+                close(conn.socket)
+                return false
+            end
+            # The server sent something to an idle session: an asynchronous
+            # message, or the error that terminated it. The stream is at a
+            # message boundary, so read one message; a failure partway leaves
+            # the position unknowable and the socket is closed.
+            message = try
+                mt, len = API.readheader(conn.socket, conn.debug)
+                if mt == UInt8('A')
+                    API.notificationResponse(len, conn.socket)
+                elseif mt == UInt8('N')
+                    API.noticeResponse(len, conn.socket)
+                elseif mt == UInt8('S')
+                    update_server_parameters!(conn, read(conn.socket, len))
+                    nothing
+                elseif mt == UInt8('E')
+                    API.errorResponse(len, conn.socket, conn.debug)
+                else
+                    # nothing else is legitimate on an idle connection: the
+                    # stream is out of step with the driver
+                    close(conn.socket)
+                    return false
+                end
+            catch
+                close(conn.socket)
+                return false
+            end
+            if message isa API.Error
+                # FATAL and PANIC end the session; an unsolicited error of any
+                # other severity means the stream is out of step. Neither
+                # connection is reusable.
+                close(conn.socket)
+                return false
+            elseif message isa API.Notification
+                API.notification_callback(conn.style, message)
+            elseif message !== nothing
+                API.notice_callback(conn.style, message)
+            end
+        end
+    end
+end
 
 function Base.show(io::IO, conn::Connection)
     println(io, "Postgres.Connection:")
@@ -433,6 +511,18 @@ end
 @inline function _clear_read_deadline!(socket::ReseauConn)
     _set_read_deadline!(socket, Int64(0))
     return nothing
+end
+
+# Non-blocking answer to "has the server sent anything since the last read?"
+# on any of the three transports: :data, :eof, or :none.
+@inline function _pending_input(socket::ReseauConn)
+    if socket isa Reseau.TCP.Conn
+        return Reseau.TCP.pending_input(socket)
+    elseif socket isa Reseau.TLS.Conn
+        return Reseau.TLS.pending_input(socket)
+    else
+        return API.pending_input(socket::API.GSSConn)
+    end
 end
 
 const NOTIFICATION_POLL_INTERVAL_NS = Int64(100_000_000)
@@ -856,9 +946,12 @@ Base.close(conn::Connection) = DBInterface.close!(conn)
 
 A pool of [`Connection`](@ref Postgres.Connection)s, created lazily up to
 `limit` and reused across [`acquire`](@ref Postgres.acquire)/[`release`](@ref
-Postgres.release) cycles. Locally closed connections are replaced. A peer close
-that the local socket has not observed can surface on the borrower's first
-operation; an ambiguous failed operation is never retried automatically.
+Postgres.release) cycles. A connection is checked with
+[`isvalid`](@ref Base.isvalid(::Postgres.Connection)) before it is handed out
+and when it is returned, so one the server terminated while it sat idle is
+replaced rather than reused. A network drop that delivered no bytes still
+surfaces on the borrower's first operation; an ambiguous failed operation is
+never retried automatically.
 
     ConnectionPool(Postgres.Connection, host, user, password; limit=10, kwargs...)
     ConnectionPool(dsn::String; limit=10, kwargs...)
@@ -896,11 +989,6 @@ function ConnectionPool(params::ConnectionParams; debug::Union{Bool, Nothing}=no
     return ConnectionPool(connector; limit=limit)
 end
 
-function pool_isvalid(conn::Connection)
-    valid = @lock conn.lock isopen(conn.socket) && !conn.closed
-    return valid
-end
-
 """
     Postgres.acquire(pool; forcenew=false) -> Connection
 
@@ -909,7 +997,7 @@ if the pool is at its limit). Return it with [`release`](@ref Postgres.release).
 """
 function acquire(pool::ConnectionPool; forcenew::Bool=false)
     pool.closed[] && throw(PostgresInterfaceError("connection pool is closed"))
-    conn = Pools.acquire(pool.connector, pool.pool; forcenew=forcenew, isvalid=pool_isvalid)
+    conn = Pools.acquire(pool.connector, pool.pool; forcenew=forcenew, isvalid=isvalid)
     closed = @lock pool.lifecycle_lock pool.closed[]
     if closed
         try
@@ -962,7 +1050,7 @@ the next borrower starts from a clean session; if it can't be rolled back it
 is closed rather than reused.
 """
 function release(pool::ConnectionPool, conn::Connection)
-    reusable = !pool.closed[] && pool_isvalid(conn) && reset_pooled_connection!(conn)
+    reusable = !pool.closed[] && isvalid(conn) && reset_pooled_connection!(conn)
     if reusable
         returned = @lock pool.lifecycle_lock begin
             if pool.closed[]

@@ -139,6 +139,14 @@ end
 
 set_read_deadline!(io::GSSConn, deadline_ns::Integer) = Reseau.TCP.set_read_deadline!(io.tcp, deadline_ns)
 
+# Non-blocking peek with the contract of Reseau.TCP.pending_input: unwrapped
+# plaintext counts as pending; otherwise the framed transport answers. A frame
+# whose first byte has arrived answers :data, and the next read completes it.
+function pending_input(io::GSSConn)
+    bytesavailable(io) > 0 && return :data
+    return Reseau.TCP.pending_input(io.tcp)
+end
+
 # GSSENCRequest and, on 'G', the framed handshake (libpq's pqsecure_open_gss).
 # Returns the encrypted transport, or `nothing` when the server answered 'N'
 # (the caller decides whether that is acceptable and continues on the same

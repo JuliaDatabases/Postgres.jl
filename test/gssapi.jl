@@ -176,6 +176,9 @@ function test_gssapi_protocol()
             # the deadline plumbing on the GSS transport: nothing arrives, nothing is consumed
             @test Postgres.wait_for_notification(conn; timeout=0.2) === nothing
             @test isopen(conn)
+            # the non-blocking peek behind isvalid also runs through the GSS
+            # transport: an idle fake server means nothing pending, alive
+            @test isvalid(conn)
             # the cancel key travels over a GSS-encrypted connection too
             Postgres.cancel_query!(conn)
             timedwait(() -> cancel_seen[] !== nothing, 5.0)
