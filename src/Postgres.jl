@@ -221,8 +221,8 @@ check never retries a user operation.
 function isvalid(conn::Connection)
     # Reentrant callbacks can call this from inside a statement as well. A
     # held connection lock means the protocol reader already owns the stream.
-    islocked(conn.lock) && return isopen(conn.socket)
-    trylock(conn.lock) || return isopen(conn.socket)
+    islocked(conn.lock) && return true
+    trylock(conn.lock) || return true
     try
         conn.closed && return false
         isopen(conn.socket) || return false
