@@ -42,7 +42,7 @@ jobs:
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v3
       # TEMPORARY until Reseau 1.5.0 is registered: isvalid needs the unreleased
-      # non-blocking pending_input peek (JuliaServices/Reseau.jl nonblocking-peek).
+      # non-blocking tryread! API (JuliaServices/Reseau.jl nonblocking-peek).
       - name: Use unreleased Reseau
         shell: bash
         run: julia --project=. -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/Reseau.jl", rev="nonblocking-peek")'
@@ -81,7 +81,7 @@ jobs:
           arch: x64
       - uses: julia-actions/cache@v3
       # TEMPORARY until Reseau 1.5.0 is registered: isvalid needs the unreleased
-      # non-blocking pending_input peek (JuliaServices/Reseau.jl nonblocking-peek).
+      # non-blocking tryread! API (JuliaServices/Reseau.jl nonblocking-peek).
       - name: Use unreleased Reseau
         shell: bash
         run: julia --project=. -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/Reseau.jl", rev="nonblocking-peek")'
@@ -108,7 +108,7 @@ jobs:
           arch: x64
       - uses: julia-actions/cache@v3
       # TEMPORARY until Reseau 1.5.0 is registered: isvalid needs the unreleased
-      # non-blocking pending_input peek (JuliaServices/Reseau.jl nonblocking-peek).
+      # non-blocking tryread! API (JuliaServices/Reseau.jl nonblocking-peek).
       - name: Use unreleased Reseau
         shell: bash
         run: julia --project=. -e 'using Pkg; Pkg.add(url="https://github.com/JuliaServices/Reseau.jl", rev="nonblocking-peek")'
@@ -127,7 +127,7 @@ jobs:
           version: '1'
       - uses: julia-actions/cache@v3
       # TEMPORARY until Reseau 1.5.0 is registered: isvalid needs the unreleased
-      # non-blocking pending_input peek (JuliaServices/Reseau.jl nonblocking-peek).
+      # non-blocking tryread! API (JuliaServices/Reseau.jl nonblocking-peek).
       - name: Use unreleased Reseau
         shell: bash
         run: |

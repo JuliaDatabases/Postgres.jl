@@ -506,24 +506,9 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
             checkstmt(stmt)
             e = try
                 bind_params!(stmt.params, params, stmt.sql)
-                # isa-split the socket union with per-branch typeasserts
-                # (identical calls in both branches get tail-merged back into
-                # one dynamic call by the optimizer).
-                socket = stmt.conn.socket
-                e = if socket isa Reseau.TCP.Conn
-                    API.exec(style, socket::Reseau.TCP.Conn, stmt.name, stmt.params,
+                API.exec(style, stmt.conn.socket, stmt.name, stmt.params,
                              stmt.names, stmt.typeIds, stmt.conn.type_registry,
                              actual_debug, 0, stmt.conn.server_parameters)
-                elseif socket isa Reseau.TLS.Conn
-                    API.exec(style, socket::Reseau.TLS.Conn, stmt.name, stmt.params,
-                             stmt.names, stmt.typeIds, stmt.conn.type_registry,
-                             actual_debug, 0, stmt.conn.server_parameters)
-                else
-                    API.exec(style, socket::API.GSSConn, stmt.name, stmt.params,
-                             stmt.names, stmt.typeIds, stmt.conn.type_registry,
-                             actual_debug, 0, stmt.conn.server_parameters)
-                end
-                e
             finally
                 # Bound strings can contain credentials or personal data. The
                 # vector must be cleared even if local parameter validation or
@@ -557,21 +542,9 @@ function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothi
         @lock conn.lock begin
             checkconn(conn)
             params_vec = build_unchecked_params(params)
-            # see the statement-execute method: socket union isa-split for --trim
-            socket = conn.socket
-            e = if socket isa Reseau.TCP.Conn
-                API.exec_unnamed(style, socket::Reseau.TCP.Conn, sql_str, params_vec,
+            e = API.exec_unnamed(style, conn.socket, sql_str, params_vec,
                                  conn.type_registry, actual_debug, 0,
                                  conn.server_parameters)
-            elseif socket isa Reseau.TLS.Conn
-                API.exec_unnamed(style, socket::Reseau.TLS.Conn, sql_str, params_vec,
-                                 conn.type_registry, actual_debug, 0,
-                                 conn.server_parameters)
-            else
-                API.exec_unnamed(style, socket::API.GSSConn, sql_str, params_vec,
-                                 conn.type_registry, actual_debug, 0,
-                                 conn.server_parameters)
-            end
             # in a finally, as in the statement-execute method above
             try
                 result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))

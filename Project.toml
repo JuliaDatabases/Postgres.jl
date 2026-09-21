@@ -32,7 +32,7 @@ JSON = "1"
 MD5 = "0.2"
 Parsers = "2.7, 3"
 Random = "1.10"
-# Reseau 1.5 adds the non-blocking pending_input peek behind isvalid.
+# Reseau 1.5 adds non-blocking tryread! behind isvalid.
 Reseau = "1.5"
 SASLAuth = "1.1.0"
 Sockets = "1.10"

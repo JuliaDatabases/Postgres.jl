@@ -49,8 +49,8 @@ function test_isvalid_fake_server()
             conn = fake_connection(port, style)
             # the messages may still be in flight: isvalid answers true either
             # way, and once they have landed one call consumes them all
-            @test timedwait(() -> (isvalid(conn); !isempty(style.notifications)), 5.0) === :ok
-            @test isvalid(conn)
+            @test timedwait(() -> (Postgres.isvalid(conn); !isempty(style.notifications)), 5.0) === :ok
+            @test Postgres.isvalid(conn)
             @test Postgres.get_server_parameter(conn, "application_name") == "changed-by-reload"
             @test length(style.notices) == 1
             @test any(==("idle warning"), values(style.notices[1]))
@@ -70,7 +70,7 @@ function test_isvalid_fake_server()
             close(sock)
         end)) do port, accepted
             conn = fake_connection(port, style)
-            @test timedwait(() -> !isvalid(conn), 5.0) === :ok
+            @test timedwait(() -> !Postgres.isvalid(conn), 5.0) === :ok
             @test !isopen(conn)
             @test length(style.notices) == 1
         end
@@ -80,7 +80,7 @@ function test_isvalid_fake_server()
         style = RecordingStyle()
         with_fake_server(serve_idle(close)) do port, accepted
             conn = fake_connection(port, style)
-            @test timedwait(() -> !isvalid(conn), 5.0) === :ok
+            @test timedwait(() -> !Postgres.isvalid(conn), 5.0) === :ok
             @test !isopen(conn)
         end
     end
@@ -99,7 +99,7 @@ function test_isvalid_fake_server()
                     then_close ? close(sock) : drain(sock)
                 end)) do port, accepted
                     conn = fake_connection(port, style)
-                    @test timedwait(() -> !isvalid(conn), 5.0) === :ok
+                    @test timedwait(() -> !Postgres.isvalid(conn), 5.0) === :ok
                     @test !isopen(conn)
                     @test isempty(style.notices) && isempty(style.notifications)
                 end
@@ -107,4 +107,112 @@ function test_isvalid_fake_server()
         end
     end
 end
+end
+
+struct WaitingValidationStyle <: Postgres.API.AbstractPostgresStyle
+    entered::Channel{Nothing}
+    release::Base.Event
+end
+function Postgres.API.notice_callback(style::WaitingValidationStyle, notice)
+    put!(style.entered, nothing)
+    wait(style.release)
+end
+struct ThrowingValidationStyle <: Postgres.API.AbstractPostgresStyle end
+Postgres.API.notice_callback(::ThrowingValidationStyle, notice) = error("validation callback failed")
+
+function test_isvalid_fragmentation()
+    @testset "validation preserves partial messages for normal reads" begin
+        message = notification_msg(99, "fragmented", "retained")
+        for prefix in (1, 4, 5, length(message)-1), completion in (:validation, :read)
+            finish = Base.Event()
+            style = RecordingStyle()
+            with_fake_server(serve_idle(sock -> begin
+                send(sock, message[1:prefix])
+                wait(finish)
+                send(sock, message[prefix+1:end])
+                drain(sock)
+            end)) do port, accepted
+                conn = fake_connection(port, style)
+                try
+                    @test !eof(conn.socket.transport)
+                    # A same-task callback during a query must not read input.
+                    lock(conn.lock) do
+                        @test Postgres.isvalid(conn)
+                        @test bytesavailable(conn.socket) == 0
+                    end
+                    @test Postgres.isvalid(conn)
+                    @test bytesavailable(conn.socket) == prefix
+                    @test isempty(style.notifications)
+                    notify(finish)
+                    if completion == :validation
+                        @test !eof(conn.socket.transport)
+                        @test Postgres.isvalid(conn)
+                    else
+                        notification = Postgres.wait_for_notification(conn; timeout=5)
+                        @test notification !== nothing
+                        @test notification.payload == "retained"
+                    end
+                    @test length(style.notifications) == 1
+                    @test style.notifications[1].channel == "fragmented"
+                    @test Postgres.isvalid(conn)
+                finally
+                    notify(finish)
+                    close(conn)
+                end
+            end
+        end
+    end
+    @testset "validation callbacks do not hold the pool lock" begin
+        send_notice = Base.Event()
+        style = WaitingValidationStyle(Channel{Nothing}(1), Base.Event())
+        handler = function(sock, n)
+            serve_idle(sock -> begin
+                if n == 1
+                    wait(send_notice)
+                    send(sock, notice_msg("NOTICE", "00000", "callback"))
+                end
+                drain(sock)
+            end)(sock, n)
+        end
+        with_fake_server(handler) do port, accepted
+            pool = Postgres.ConnectionPool(() -> fake_connection(port, style); limit=2)
+            first = Postgres.acquire(pool)
+            Postgres.release(pool, first)
+            notify(send_notice)
+            @test !eof(first.socket.transport)
+            taking = @async Postgres.acquire(pool)
+            take!(style.entered)
+            other = @async Postgres.acquire(pool)
+            try
+                @test timedwait(() -> istaskdone(other), 5.0) === :ok
+            finally
+                notify(style.release)
+            end
+            first = fetch(taking)
+            second = fetch(other)
+            @test first !== second
+            Postgres.release(pool, first)
+            Postgres.release(pool, second)
+            @test Postgres.Pools.in_use(pool.pool) == 0
+            close(pool)
+        end
+    end
+    @testset "throwing validation returns the pool permit" begin
+        send_notice = Base.Event()
+        with_fake_server(serve_idle(sock -> begin
+            wait(send_notice)
+            send(sock, notice_msg("NOTICE", "00000", "callback"))
+            drain(sock)
+        end)) do port, accepted
+            pool = Postgres.ConnectionPool(() -> fake_connection(port, ThrowingValidationStyle()); limit=1)
+            conn = Postgres.acquire(pool)
+            Postgres.release(pool, conn)
+            notify(send_notice)
+            @test !eof(conn.socket.transport)
+            @test_throws ErrorException Postgres.acquire(pool)
+            @test Postgres.Pools.in_use(pool.pool) == 0
+            @test !isopen(conn)
+            close(pool)
+        end
+    end
 end

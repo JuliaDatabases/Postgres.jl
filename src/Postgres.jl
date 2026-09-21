@@ -27,7 +27,6 @@ include("connection_string.jl")
 using .ConnectionString
 
 const Pools = ConcurrentUtilities.Pools
-const ReseauConn = API.ReseauConn
 
 # Observability must not change whether a database operation succeeds. A
 # callback failure is reported, but never replaces the query result or error.
@@ -105,7 +104,7 @@ Close with `DBInterface.close!(conn)` or `close(conn)`; the do-block form
 """
 mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Connection
     const lock::ReentrantLock
-    socket::ReseauConn
+    socket::API.BufferedConn
     const host::String
     const user::String
     const password::Union{String, Nothing}
@@ -196,78 +195,89 @@ _style_type(::Connection{T, S}) where {T, S} = S
 
 Whether the local socket is open. This is local state only: a session the
 server terminated while the connection sat idle still reports open until a
-read observes the termination. Use [`isvalid`](@ref Base.isvalid(::Postgres.Connection))
+read observes the termination. Use [`isvalid`](@ref Postgres.isvalid)
 to check the server side without sending anything.
 """
 Base.isopen(conn::Connection) = @lock conn.lock isopen(conn.socket)
 
 """
-    isvalid(conn::Connection) -> Bool
+    Postgres.isvalid(conn::Connection) -> Bool
 
-Check that the server session behind `conn` is still alive, without sending
-anything. The server signals a terminated session (`pg_terminate_backend`, a
-restart or failover, `idle_session_timeout`) with a FATAL error and a close,
-and those bytes wait in the socket until something reads them; `isopen` does
-not. `isvalid` reads whatever the server has already sent: asynchronous
-notices, notifications, and parameter changes are delivered to the style
-callbacks as usual, a terminating error or a closed stream marks the
-connection dead (its socket is closed, so `isopen` turns `false`), and a
-connection with nothing pending is alive.
+Check an idle connection for a known failure without sending a query or waiting
+for network input. Return `false` on a fatal server message, EOF, or a transport
+or protocol failure. Return `true` when no failure has been observed; this does
+not prove the server is alive and cannot detect a silent network drop.
 
-The connection lock is held, so a statement in flight on another task is
-never disturbed. A network path that dropped without delivering any bytes
-cannot be detected this way and still surfaces on the next operation.
-[`ConnectionPool`](@ref Postgres.ConnectionPool) calls this before handing out
-an idle connection; custom pools can do the same.
+Read available bytes into the same buffer used by normal queries. Process only
+complete messages, preserving partial messages for subsequent reads. Notices,
+notifications, and parameter changes are handled as usual. Each call collects
+at most 128 KiB, so continuous incoming messages cannot keep validation running
+indefinitely. User callbacks may wait or throw.
+
+A connection already in use is left untouched. The pool validates after taking
+exclusive ownership of an idle connection, outside its shared pool lock. This
+check never retries a user operation.
 """
-function Base.isvalid(conn::Connection)
-    @lock conn.lock begin
+function isvalid(conn::Connection)
+    # Reentrant callbacks can call this from inside a statement as well. A
+    # held connection lock means the protocol reader already owns the stream.
+    islocked(conn.lock) && return isopen(conn.socket)
+    trylock(conn.lock) || return isopen(conn.socket)
+    try
         conn.closed && return false
         isopen(conn.socket) || return false
-        while true
-            pending = _pending_input(conn.socket)
-            pending === :none && return true
-            if pending === :eof
-                close(conn.socket)
+        socket = conn.socket
+        for _ in 1:16
+            n = try
+                API.consume_input!(socket)
+            catch
+                API.abort(socket)
                 return false
             end
-            # The server sent something to an idle session: an asynchronous
-            # message, or the error that terminated it. The stream is at a
-            # message boundary, so read one message; a failure partway leaves
-            # the position unknowable and the socket is closed.
-            message = try
-                mt, len = API.readheader(conn.socket, conn.debug)
-                if mt == UInt8('A')
-                    API.notificationResponse(len, conn.socket)
-                elseif mt == UInt8('N')
-                    API.noticeResponse(len, conn.socket)
-                elseif mt == UInt8('S')
-                    update_server_parameters!(conn, API.readbody(conn.socket, len))
-                    nothing
-                elseif mt == UInt8('E')
-                    API.errorResponse(len, conn.socket, conn.debug)
-                else
-                    # nothing else is legitimate on an idle connection: the
-                    # stream is out of step with the driver
-                    close(conn.socket)
+            while bytesavailable(socket) >= 5
+                message = try
+                    pos = socket.pos
+                    # Inspect framing without consuming an incomplete message.
+                    len = Int(ntoh(reinterpret(Int32, socket.buffer[pos+1:pos+4])[1])) - 4
+                    (0 <= len <= API.MAX_MESSAGE_LEN) || throw(API.Error("invalid message length from server"))
+                    bytesavailable(socket) >= 5 + len || break
+                    frame = IOBuffer(@view(socket.buffer[pos:pos+4+len]))
+                    socket.pos += 5 + len
+                    mt, _ = API.readheader(frame, conn.debug)
+                    if mt == UInt8('A')
+                        API.notificationResponse(len, frame)
+                    elseif mt == UInt8('N')
+                        API.noticeResponse(len, frame)
+                    elseif mt == UInt8('S')
+                        API.parameterStatus!(conn.server_parameters, len, frame)
+                        nothing
+                    elseif mt == UInt8('E')
+                        API.errorResponse(len, frame, conn.debug)
+                    else
+                        throw(API.Error("unexpected message on idle connection"))
+                    end
+                catch
+                    API.abort(socket)
                     return false
                 end
-            catch
-                close(conn.socket)
+                if message isa API.Error
+                    API.abort(socket)
+                    return false
+                elseif message isa API.Notification
+                    API.notification_callback(conn.style, message)
+                elseif message !== nothing
+                    API.notice_callback(conn.style, message)
+                end
+            end
+            if socket.ended
+                API.abort(socket)
                 return false
             end
-            if message isa API.Error
-                # FATAL and PANIC end the session; an unsolicited error of any
-                # other severity means the stream is out of step. Neither
-                # connection is reusable.
-                close(conn.socket)
-                return false
-            elseif message isa API.Notification
-                API.notification_callback(conn.style, message)
-            elseif message !== nothing
-                API.notice_callback(conn.style, message)
-            end
+            n === nothing && return true
         end
+        return true
+    finally
+        unlock(conn.lock)
     end
 end
 
@@ -497,32 +507,21 @@ function update_server_parameters!(conn::Connection, buf::Vector{UInt8})
     return
 end
 
-@inline function _set_read_deadline!(socket::ReseauConn, deadline_ns::Int64)
-    if socket isa Reseau.TCP.Conn
-        Reseau.TCP.set_read_deadline!(socket, deadline_ns)
-    elseif socket isa Reseau.TLS.Conn
-        Reseau.TLS.set_read_deadline!(socket, deadline_ns)
+@inline function _set_read_deadline!(socket::API.BufferedConn, deadline_ns::Int64)
+    transport = socket.transport
+    if transport isa Reseau.TCP.Conn
+        Reseau.TCP.set_read_deadline!(transport, deadline_ns)
+    elseif transport isa Reseau.TLS.Conn
+        Reseau.TLS.set_read_deadline!(transport, deadline_ns)
     else
-        API.set_read_deadline!(socket::API.GSSConn, deadline_ns)
+        API.set_read_deadline!(transport::API.GSSConn, deadline_ns)
     end
     return nothing
 end
 
-@inline function _clear_read_deadline!(socket::ReseauConn)
+@inline function _clear_read_deadline!(socket::API.BufferedConn)
     _set_read_deadline!(socket, Int64(0))
     return nothing
-end
-
-# Non-blocking answer to "has the server sent anything since the last read?"
-# on any of the three transports: :data, :eof, or :none.
-@inline function _pending_input(socket::ReseauConn)
-    if socket isa Reseau.TCP.Conn
-        return Reseau.TCP.pending_input(socket)
-    elseif socket isa Reseau.TLS.Conn
-        return Reseau.TLS.pending_input(socket)
-    else
-        return API.pending_input(socket::API.GSSConn)
-    end
 end
 
 const NOTIFICATION_POLL_INTERVAL_NS = Int64(100_000_000)
@@ -551,11 +550,10 @@ with a query are delivered to
 [`notification_callback`](@ref Postgres.API.notification_callback) only during
 the phases of a query that read result data.
 
-Over TLS or GSSAPI encryption the poll interval bounds a read on the
-underlying transport rather than on the record layer, so a record that arrives split across a poll
-boundary cannot be resumed. That is detected on the following poll and closes
-the connection with an error rather than returning corrupt data; a blocking
-wait (no `timeout`) is not affected.
+TLS and GSSAPI retain partial encrypted records across poll intervals. If the
+timeout expires before a complete application byte is available, a later read
+resumes that record. Once a PostgreSQL message begins, its remaining bytes are
+read without a deadline.
 """
 function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=nothing)
     start_time = time()
@@ -583,9 +581,8 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
             catch err
                 if !_is_read_deadline_error(err)
                     # the stream position is unknowable, so the connection
-                    # must never be reused (see the TLS caveat in the
-                    # docstring: a deadline that expires partway through a TLS
-                    # record surfaces here on the following poll)
+                    # must never be reused. Transport deadlines are the
+                    # exception: TLS and GSS retain partial record input.
                     close(conn.socket)
                     rethrow()
                 end
@@ -868,8 +865,8 @@ function cancel_query!(conn::Connection)
     # when another task holds it running the query being cancelled, so a
     # trylock-guarded check would be skipped in the case that matters. Reading
     # the socket field unlocked matches how host/pid/skey are read below.
-    sslmode = cancel_sslmode(conn.socket isa Reseau.TLS.Conn, conn.sslmode)
-    gssencmode = cancel_gssencmode(conn.socket isa API.GSSConn, conn.gssencmode)
+    sslmode = cancel_sslmode(conn.socket.transport isa Reseau.TLS.Conn, conn.sslmode)
+    gssencmode = cancel_gssencmode(conn.socket.transport isa API.GSSConn, conn.gssencmode)
     if trylock(conn.lock)
         try
             !isopen(conn.socket) && throw(PostgresInterfaceError("cannot cancel query: connection not open"))
@@ -892,7 +889,8 @@ function checkconn(conn::Connection)
         # connection is closed, but not explicitly, reconnect
         conn.in_transaction && throw(PostgresInterfaceError("postgres connection has been closed or disconnected; reconnect disabled during transaction"))
         conn.reconnect || throw(PostgresInterfaceError("postgres connection has been closed or disconnected; reconnect disabled"))
-        conn.socket, conn.pid, conn.skey, server_params = API.connect(conn.host, conn.port, conn.dbname, conn.user, conn.password, conn.debug, conn.application_name, conn.options, conn.connect_timeout, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.statement_timeout, conn.gssencmode, conn.krbsrvname, conn.gssdelegation, conn.style)
+        socket, conn.pid, conn.skey, server_params = API.connect(conn.host, conn.port, conn.dbname, conn.user, conn.password, conn.debug, conn.application_name, conn.options, conn.connect_timeout, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.statement_timeout, conn.gssencmode, conn.krbsrvname, conn.gssdelegation, conn.style)
+        conn.socket = socket
         empty!(conn.statements)
         conn.in_transaction = false
         conn.transaction_depth = 0
@@ -947,7 +945,7 @@ Base.close(conn::Connection) = DBInterface.close!(conn)
 A pool of [`Connection`](@ref Postgres.Connection)s, created lazily up to
 `limit` and reused across [`acquire`](@ref Postgres.acquire)/[`release`](@ref
 Postgres.release) cycles. A connection is checked with
-[`isvalid`](@ref Base.isvalid(::Postgres.Connection)) before it is handed out
+[`isvalid`](@ref Postgres.isvalid) before it is handed out
 and when it is returned, so one the server terminated while it sat idle is
 replaced rather than reused. A network drop that delivered no bytes still
 surfaces on the borrower's first operation; an ambiguous failed operation is
@@ -996,18 +994,30 @@ Take a connection from the pool, creating one if none is available (blocking
 if the pool is at its limit). Return it with [`release`](@ref Postgres.release).
 """
 function acquire(pool::ConnectionPool; forcenew::Bool=false)
-    pool.closed[] && throw(PostgresInterfaceError("connection pool is closed"))
-    conn = Pools.acquire(pool.connector, pool.pool; forcenew=forcenew, isvalid=isvalid)
-    closed = @lock pool.lifecycle_lock pool.closed[]
-    if closed
+    while true
+        pool.closed[] && throw(PostgresInterfaceError("connection pool is closed"))
+        conn = Pools.acquire(pool.connector, pool.pool; forcenew=forcenew)
+        keep = false
         try
-            DBInterface.close!(conn)
+            # Validation may deliver user callbacks. It must run after the
+            # pool lock is released, with this connection exclusively leased.
+            valid = isvalid(conn)
+            closed = @lock pool.lifecycle_lock pool.closed[]
+            closed && throw(PostgresInterfaceError("connection pool is closed"))
+            if valid
+                keep = true
+                return conn
+            end
         finally
-            Pools.release(pool.pool)
+            if !keep
+                try
+                    API.abort(conn.socket)
+                finally
+                    Pools.release(pool.pool)
+                end
+            end
         end
-        throw(PostgresInterfaceError("connection pool is closed"))
     end
-    return conn
 end
 
 # A connection going back into the pool must not carry a transaction with it:
@@ -1050,7 +1060,16 @@ the next borrower starts from a clean session; if it can't be rolled back it
 is closed rather than reused.
 """
 function release(pool::ConnectionPool, conn::Connection)
-    reusable = !pool.closed[] && isvalid(conn) && reset_pooled_connection!(conn)
+    reusable = try
+        !pool.closed[] && isvalid(conn) && reset_pooled_connection!(conn)
+    catch
+        try
+            API.abort(conn.socket)
+        finally
+            Pools.release(pool.pool)
+        end
+        rethrow()
+    end
     if reusable
         returned = @lock pool.lifecycle_lock begin
             if pool.closed[]
@@ -1518,7 +1537,7 @@ end
         "command_tag, rows_affected, cancel_query!, escape_identifier, escape_literal, " *
         "get_cached_statements, clear_statement_cache!, set_statement_cache_maxsize!, " *
         "get_server_parameter, get_server_parameters, get_statement_timeout, set_statement_timeout!, " *
-        "acquire, release, with_connection, describe"))
+        "acquire, release, with_connection, describe, isvalid"))
 end
 
 end

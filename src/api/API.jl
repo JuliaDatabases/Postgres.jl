@@ -211,7 +211,8 @@ end
 include("types.jl")
 include("gss.jl")
 
-const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn, GSSConn}
+include("buffered.jl")
+
 
 struct Params
     params::Vector{Union{String, Missing}}
@@ -843,8 +844,9 @@ function _startup!(socket, debug::Bool, user::String, dbname::String, @nospecial
     pid, skey, server_params = waitfor(socket, debug, 'K', 'Z'; max_message_len=MAX_PREAUTH_MESSAGE_LEN)
     uppercase(replace(get(server_params, "client_encoding", ""), "-" => "")) == "UTF8" ||
         close_and_throw(socket, Error("server did not confirm UTF8 client_encoding"))
-    align_session_formats!(socket, server_params, debug, statement_timeout_v)
-    return socket, pid, skey, server_params
+    buffered = BufferedConn(socket)
+    align_session_formats!(buffered, server_params, debug, statement_timeout_v)
+    return buffered, pid, skey, server_params
 end
 
 # The text-format parsers only understand ISO dates and postgres-style
@@ -1022,7 +1024,7 @@ end
 
 struct Exec{S <: AbstractPostgresStyle}
     style::S
-    socket::ReseauConn
+    socket::BufferedConn
     names::Vector{Symbol}
     typeIds::Vector{Int}
     type_registry::Dict{Int, TypeInfo}
@@ -1167,7 +1169,7 @@ function StructUtils.applyeach(style::AbstractPostgresStyle,
     throw(MethodError(StructUtils.applyeach, (style, callback, e)))
 end
 
-function exec(style::S, socket::ReseauConn, stmtname::String,
+function exec(style::S, socket::BufferedConn, stmtname::String,
               params::Vector{Union{String, Missing}}, names, typeIds,
               type_registry::Dict{Int, TypeInfo}, debug::Bool, rowlimit::Int=0,
               server_parameters::Dict{String, String}=Dict{String, String}()) where {S <: AbstractPostgresStyle}
@@ -1186,7 +1188,7 @@ end
 # Sync, after Parse/Describe/Bind/Execute. A transaction-mode pooler therefore
 # cannot return the backend between dependent protocol messages and replace the
 # unnamed statement with another client's statement.
-function exec_unnamed(style::S, socket::ReseauConn, sql::String,
+function exec_unnamed(style::S, socket::BufferedConn, sql::String,
                       params::Vector{Union{String, Missing}},
                       type_registry::Dict{Int, TypeInfo}, debug::Bool,
                       rowlimit::Int=0,
@@ -1210,7 +1212,7 @@ function exec_unnamed(style::S, socket::ReseauConn, sql::String,
                    Ref{UInt8}(UInt8('I')))
 end
 
-function exec(style::S, socket::ReseauConn, query::String, debug::Bool,
+function exec(style::S, socket::BufferedConn, query::String, debug::Bool,
               tx_status_ref::Union{Nothing, Base.RefValue{UInt8}}=nothing,
               command_tag_ref::Union{Nothing, Base.RefValue{Union{Nothing, String}}}=nothing,
               server_parameters::Union{Nothing, Dict{String, String}}=nothing) where {S <: AbstractPostgresStyle}
@@ -1258,7 +1260,7 @@ function exec(style::S, socket::ReseauConn, query::String, debug::Bool,
     return tx_status
 end
 
-exec(socket::ReseauConn, query::String, debug::Bool) = exec(PostgresStyle(), socket, query, debug)
+exec(socket::BufferedConn, query::String, debug::Bool) = exec(PostgresStyle(), socket, query, debug)
 
 function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessage(socket, debug, 'Q', query)

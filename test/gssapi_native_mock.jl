@@ -97,6 +97,7 @@ function test_gssapi()
     @eval GSSAPI sym(name::Symbol) = $(FAKE_SYMBOLS)[name]
     try
         Base.invokelatest(test_gssapi_protocol)
+        Base.invokelatest(test_gss_fragmentation)
     finally
         # Close even contexts left behind by a failed test before restoring the
         # real library; a finalizer must never hand a fake handle to Kerberos.

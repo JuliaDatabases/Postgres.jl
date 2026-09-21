@@ -524,7 +524,7 @@ include("isvalid_fake_server.jl")
                 :command_tag, :rows_affected, :cancel_query!, :escape_identifier, :escape_literal,
                 :get_cached_statements, :clear_statement_cache!, :set_statement_cache_maxsize!,
                 :get_server_parameter, :get_server_parameters, :get_statement_timeout, :set_statement_timeout!,
-                :acquire, :release, :with_connection, :describe,
+                :acquire, :release, :with_connection, :describe, :isvalid,
             ])
             @test Set(names(Postgres)) == union(exported, public_names)
         else
@@ -1023,6 +1023,7 @@ include("isvalid_fake_server.jl")
 
     test_gssapi()
     test_isvalid_fake_server()
+    test_isvalid_fragmentation()
 
     require_integration = get(ENV, "POSTGRES_REQUIRE_INTEGRATION", "false") == "true"
     if !docker_available()
@@ -1187,11 +1188,11 @@ include("isvalid_fake_server.jl")
                     # reports dead, and closes the socket so nothing is sent
                     # on a session that no longer exists.
                     idle_victim = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
-                    @test isvalid(idle_victim)
+                    @test Postgres.isvalid(idle_victim)
                     DBInterface.execute(connp, "SELECT pg_terminate_backend($(idle_victim.pid))")
                     @test wait_for_backend_exit(connp, idle_victim.pid)
                     @test isopen(idle_victim)
-                    @test !isvalid(idle_victim)
+                    @test !Postgres.isvalid(idle_victim)
                     @test !isopen(idle_victim)
                     @test_throws Postgres.PostgresInterfaceError DBInterface.execute(idle_victim, "SELECT 1")
                     DBInterface.close!(idle_victim)
@@ -1205,7 +1206,7 @@ include("isvalid_fake_server.jl")
                     Postgres.notify!(connp, "isvalid_channel", "while-idle")
                     seen = false
                     for _ = 1:100
-                        @test isvalid(listener_conn)
+                        @test Postgres.isvalid(listener_conn)
                         seen = !isempty(NOTIFICATIONS_SEEN)
                         seen && break
                         sleep(0.05)
@@ -1215,7 +1216,7 @@ include("isvalid_fake_server.jl")
                     @test NOTIFICATIONS_SEEN[1].payload == "while-idle"
                     @test Tables.rowtable(DBInterface.execute(listener_conn, "SELECT 1 AS a"))[1].a == 1
                     DBInterface.close!(listener_conn)
-                    @test !isvalid(listener_conn)
+                    @test !Postgres.isvalid(listener_conn)
 
                     DBInterface.close!(connp)
                 end
@@ -2761,11 +2762,11 @@ include("isvalid_fake_server.jl")
                     tls_victim = wait_for_connection(ssl_cfg; sslmode="require")
                     tls_killer = wait_for_connection(ssl_cfg; sslmode="require")
                     try
-                        @test tls_victim.socket isa Postgres.Reseau.TLS.Conn
-                        @test isvalid(tls_victim)
+                        @test tls_victim.socket.transport isa Postgres.Reseau.TLS.Conn
+                        @test Postgres.isvalid(tls_victim)
                         DBInterface.execute(tls_killer, "SELECT pg_terminate_backend($(tls_victim.pid))")
                         @test wait_for_backend_exit(tls_killer, tls_victim.pid)
-                        @test !isvalid(tls_victim)
+                        @test !Postgres.isvalid(tls_victim)
                         @test !isopen(tls_victim)
                     finally
                         isopen(tls_killer) && DBInterface.close!(tls_killer)
@@ -2883,7 +2884,7 @@ include("isvalid_fake_server.jl")
                     end
 
                     ssl_cancel_conn = DBInterface.connect(Postgres.Connection, ssl_cfg.host, ssl_cfg.user, ssl_cfg.password; dbname=ssl_cfg.dbname, port=ssl_cfg.port)
-                    @test ssl_cancel_conn.socket isa Postgres.Reseau.TLS.Conn
+                    @test ssl_cancel_conn.socket.transport isa Postgres.Reseau.TLS.Conn
                     try
                         ssl_task = errormonitor(Threads.@spawn begin
                             try
