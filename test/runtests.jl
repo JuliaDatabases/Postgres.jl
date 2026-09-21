@@ -503,6 +503,7 @@ end
 include("timestamps.jl")
 include("decimals.jl")
 include("gssapi.jl")
+include("isvalid_fake_server.jl")
 
 @testset "Postgres" begin
     test_timestamps()
@@ -1021,6 +1022,7 @@ include("gssapi.jl")
     end
 
     test_gssapi()
+    test_isvalid_fake_server()
 
     require_integration = get(ENV, "POSTGRES_REQUIRE_INTEGRATION", "false") == "true"
     if !docker_available()
