@@ -89,7 +89,7 @@ function cstring_at(buf::Vector{UInt8}, pos::Int)
 end
 
 function errorResponse(len, socket, debug)
-    buf = read(socket, len)
+    buf = readbody(socket, len)
     # parse error fields
     i = 1
     severity = ""
@@ -165,7 +165,7 @@ function errorResponse(len, socket, debug)
 end
 
 function noticeResponse(len, socket)
-    buf = read(socket, len)
+    buf = readbody(socket, len)
     i = 1
     notice = Dict{String, String}()
     while i <= length(buf)
@@ -183,7 +183,7 @@ function notificationResponse(len, socket)
     # channel/payload read consume the next message
     len < 4 && throw(Error("truncated NotificationResponse from server"))
     pid = ntoh(read(socket, Int32))
-    buf = read(socket, len - 4)
+    buf = readbody(socket, len - 4)
     i = 1
     channel = ""
     payload = ""
@@ -195,8 +195,7 @@ function notificationResponse(len, socket)
 end
 
 function parameterStatus!(parameters::Dict{String, String}, len, socket)
-    buf = read(socket, len)
-    length(buf) == len || close_and_throw(socket, Error("truncated ParameterStatus message from server"))
+    buf = readbody(socket, len)
     first_nul = findfirst(isequal(UInt8(0)), buf)
     first_nul === nothing && close_and_throw(socket, Error("invalid ParameterStatus message from server"))
     second_nul = findnext(isequal(UInt8(0)), buf, first_nul + 1)
@@ -379,6 +378,17 @@ const MAX_PREAUTH_MESSAGE_LEN = Int32(1) << 20
 @noinline function _bad_message_length(socket, len)
     close(socket)
     throw(Error("invalid message length $len from server; connection protocol state is corrupted"))
+end
+
+# A message body must arrive whole. `read(socket, n)` returns short when the
+# peer closes mid-message (the Base contract), which would let a truncated
+# message parse as a valid one. The stream position is then unknowable, so the
+# socket is closed before throwing.
+function readbody(socket, len::Integer)
+    buf = read(socket, len)
+    length(buf) == len ||
+        close_and_throw(socket, Error("truncated message from server ($(length(buf)) of $len body bytes); connection closed"))
+    return buf
 end
 
 function readheader(socket, debug=false, max_message_len::Int32=MAX_MESSAGE_LEN)
@@ -926,8 +936,7 @@ function readprepareddescription(socket, debug::Bool,
         len >= 2 || close_and_throw(socket, Error("truncated RowDescription message from server"))
         ncols = Int(ntoh(read(socket, Int16)))
         ncols >= 0 || close_and_throw(socket, Error("invalid RowDescription column count from server"))
-        buf = read(socket, len - 2)
-        length(buf) == len - 2 || close_and_throw(socket, Error("truncated RowDescription message from server"))
+        buf = readbody(socket, len - 2)
         i = 1
         # each field: name (cstring), table oid (4), column number (2),
         # type oid (4), type length (2), type modifier (4), format code (2).
@@ -1039,8 +1048,7 @@ end
 in_transaction_status(status::UInt8) = status == UInt8('T') || status == UInt8('E')
 
 function commandComplete(len, socket)
-    buf = read(socket, len)
-    length(buf) == len || throw(Error("truncated CommandComplete message from server"))
+    buf = readbody(socket, len)
     isempty(buf) && throw(Error("empty CommandComplete message from server"))
     findfirst(isequal(UInt8(0)), buf) == length(buf) ||
         throw(Error("invalid CommandComplete message from server"))
@@ -1389,7 +1397,7 @@ function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where 
                     (extra_statement = true)
                 copy_started = true
             elseif mt == UInt8('d')
-                write(dest, read(socket, len))
+                write(dest, readbody(socket, len))
             elseif mt == UInt8('c')
                 skipbytes!(socket, len)
             elseif mt == UInt8('C')

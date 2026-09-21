@@ -397,7 +397,7 @@ function read_portal_batch!(cursor::Cursor)
             if mt == UInt8('D')
                 cursor.rowcount += 1
                 if consumer_error === nothing
-                    row = API.DataRow(read(conn.socket, len), cursor.names, cursor.typeIds, conn.type_registry)
+                    row = API.DataRow(API.readbody(conn.socket, len), cursor.names, cursor.typeIds, conn.type_registry)
                     try
                         data = Vector{Any}(undef, length(cursor.names))
                         StructUtils.applyeach(conn.style, RowClosure(data, cursor.types, 1), row)

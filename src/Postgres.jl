@@ -242,7 +242,7 @@ function Base.isvalid(conn::Connection)
                 elseif mt == UInt8('N')
                     API.noticeResponse(len, conn.socket)
                 elseif mt == UInt8('S')
-                    update_server_parameters!(conn, read(conn.socket, len))
+                    update_server_parameters!(conn, API.readbody(conn.socket, len))
                     nothing
                 elseif mt == UInt8('E')
                     API.errorResponse(len, conn.socket, conn.debug)
@@ -617,7 +617,7 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
                 elseif mt == UInt8('N')
                     API.noticeResponse(len, conn.socket)
                 elseif mt == UInt8('S')
-                    update_server_parameters!(conn, read(conn.socket, len))
+                    update_server_parameters!(conn, API.readbody(conn.socket, len))
                     nothing
                 elseif mt == UInt8('E')
                     API.errorResponse(len, conn.socket, conn.debug)
