@@ -115,14 +115,6 @@ function docker_available()
     end
 end
 
-function pick_port()
-    server = Sockets.listen(Sockets.IPv4(0), 0)
-    _, port = Sockets.getsockname(server)
-    port = Int(port)
-    close(server)
-    return port
-end
-
 function wait_for_connection(cfg::PgConfig; timeout::Float64=60.0, sslmode::Union{Nothing, String}=nothing, sslrootcert::Union{Nothing, String}=nothing)
     start_time = time()
     last_err = nothing
@@ -157,7 +149,6 @@ Postgres.API.notification_callback(::NotifyStyle, n) = (push!(NOTIFICATIONS_SEEN
 
 function with_postgres(f::Function)
     image, tag = parse_image_ref(IMAGE_REF)
-    host_port = pick_port()
     env = Dict(
         "POSTGRES_USER" => DEFAULT_USER,
         "POSTGRES_PASSWORD" => DEFAULT_PASSWORD,
@@ -168,10 +159,11 @@ function with_postgres(f::Function)
     Harbor.with_container(
         image;
         tag=tag,
-        ports=Dict(5432 => host_port),
+        ports=Dict(5432 => 0),
         environment=env,
         wait_strategy=(pattern="database system is ready to accept connections",),
-    ) do _
+    ) do container
+        host_port = Harbor.host_port(container, 5432)
         cfg = PgConfig("127.0.0.1", host_port, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_DB)
         return f(cfg)
     end
@@ -278,7 +270,6 @@ end
 
 function with_ssl_postgres(f::Function)
     image, tag = parse_image_ref(IMAGE_REF)
-    host_port = pick_port()
     env = Dict(
         "POSTGRES_USER" => DEFAULT_USER,
         "POSTGRES_PASSWORD" => DEFAULT_PASSWORD,
@@ -291,14 +282,15 @@ function with_ssl_postgres(f::Function)
         Harbor.with_container(
             image;
             tag=tag,
-            ports=Dict(5432 => host_port),
+            ports=Dict(5432 => 0),
             volumes=Dict(
                 "/certs" => tls.certdir,
             ),
             environment=env,
             command=ssl_postgres_command(),
             wait_strategy=(pattern="database system is ready to accept connections",),
-        ) do _
+        ) do container
+            host_port = Harbor.host_port(container, 5432)
             cfg = PgConfig("127.0.0.1", host_port, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_DB)
             return f(cfg, tls)
         end

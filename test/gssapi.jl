@@ -543,8 +543,6 @@ end
 
 function with_kerberos_postgres(f::Function)
     image, tag = parse_image_ref(IMAGE_REF)
-    host_port = pick_port()
-    kdc_port = pick_port()
     env = Dict(
         "POSTGRES_USER" => DEFAULT_USER,
         "POSTGRES_PASSWORD" => DEFAULT_PASSWORD,
@@ -561,10 +559,23 @@ hostnogssenc all $KRB_USER 0.0.0.0/0 gss include_realm=0 krb_realm=$KRB_REALM
 host all all 0.0.0.0/0 trust
 host all all ::/0 trust
 """)
-        # Only TCP is published: MIT forces TCP with udp_preference_limit = 0,
-        # Heimdal (macOS) with the tcp/ prefix.
-        kdc = Sys.isapple() ? "tcp/127.0.0.1:$kdc_port" : "127.0.0.1:$kdc_port"
-        write(joinpath(dir, "krb5.conf"), """
+        Harbor.with_container(
+            image;
+            tag=tag,
+            ports=Dict(5432 => 0, 88 => 0),
+            volumes=Dict("/keys" => dir),
+            environment=env,
+            command=kerberos_postgres_command(),
+            wait_strategy=(pattern="database system is ready to accept connections",),
+            wait_timeout=300.0,
+            container_logs_on_error=true,
+        ) do container
+            host_port = Harbor.host_port(container, 5432)
+            kdc_port = Harbor.host_port(container, 88)
+            # Only TCP is published: MIT forces TCP with udp_preference_limit = 0,
+            # Heimdal (macOS) with the tcp/ prefix.
+            kdc = Sys.isapple() ? "tcp/127.0.0.1:$kdc_port" : "127.0.0.1:$kdc_port"
+            write(joinpath(dir, "krb5.conf"), """
 [libdefaults]
     default_realm = $KRB_REALM
     dns_lookup_kdc = false
@@ -577,17 +588,6 @@ host all all ::/0 trust
         kdc = $kdc
     }
 """)
-        Harbor.with_container(
-            image;
-            tag=tag,
-            ports=Dict(5432 => host_port, 88 => kdc_port),
-            volumes=Dict("/keys" => dir),
-            environment=env,
-            command=kerberos_postgres_command(),
-            wait_strategy=(pattern="database system is ready to accept connections",),
-            wait_timeout=300.0,
-            container_logs_on_error=true,
-        ) do _
             cfg = PgConfig("127.0.0.1", host_port, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_DB)
             withenv("KRB5_CONFIG" => joinpath(dir, "krb5.conf"), "KRB5CCNAME" => "FILE:" * joinpath(dir, "ccache")) do
                 return f(cfg)
