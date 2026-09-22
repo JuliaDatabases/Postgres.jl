@@ -194,6 +194,15 @@ end
 DBInterface.close!(pool)
 ```
 
+Before an idle connection is handed out, the pool checks it with
+`Postgres.isvalid(conn)`, which reads whatever the server has already sent without
+issuing a query. A session the server terminated while it sat idle (a restart,
+`pg_terminate_backend`, `idle_session_timeout`) is replaced instead of reused.
+`isopen(conn)` only reports the local socket state. Custom pools can call
+`Postgres.isvalid` the same way. Partial messages remain buffered for normal
+reads. A `true` result means no failure was observed; it does not prove that
+the server is alive. Validation callbacks run outside the pool lock.
+
 ## Errors and cancellation
 
 `Postgres.Error` includes SQLSTATE information. Use `Postgres.cancel_query!(conn)` to cancel a running query.

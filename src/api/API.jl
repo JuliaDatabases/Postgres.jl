@@ -89,7 +89,7 @@ function cstring_at(buf::Vector{UInt8}, pos::Int)
 end
 
 function errorResponse(len, socket, debug)
-    buf = read(socket, len)
+    buf = readbody(socket, len)
     # parse error fields
     i = 1
     severity = ""
@@ -165,7 +165,7 @@ function errorResponse(len, socket, debug)
 end
 
 function noticeResponse(len, socket)
-    buf = read(socket, len)
+    buf = readbody(socket, len)
     i = 1
     notice = Dict{String, String}()
     while i <= length(buf)
@@ -183,7 +183,7 @@ function notificationResponse(len, socket)
     # channel/payload read consume the next message
     len < 4 && throw(Error("truncated NotificationResponse from server"))
     pid = ntoh(read(socket, Int32))
-    buf = read(socket, len - 4)
+    buf = readbody(socket, len - 4)
     i = 1
     channel = ""
     payload = ""
@@ -195,8 +195,7 @@ function notificationResponse(len, socket)
 end
 
 function parameterStatus!(parameters::Dict{String, String}, len, socket)
-    buf = read(socket, len)
-    length(buf) == len || close_and_throw(socket, Error("truncated ParameterStatus message from server"))
+    buf = readbody(socket, len)
     first_nul = findfirst(isequal(UInt8(0)), buf)
     first_nul === nothing && close_and_throw(socket, Error("invalid ParameterStatus message from server"))
     second_nul = findnext(isequal(UInt8(0)), buf, first_nul + 1)
@@ -212,7 +211,8 @@ end
 include("types.jl")
 include("gss.jl")
 
-const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn, GSSConn}
+include("buffered.jl")
+
 
 struct Params
     params::Vector{Union{String, Missing}}
@@ -379,6 +379,17 @@ const MAX_PREAUTH_MESSAGE_LEN = Int32(1) << 20
 @noinline function _bad_message_length(socket, len)
     close(socket)
     throw(Error("invalid message length $len from server; connection protocol state is corrupted"))
+end
+
+# A message body must arrive whole. `read(socket, n)` returns short when the
+# peer closes mid-message (the Base contract), which would let a truncated
+# message parse as a valid one. The stream position is then unknowable, so the
+# socket is closed before throwing.
+function readbody(socket, len::Integer)
+    buf = read(socket, len)
+    length(buf) == len ||
+        close_and_throw(socket, Error("truncated message from server ($(length(buf)) of $len body bytes); connection closed"))
+    return buf
 end
 
 function readheader(socket, debug=false, max_message_len::Int32=MAX_MESSAGE_LEN)
@@ -833,8 +844,9 @@ function _startup!(socket, debug::Bool, user::String, dbname::String, @nospecial
     pid, skey, server_params = waitfor(socket, debug, 'K', 'Z'; max_message_len=MAX_PREAUTH_MESSAGE_LEN)
     uppercase(replace(get(server_params, "client_encoding", ""), "-" => "")) == "UTF8" ||
         close_and_throw(socket, Error("server did not confirm UTF8 client_encoding"))
-    align_session_formats!(socket, server_params, debug, statement_timeout_v)
-    return socket, pid, skey, server_params
+    buffered = BufferedConn(socket)
+    align_session_formats!(buffered, server_params, debug, statement_timeout_v)
+    return buffered, pid, skey, server_params
 end
 
 # The text-format parsers only understand ISO dates and postgres-style
@@ -926,8 +938,7 @@ function readprepareddescription(socket, debug::Bool,
         len >= 2 || close_and_throw(socket, Error("truncated RowDescription message from server"))
         ncols = Int(ntoh(read(socket, Int16)))
         ncols >= 0 || close_and_throw(socket, Error("invalid RowDescription column count from server"))
-        buf = read(socket, len - 2)
-        length(buf) == len - 2 || close_and_throw(socket, Error("truncated RowDescription message from server"))
+        buf = readbody(socket, len - 2)
         i = 1
         # each field: name (cstring), table oid (4), column number (2),
         # type oid (4), type length (2), type modifier (4), format code (2).
@@ -1013,7 +1024,7 @@ end
 
 struct Exec{S <: AbstractPostgresStyle}
     style::S
-    socket::ReseauConn
+    socket::BufferedConn
     names::Vector{Symbol}
     typeIds::Vector{Int}
     type_registry::Dict{Int, TypeInfo}
@@ -1039,8 +1050,7 @@ end
 in_transaction_status(status::UInt8) = status == UInt8('T') || status == UInt8('E')
 
 function commandComplete(len, socket)
-    buf = read(socket, len)
-    length(buf) == len || throw(Error("truncated CommandComplete message from server"))
+    buf = readbody(socket, len)
     isempty(buf) && throw(Error("empty CommandComplete message from server"))
     findfirst(isequal(UInt8(0)), buf) == length(buf) ||
         throw(Error("invalid CommandComplete message from server"))
@@ -1159,7 +1169,7 @@ function StructUtils.applyeach(style::AbstractPostgresStyle,
     throw(MethodError(StructUtils.applyeach, (style, callback, e)))
 end
 
-function exec(style::S, socket::ReseauConn, stmtname::String,
+function exec(style::S, socket::BufferedConn, stmtname::String,
               params::Vector{Union{String, Missing}}, names, typeIds,
               type_registry::Dict{Int, TypeInfo}, debug::Bool, rowlimit::Int=0,
               server_parameters::Dict{String, String}=Dict{String, String}()) where {S <: AbstractPostgresStyle}
@@ -1178,7 +1188,7 @@ end
 # Sync, after Parse/Describe/Bind/Execute. A transaction-mode pooler therefore
 # cannot return the backend between dependent protocol messages and replace the
 # unnamed statement with another client's statement.
-function exec_unnamed(style::S, socket::ReseauConn, sql::String,
+function exec_unnamed(style::S, socket::BufferedConn, sql::String,
                       params::Vector{Union{String, Missing}},
                       type_registry::Dict{Int, TypeInfo}, debug::Bool,
                       rowlimit::Int=0,
@@ -1202,7 +1212,7 @@ function exec_unnamed(style::S, socket::ReseauConn, sql::String,
                    Ref{UInt8}(UInt8('I')))
 end
 
-function exec(style::S, socket::ReseauConn, query::String, debug::Bool,
+function exec(style::S, socket::BufferedConn, query::String, debug::Bool,
               tx_status_ref::Union{Nothing, Base.RefValue{UInt8}}=nothing,
               command_tag_ref::Union{Nothing, Base.RefValue{Union{Nothing, String}}}=nothing,
               server_parameters::Union{Nothing, Dict{String, String}}=nothing) where {S <: AbstractPostgresStyle}
@@ -1250,7 +1260,7 @@ function exec(style::S, socket::ReseauConn, query::String, debug::Bool,
     return tx_status
 end
 
-exec(socket::ReseauConn, query::String, debug::Bool) = exec(PostgresStyle(), socket, query, debug)
+exec(socket::BufferedConn, query::String, debug::Bool) = exec(PostgresStyle(), socket, query, debug)
 
 function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessage(socket, debug, 'Q', query)
@@ -1389,7 +1399,7 @@ function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where 
                     (extra_statement = true)
                 copy_started = true
             elseif mt == UInt8('d')
-                write(dest, read(socket, len))
+                write(dest, readbody(socket, len))
             elseif mt == UInt8('c')
                 skipbytes!(socket, len)
             elseif mt == UInt8('C')

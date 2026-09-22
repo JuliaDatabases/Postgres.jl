@@ -138,6 +138,23 @@ function wait_for_connection(cfg::PgConfig; timeout::Float64=60.0, sslmode::Unio
     error("Postgres did not become ready: $(sprint(showerror, last_err))")
 end
 
+# Poll until the server no longer lists `pid`: a terminated backend sends its
+# FATAL and closes its socket before its pg_stat_activity row disappears.
+function wait_for_backend_exit(conn, pid; timeout::Float64=10.0)
+    deadline = time() + timeout
+    while time() < deadline
+        n = Tables.rowtable(DBInterface.execute(conn, "SELECT count(*) AS n FROM pg_stat_activity WHERE pid = $pid"))[1].n
+        n == 0 && return true
+        sleep(0.05)
+    end
+    return false
+end
+
+# collects notifications that isvalid dispatches while reading pending input
+const NOTIFICATIONS_SEEN = Postgres.API.Notification[]
+struct NotifyStyle <: Postgres.API.AbstractPostgresStyle end
+Postgres.API.notification_callback(::NotifyStyle, n) = (push!(NOTIFICATIONS_SEEN, n); nothing)
+
 function with_postgres(f::Function)
     image, tag = parse_image_ref(IMAGE_REF)
     host_port = pick_port()
@@ -486,6 +503,7 @@ end
 include("timestamps.jl")
 include("decimals.jl")
 include("gssapi.jl")
+include("isvalid_fake_server.jl")
 
 @testset "Postgres" begin
     test_timestamps()
@@ -506,7 +524,7 @@ include("gssapi.jl")
                 :command_tag, :rows_affected, :cancel_query!, :escape_identifier, :escape_literal,
                 :get_cached_statements, :clear_statement_cache!, :set_statement_cache_maxsize!,
                 :get_server_parameter, :get_server_parameters, :get_statement_timeout, :set_statement_timeout!,
-                :acquire, :release, :with_connection, :describe,
+                :acquire, :release, :with_connection, :describe, :isvalid,
             ])
             @test Set(names(Postgres)) == union(exported, public_names)
         else
@@ -1004,6 +1022,8 @@ include("gssapi.jl")
     end
 
     test_gssapi()
+    test_isvalid_fake_server()
+    test_isvalid_fragmentation()
 
     require_integration = get(ENV, "POSTGRES_REQUIRE_INTEGRATION", "false") == "true"
     if !docker_available()
@@ -1162,6 +1182,42 @@ include("gssapi.jl")
                     @test !isopen(conn_victim.socket)
 
                     DBInterface.close!(conn_victim)
+
+                    # A session terminated while idle: the FATAL sits unread in
+                    # the socket, so isopen still says open. isvalid reads it,
+                    # reports dead, and closes the socket so nothing is sent
+                    # on a session that no longer exists.
+                    idle_victim = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+                    @test Postgres.isvalid(idle_victim)
+                    DBInterface.execute(connp, "SELECT pg_terminate_backend($(idle_victim.pid))")
+                    @test wait_for_backend_exit(connp, idle_victim.pid)
+                    @test isopen(idle_victim)
+                    @test !Postgres.isvalid(idle_victim)
+                    @test !isopen(idle_victim)
+                    @test_throws Postgres.PostgresInterfaceError DBInterface.execute(idle_victim, "SELECT 1")
+                    DBInterface.close!(idle_victim)
+
+                    # Pending input that is not a termination (a NOTIFY that
+                    # arrived while idle) is dispatched to the style callback
+                    # and the connection stays valid and usable.
+                    empty!(NOTIFICATIONS_SEEN)
+                    listener_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, style=NotifyStyle())
+                    Postgres.listen!(listener_conn, "isvalid_channel")
+                    Postgres.notify!(connp, "isvalid_channel", "while-idle")
+                    seen = false
+                    for _ = 1:100
+                        @test Postgres.isvalid(listener_conn)
+                        seen = !isempty(NOTIFICATIONS_SEEN)
+                        seen && break
+                        sleep(0.05)
+                    end
+                    @test seen
+                    @test NOTIFICATIONS_SEEN[1].channel == "isvalid_channel"
+                    @test NOTIFICATIONS_SEEN[1].payload == "while-idle"
+                    @test Tables.rowtable(DBInterface.execute(listener_conn, "SELECT 1 AS a"))[1].a == 1
+                    DBInterface.close!(listener_conn)
+                    @test !Postgres.isvalid(listener_conn)
+
                     DBInterface.close!(connp)
                 end
                 @testset "Prepared Statements" begin
@@ -2182,6 +2238,19 @@ include("gssapi.jl")
                         ids = [row.id for row in Tables.rowtable(DBInterface.execute(pooled_conn, "SELECT id FROM pool_tx_test ORDER BY id"))]
                         @test ids == [2]
                     end
+
+                    # A pooled connection the server terminates while it sits
+                    # idle is replaced at the next acquire, not handed out.
+                    stale = Postgres.acquire(pool)
+                    stale_pid = stale.pid
+                    Postgres.release(pool, stale)
+                    DBInterface.execute(conn, "SELECT pg_terminate_backend($stale_pid)")
+                    @test wait_for_backend_exit(conn, stale_pid)
+                    fresh = Postgres.acquire(pool)
+                    @test fresh !== stale
+                    @test !isopen(stale)
+                    @test Tables.rowtable(DBInterface.execute(fresh, "SELECT 1 AS a"))[1].a == 1
+                    Postgres.release(pool, fresh)
                     DBInterface.close!(pool)
                     @test !isopen(pool)
                     @test !isopen(conn_a)
@@ -2688,6 +2757,22 @@ include("gssapi.jl")
                         isopen(require_conn) && DBInterface.close!(require_conn)
                     end
 
+                    # isvalid over TLS: the FATAL arrives inside a TLS record,
+                    # and the peek has to see it through the record layer
+                    tls_victim = wait_for_connection(ssl_cfg; sslmode="require")
+                    tls_killer = wait_for_connection(ssl_cfg; sslmode="require")
+                    try
+                        @test tls_victim.socket.transport isa Postgres.Reseau.TLS.Conn
+                        @test Postgres.isvalid(tls_victim)
+                        DBInterface.execute(tls_killer, "SELECT pg_terminate_backend($(tls_victim.pid))")
+                        @test wait_for_backend_exit(tls_killer, tls_victim.pid)
+                        @test !Postgres.isvalid(tls_victim)
+                        @test !isopen(tls_victim)
+                    finally
+                        isopen(tls_killer) && DBInterface.close!(tls_killer)
+                        isopen(tls_victim) && DBInterface.close!(tls_victim)
+                    end
+
                     verify_conn = DBInterface.connect(Postgres.Connection, ssl_cfg.host, ssl_cfg.user, ssl_cfg.password; dbname=ssl_cfg.dbname, port=ssl_cfg.port, sslmode="verify-full", sslrootcert=tls.rootcert)
                     try
                         @test isopen(verify_conn)
@@ -2799,7 +2884,7 @@ include("gssapi.jl")
                     end
 
                     ssl_cancel_conn = DBInterface.connect(Postgres.Connection, ssl_cfg.host, ssl_cfg.user, ssl_cfg.password; dbname=ssl_cfg.dbname, port=ssl_cfg.port)
-                    @test ssl_cancel_conn.socket isa Postgres.Reseau.TLS.Conn
+                    @test ssl_cancel_conn.socket.transport isa Postgres.Reseau.TLS.Conn
                     try
                         ssl_task = errormonitor(Threads.@spawn begin
                             try

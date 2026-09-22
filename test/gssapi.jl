@@ -166,7 +166,7 @@ function test_gssapi_protocol()
             conn = Postgres.Connection(host="127.0.0.1", port=port, user="krbuser", dbname="db",
                                        gssencmode="require", krbsrvname="POSTGRES", gssdelegation=true,
                                        options="-c search_path=public", style=style)
-            @test conn.socket isa Postgres.API.GSSConn
+            @test conn.socket.transport isa Postgres.API.GSSConn
             @test fieldtype(Postgres.API.GSSConn, :ctx) === GSSAPI.Context
             @test isopen(conn)
             @test conn.pid == 4242
@@ -176,6 +176,9 @@ function test_gssapi_protocol()
             # the deadline plumbing on the GSS transport: nothing arrives, nothing is consumed
             @test Postgres.wait_for_notification(conn; timeout=0.2) === nothing
             @test isopen(conn)
+            # the non-blocking read behind isvalid also runs through the GSS
+            # transport: an idle fake server means nothing pending, alive
+            @test Postgres.isvalid(conn)
             # the cancel key travels over a GSS-encrypted connection too
             Postgres.cancel_query!(conn)
             timedwait(() -> cancel_seen[] !== nothing, 5.0)
@@ -201,7 +204,7 @@ function test_gssapi_protocol()
         with_fake_server(handler) do port, accepted
             withenv("PGGSSENCMODE" => "prefer", "PGKRBSRVNAME" => "pgsvc") do
                 conn = DBInterface.connect(Postgres.Connection, "postgresql://krbuser@127.0.0.1:$port/db"; style=style)
-                @test conn.socket isa Postgres.API.GSSConn
+                @test conn.socket.transport isa Postgres.API.GSSConn
                 @test style.contexts[1].target == "pgsvc@127.0.0.1"
                 @test !style.contexts[1].delegate
                 close(conn)
@@ -377,7 +380,7 @@ function test_gssapi_protocol()
         end
         with_fake_server(handler) do port, accepted
             conn = Postgres.Connection(host="127.0.0.1", port=port, user="u", gssencmode="prefer", style=style)
-            @test conn.socket isa Postgres.Reseau.TCP.Conn
+            @test conn.socket.transport isa Postgres.Reseau.TCP.Conn
             close(conn)
             err = connect_err(() -> Postgres.Connection(host="127.0.0.1", port=port, user="u", gssencmode="require", style=style))
             @test err isa Postgres.Error
@@ -404,7 +407,7 @@ function test_gssapi_protocol()
                 conn = Postgres.Connection(host="127.0.0.1", port=port, user="krbuser", password=password, sslmode="disable",
                                            krbsrvname="postgres", gssdelegation=true, style=style)
                 @test isopen(conn)
-                @test conn.socket isa Postgres.Reseau.TCP.Conn
+                @test conn.socket.transport isa Postgres.Reseau.TCP.Conn
                 @test length(style.contexts) == 1
                 @test style.contexts[1].target == "postgres@127.0.0.1"
                 @test !style.contexts[1].encrypt && style.contexts[1].delegate
@@ -608,7 +611,7 @@ function test_kerberos_integration()
                 # GSSAPI authentication on a plain connection (hostnogssenc rule)
                 auth_conn = DBInterface.connect(Postgres.Connection, cfg.host, KRB_USER, nothing; dbname=cfg.dbname, port=cfg.port, sslmode="disable")
                 try
-                    @test auth_conn.socket isa Postgres.Reseau.TCP.Conn
+                    @test auth_conn.socket.transport isa Postgres.Reseau.TCP.Conn
                     status = gss_status(auth_conn)
                     @test status.gss_authenticated && !status.encrypted
                     @test status.principal == "$KRB_USER@$KRB_REALM"
@@ -621,7 +624,7 @@ function test_kerberos_integration()
                 for mode in ("require", "prefer")
                     enc_conn = DBInterface.connect(Postgres.Connection, cfg.host, KRB_USER, nothing; dbname=cfg.dbname, port=cfg.port, gssencmode=mode)
                     try
-                        @test enc_conn.socket isa Postgres.API.GSSConn
+                        @test enc_conn.socket.transport isa Postgres.API.GSSConn
                         status = gss_status(enc_conn)
                         @test status.gss_authenticated && status.encrypted
                         @test status.principal == "$KRB_USER@$KRB_REALM"
@@ -663,6 +666,67 @@ function test_kerberos_integration()
             finally
                 DBInterface.execute(admin, "DROP ROLE IF EXISTS $KRB_USER")
                 DBInterface.close!(admin)
+            end
+        end
+    end
+end
+
+function test_gss_fragmentation()
+    @testset "GSS validation preserves incomplete frames" begin
+        for completion in (:read, :validation)
+            finish = Base.Event()
+            sent = Channel{Int}(1)
+            advance = Channel{Nothing}(1)
+            message = pgmsg('A', vcat(be32(77), Vector{UInt8}("gss-fragments"), 0x00, Vector{UInt8}("retained"), 0x00))
+            message = vcat(param_status("application_name", "fragmented-gss"), message)
+            token = vcat(FAKE_SEAL, message)
+            frame = vcat(be32(length(token)), token)
+            handler = function(sock, n)
+                code, _ = read_request(sock)
+                code == GSSENC_REQUEST || error("expected GSS request")
+                send(sock, UInt8['G'])
+                io = server_handshake(sock)
+                read_startup(io)
+                ready!(io)
+                start = 1
+                for stop in (1, 3, 4, length(frame)-1)
+                    send(sock, frame[start:stop])
+                    put!(sent, stop)
+                    take!(advance)
+                    start = stop + 1
+                end
+                send(sock, frame[start:end])
+                wait(finish)
+                close(sock)
+            end
+            with_fake_server(handler) do port, accepted
+                conn = Postgres.Connection(host="127.0.0.1", port=port, user="u", dbname="db", gssencmode="require", style=FakeGSSStyle())
+                try
+                    for _ in 1:4
+                        stop = take!(sent)
+                        @test !eof(conn.socket.transport.tcp)
+                        @test Postgres.isvalid(conn)
+                        @test conn.socket.transport.received == stop
+                        @test bytesavailable(conn.socket) == 0
+                        put!(advance, nothing)
+                    end
+                    if completion == :read
+                        notification = Postgres.wait_for_notification(conn; timeout=5)
+                        @test notification !== nothing
+                        @test notification.channel == "gss-fragments"
+                        @test notification.payload == "retained"
+                    else
+                        @test !eof(conn.socket.transport.tcp)
+                        @test Postgres.isvalid(conn)
+                    end
+                    @test Postgres.get_server_parameter(conn, "application_name") == "fragmented-gss"
+                    notify(finish)
+                    @test eof(conn.socket.transport.tcp)
+                    @test !Postgres.isvalid(conn)
+                finally
+                    notify(finish)
+                    close(conn)
+                end
             end
         end
     end

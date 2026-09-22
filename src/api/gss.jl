@@ -34,6 +34,8 @@ mutable struct GSSConn <: IO
     max_plaintext::Int      # gss_wrap_size_limit for one packet
     buffer::Vector{UInt8}   # unwrapped plaintext not yet consumed
     pos::Int
+    frame::Vector{UInt8}
+    received::Int
 end
 
 function _write_framed(tcp::Reseau.TCP.Conn, token::Vector{UInt8})
@@ -57,19 +59,42 @@ function _read_framed(socket, max_len::Int, debug::Bool)
     return read!(socket, Vector{UInt8}(undef, len))
 end
 
-function _fill!(io::GSSConn)
-    # a read failure here leaves the transport where it was: a read-deadline
-    # expiry on the first header byte (wait_for_notification polling) consumes
-    # nothing, and callers close the connection on every other failure
-    token = _read_framed(io.tcp, GSS_MAX_PACKET_SIZE - 4, false)
+# GSS frames can split anywhere, including inside their four-byte length.
+# Both blocking reads and validation resume from the same collected prefix.
+function _fill!(io::GSSConn; block::Bool=true)::Union{Bool, Nothing}
+    for header in (true, false)
+        target = if header
+            4
+        else
+            len = Int(ntoh(reinterpret(UInt32, @view(io.frame[1:4]))[1]))
+            len <= GSS_MAX_PACKET_SIZE - 4 || close_and_throw(io, Error("oversize GSSAPI packet sent by the server"))
+            4 + len
+        end
+        io.received >= target && continue
+        resize!(io.frame, target)
+        while io.received < target
+            n = if block
+                readbytes!(io.tcp, @view(io.frame[io.received+1:target]), target-io.received; all=false)
+            else
+                Reseau.TCP.tryread!(io.tcp, @view(io.frame[io.received+1:target]))
+            end
+            n === nothing && return nothing
+            if n == 0
+                io.received == 0 && return false
+                close_and_throw(io, Error("truncated GSSAPI frame from server"))
+            end
+            io.received += n
+        end
+    end
     io.buffer = try
-        SASLAuth.GSSAPI.unwrap(io.ctx, token)
+        SASLAuth.GSSAPI.unwrap(io.ctx, io.frame[5:end])
     catch
         close(io)
         rethrow()
     end
+    io.received = 0
     io.pos = 1
-    return
+    return true
 end
 
 Base.bytesavailable(io::GSSConn) = length(io.buffer) - io.pos + 1
@@ -84,7 +109,7 @@ end
 
 function Base.read(io::GSSConn, ::Type{UInt8})
     while bytesavailable(io) == 0
-        _fill!(io)
+        _fill!(io) === true || throw(EOFError())
     end
     b = @inbounds io.buffer[io.pos]
     io.pos += 1
@@ -97,7 +122,7 @@ function Base.unsafe_read(io::GSSConn, p::Ptr{UInt8}, n::UInt)
     while remaining > 0
         avail = bytesavailable(io)
         if avail == 0
-            _fill!(io)
+            _fill!(io) === true || throw(EOFError())
             continue
         end
         k = min(avail, remaining)
@@ -111,15 +136,21 @@ end
 
 function Base.readbytes!(io::GSSConn, buf::AbstractVector{UInt8}, nb::Integer=length(buf); all::Bool=true)
     n = Int(nb)
-    if !all
-        while bytesavailable(io) == 0
-            _fill!(io)
-        end
-        n = min(n, bytesavailable(io))
-    end
+    n >= 0 || throw(ArgumentError("nb must be nonnegative"))
     length(buf) < n && resize!(buf, n)
-    GC.@preserve buf unsafe_read(io, pointer(buf), UInt(n))
-    return n
+    total = 0
+    while total < n
+        if bytesavailable(io) == 0
+            _fill!(io) === true || break
+            continue
+        end
+        k = min(n-total, bytesavailable(io))
+        copyto!(buf, total+1, io.buffer, io.pos, k)
+        io.pos += k
+        total += k
+        all || break
+    end
+    return total
 end
 
 function Base.unsafe_write(io::GSSConn, p::Ptr{UInt8}, n::UInt)
@@ -138,6 +169,22 @@ function Base.unsafe_write(io::GSSConn, p::Ptr{UInt8}, n::UInt)
 end
 
 set_read_deadline!(io::GSSConn, deadline_ns::Integer) = Reseau.TCP.set_read_deadline!(io.tcp, deadline_ns)
+
+function tryread!(io::GSSConn, buf::AbstractVector{UInt8})::Union{Int, Nothing}
+    isempty(buf) && throw(ArgumentError("tryread! requires a nonempty buffer"))
+    for _ in 1:16
+        n = min(length(buf), bytesavailable(io))
+        if n > 0
+            copyto!(buf, 1, io.buffer, io.pos, n)
+            io.pos += n
+            return n
+        end
+        ready = _fill!(io; block=false)
+        ready === nothing && return nothing
+        ready || return 0
+    end
+    return nothing
+end
 
 # GSSENCRequest and, on 'G', the framed handshake (libpq's pqsecure_open_gss).
 # Returns the encrypted transport, or `nothing` when the server answered 'N'
@@ -170,7 +217,7 @@ function gss_encrypt(socket::Reseau.TCP.Conn, style::AbstractPostgresStyle, host
         end
         max_plaintext = SASLAuth.GSSAPI.wrap_size_limit(ctx, GSS_MAX_PACKET_SIZE - 4)
         max_plaintext > 0 || close_and_throw(socket, Error("GSSAPI size check error: no room for data in a $(GSS_MAX_PACKET_SIZE)-byte packet"))
-        return GSSConn(socket, ctx, max_plaintext, UInt8[], 1)
+        return GSSConn(socket, ctx, max_plaintext, UInt8[], 1, UInt8[], 0)
     catch
         close(ctx)
         rethrow()
