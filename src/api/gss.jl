@@ -173,17 +173,16 @@ set_read_deadline!(io::GSSConn, deadline_ns::Integer) = Reseau.TCP.set_read_dead
 function tryread!(io::GSSConn, buf::AbstractVector{UInt8})::Union{Int, Nothing}
     isempty(buf) && throw(ArgumentError("tryread! requires a nonempty buffer"))
     for _ in 1:16
-        n = min(length(buf), bytesavailable(io))
-        if n > 0
-            copyto!(buf, 1, io.buffer, io.pos, n)
-            io.pos += n
-            return n
-        end
+        bytesavailable(io) > 0 && break
         ready = _fill!(io; block=false)
         ready === nothing && return nothing
         ready || return 0
     end
-    return nothing
+    n = min(length(buf), bytesavailable(io))
+    n == 0 && return nothing
+    copyto!(buf, 1, io.buffer, io.pos, n)
+    io.pos += n
+    return n
 end
 
 # GSSENCRequest and, on 'G', the framed handshake (libpq's pqsecure_open_gss).

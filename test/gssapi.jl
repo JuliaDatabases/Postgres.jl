@@ -730,4 +730,88 @@ function test_gss_fragmentation()
             end
         end
     end
+    test_gss_read_budget()
+end
+
+function test_gss_read_budget()
+    @testset "GSS nonblocking record budget" begin
+        for (empty_frames, shared_buffer) in ((15, true), (15, false), (16, false))
+            finish = Base.Event()
+            sent = Channel{Nothing}(1)
+            message = pgmsg('A', vcat(be32(77), UInt8['c', 0, 'p', 0]))
+            empty_frame = vcat(be32(1), FAKE_SEAL)
+            token = vcat(FAKE_SEAL, message)
+            wire = vcat(repeat(empty_frame, empty_frames), be32(length(token)), token)
+            handler = function(sock, n)
+                read_request(sock)
+                send(sock, UInt8['G'])
+                io = server_handshake(sock)
+                read_startup(io)
+                ready!(io)
+                send(sock, wire)
+                put!(sent, nothing)
+                wait(finish)
+            end
+            with_fake_server(handler) do port, accepted
+                conn = Postgres.Connection(host="127.0.0.1", port=port, user="u", dbname="db",
+                                           gssencmode="require", style=FakeGSSStyle())
+                transport = conn.socket.transport
+                buf = zeros(UInt8, 3)
+                try
+                    take!(sent)
+                    deadline = time_ns() + UInt64(5_000_000_000)
+                    Postgres.API.set_read_deadline!(transport, deadline)
+                    @test !eof(transport.tcp)
+                    # No other reader uses this socket. Wait for the full fixture,
+                    # since readability alone only guarantees its first byte.
+                    peeked = similar(wire)
+                    socketops = Postgres.API.Reseau.SocketOps
+                    while true
+                        available = GC.@preserve peeked socketops.recv_from!(
+                            transport.tcp.fd.pfd.sysfd, pointer(peeked),
+                            Csize_t(length(peeked)), socketops.MSG_PEEK)
+                        available > 0 || error("fixture socket lost readability")
+                        available == length(peeked) && break
+                        time_ns() < deadline || error("complete GSS fixture did not arrive")
+                        yield()
+                    end
+                    Postgres.API.set_read_deadline!(transport, 0)
+                    @test peeked == wire
+                    n = shared_buffer ? Postgres.API.consume_input!(conn.socket) : Postgres.API.tryread!(transport, buf)
+                    expected = empty_frames == 16 ? nothing : shared_buffer ? length(message) : length(buf)
+                    @test n === expected
+                    if empty_frames == 16
+                        @test bytesavailable(transport) == 0
+                        @test !eof(transport.tcp) # The seventeenth record was not consumed.
+                    end
+                    if n === nothing
+                        n = shared_buffer ? Postgres.API.consume_input!(conn.socket) : Postgres.API.tryread!(transport, buf)
+                    end
+                    if shared_buffer
+                        @test n == length(message)
+                        @test conn.socket.buffer == message
+                    else
+                        @test n == length(buf)
+                        received = copy(buf[1:n])
+                        @test bytesavailable(transport) == length(message) - n
+                        @test Postgres.API.Reseau.TCP.tryread!(transport.tcp, zeros(UInt8, 1)) === nothing
+                        while length(received) < length(message)
+                            n = Postgres.API.tryread!(transport, buf)
+                            @test n isa Int && n > 0
+                            append!(received, @view(buf[1:n]))
+                        end
+                        @test received == message
+                    end
+                    @test bytesavailable(transport) == 0
+                    @test Postgres.API.tryread!(transport, buf) === nothing
+                    notify(finish)
+                    @test eof(transport.tcp)
+                    @test Postgres.API.tryread!(transport, buf) == 0
+                finally
+                    notify(finish)
+                    close(conn)
+                end
+            end
+        end
+    end
 end
