@@ -234,16 +234,11 @@ function isvalid(conn::Connection)
                 API.abort(socket)
                 return false
             end
-            while bytesavailable(socket) >= 5
+            while true
                 message = try
-                    pos = socket.pos
-                    # Inspect framing without consuming an incomplete message.
-                    len = Int(ntoh(reinterpret(Int32, socket.buffer[pos+1:pos+4])[1])) - 4
-                    (0 <= len <= API.MAX_MESSAGE_LEN) || throw(API.Error("invalid message length from server"))
-                    bytesavailable(socket) >= 5 + len || break
-                    frame = IOBuffer(@view(socket.buffer[pos:pos+4+len]))
-                    socket.pos += 5 + len
-                    mt, _ = API.readheader(frame, conn.debug)
+                    frame = API.take_frame!(socket)
+                    frame === nothing && break
+                    mt, len = API.readheader(frame, conn.debug)
                     if mt == UInt8('A')
                         API.notificationResponse(len, frame)
                     elseif mt == UInt8('N')
@@ -541,91 +536,75 @@ end
 Block until a `NOTIFY` message arrives on the connection (see
 [`listen!`](@ref Postgres.listen!)) and return it as a
 [`Notification`](@ref Postgres.API.Notification). With a `timeout` (seconds),
-return `nothing` if no message begins arriving in that window; once a message
-starts, it is always read to completion so the connection is never left parked
-mid-message. The connection lock is held while waiting, so use a dedicated
-connection for listening — that is also the only way to receive every
-notification, since notifications that arrive while the connection is busy
-with a query are delivered to
-[`notification_callback`](@ref Postgres.API.notification_callback) only during
-the phases of a query that read result data.
+return `nothing` if no complete notification arrives within the receive budget.
+Partial PostgreSQL messages and TLS or GSSAPI records remain buffered, so a later
+read can resume them. Notices and other messages do not restart the budget.
 
-TLS and GSSAPI retain partial encrypted records across poll intervals. If the
-timeout expires before a complete application byte is available, a later read
-resumes that record. Once a PostgreSQL message begins, its remaining bytes are
-read without a deadline.
+The connection lock is held while waiting, so use a dedicated connection for
+listening. Notifications received while a query uses the connection are instead
+delivered to [`notification_callback`](@ref Postgres.API.notification_callback)
+during the phases that read result data.
+
+The timeout bounds network receive waiting on an established connection with
+exclusive ownership. Elapsed time while acquiring the connection lock,
+reconnecting, or running user callbacks counts against the budget, but these
+operations are not interrupted by it. It is not a hard wall-clock return deadline.
 """
 function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=nothing)
-    start_time = time()
+    start_time = time_ns()
     @lock conn.lock begin
         checkconn(conn)
         while true
             deadline_ns = if timeout === nothing
                 Int64(time_ns()) + NOTIFICATION_POLL_INTERVAL_NS
             else
-                remaining_s = timeout - (time() - start_time)
+                remaining_s = timeout - (time_ns() - start_time) / 1_000_000_000
                 remaining_s <= 0 && return nothing
                 # clamp before converting: an Inf or very large timeout would
                 # overflow the nanosecond conversion
                 remaining_ns = remaining_s >= 10.0 ? NOTIFICATION_POLL_INTERVAL_NS : round(Int64, remaining_s * 1_000_000_000)
                 Int64(time_ns()) + min(NOTIFICATION_POLL_INTERVAL_NS, remaining_ns)
             end
-            # The deadline covers only the first byte: if it expires there,
-            # nothing of a message has been consumed and polling again is safe.
-            # Once a byte arrives the rest of the message is read without a
-            # deadline, so a message straddling the poll boundary can never
-            # leave the stream parked mid-message.
-            _set_read_deadline!(conn.socket, deadline_ns)
-            mt = try
-                read(conn.socket, UInt8)
-            catch err
-                if !_is_read_deadline_error(err)
-                    # the stream position is unknowable, so the connection
-                    # must never be reused. Transport deadlines are the
-                    # exception: TLS and GSS retain partial record input.
-                    close(conn.socket)
-                    rethrow()
-                end
-                nothing
-            finally
-                # the deadline must be cleared on every path, including a
-                # rethrow: an expired deadline left set on the socket makes
-                # every later read on this connection fail
-                isopen(conn.socket) && _clear_read_deadline!(conn.socket)
-            end
-            # nothing arrived within this poll interval; nothing of a message
-            # has been consumed, so it is safe to loop and re-check the timeout
-            mt === nothing && continue
-            # A byte of a message has been consumed, so from here any failure
-            # leaves the stream at an unknowable position: close the connection
-            # rather than hand back one that still looks healthy. No deadline is
-            # in effect, so the message is read to completion.
-            # Read the message off the socket. Only the reading is guarded:
-            # once a message is fully consumed the stream is back at a clean
-            # boundary, so user callbacks and server errors are surfaced
-            # without destroying the connection.
             message = try
-                len = ntoh(read(conn.socket, Int32)) - 4
-                (len < 0 || len > API.MAX_MESSAGE_LEN) &&
-                    throw(API.Error("invalid message length $len from server; connection protocol state is corrupted"))
-                conn.debug && @info "readheader: $(Char(mt)), $len"
+                frame = API.take_frame!(conn.socket)
+                if frame === nothing
+                    conn.socket.ended && throw(EOFError())
+                    n = API.consume_input!(conn.socket)
+                    if n === nothing
+                        # Readiness is only a wake signal. Collect and parse
+                        # nonblocking input again, even after raw TCP EOF, so
+                        # TLS/GSS can diagnose truncated encrypted records.
+                        transport = conn.socket.transport
+                        tcp = transport isa Reseau.TCP.Conn ? transport : transport.tcp
+                        _set_read_deadline!(conn.socket, deadline_ns)
+                        try
+                            eof(tcp)
+                        finally
+                            isopen(conn.socket) && _clear_read_deadline!(conn.socket)
+                        end
+                    end
+                    continue
+                end
+                mt, len = API.readheader(frame, conn.debug)
                 if mt == UInt8('A')
-                    API.notificationResponse(len, conn.socket)
+                    API.notificationResponse(len, frame)
                 elseif mt == UInt8('N')
-                    API.noticeResponse(len, conn.socket)
+                    API.noticeResponse(len, frame)
                 elseif mt == UInt8('S')
-                    update_server_parameters!(conn, API.readbody(conn.socket, len))
+                    update_server_parameters!(conn, API.readbody(frame, len))
                     nothing
                 elseif mt == UInt8('E')
-                    API.errorResponse(len, conn.socket, conn.debug)
+                    API.errorResponse(len, frame, conn.debug)
                 else
-                    API.skipbytes!(conn.socket, len)
                     nothing
                 end
-            catch
-                close(conn.socket)
+            catch err
+                _is_read_deadline_error(err) && continue
+                API.abort(conn.socket)
                 rethrow()
             end
+            # Parsing has consumed a complete frame. User callback failures
+            # must propagate without discarding the aligned connection.
             if message isa API.Notification
                 API.notification_callback(conn.style, message)
                 return message
@@ -633,7 +612,7 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
                 # FATAL and PANIC both terminate the session; close now so the
                 # next use reports the error rather than a bare EOF from a
                 # socket the server has already dropped
-                (message.severity == "FATAL" || message.severity == "PANIC") && close(conn.socket)
+                (message.severity == "FATAL" || message.severity == "PANIC") && API.abort(conn.socket)
                 throw(message)
             elseif message !== nothing
                 API.notice_callback(conn.style, message)
