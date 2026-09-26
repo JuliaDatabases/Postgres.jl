@@ -1201,11 +1201,21 @@ function exec_unnamed(style::S, socket::BufferedConn, sql::String,
         ('B', "", "", npformats, nparams, Params(params), Int16(0)),
         ('E', "", Int32(rowlimit)),
         ('S',))
-    mt, len = read_expected(socket, debug, '1'; server_parameters=server_parameters)
-    skipbytes!(socket, len)
-    _, names, typeIds = readprepareddescription(socket, debug, server_parameters)
-    mt, len = read_expected(socket, debug, '2'; server_parameters=server_parameters)
-    skipbytes!(socket, len)
+    names, typeIds = try
+        mt, len = read_expected(socket, debug, '1'; server_parameters=server_parameters)
+        skipbytes!(socket, len)
+        _, names, typeIds = readprepareddescription(socket, debug, server_parameters)
+        mt, len = read_expected(socket, debug, '2'; server_parameters=server_parameters)
+        skipbytes!(socket, len)
+        names, typeIds
+    catch err
+        # an Error leaves the stream at ReadyForQuery (or already closed the
+        # socket); anything else, such as EOF before the server flushed these
+        # replies, leaves the position unknowable and the socket must never be
+        # reused
+        err isa Error || close(socket)
+        rethrow()
+    end
     return Exec{S}(style, socket, names, typeIds, type_registry, server_parameters, debug,
                    Ref{Union{Nothing, String}}(nothing),
                    Ref{Union{Nothing, Int}}(nothing),
