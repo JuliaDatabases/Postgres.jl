@@ -496,6 +496,7 @@ include("timestamps.jl")
 include("decimals.jl")
 include("gssapi.jl")
 include("isvalid_fake_server.jl")
+include("executemany.jl")
 
 @testset "Postgres" begin
     test_timestamps()
@@ -1016,6 +1017,7 @@ include("isvalid_fake_server.jl")
     test_gssapi()
     test_isvalid_fake_server()
     test_isvalid_fragmentation()
+    test_executemany_protocol()
 
     require_integration = get(ENV, "POSTGRES_REQUIRE_INTEGRATION", "false") == "true"
     if !docker_available()
@@ -1026,6 +1028,7 @@ include("isvalid_fake_server.jl")
         with_postgres() do cfg
             conn = wait_for_connection(cfg)
             try
+                test_executemany(conn)
                 @testset "Auth" begin
                     if occursin("trust", DEFAULT_AUTH) || occursin("trust", DEFAULT_INITDB_ARGS)
                         conn_trust = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, nothing; dbname=cfg.dbname, port=cfg.port)
@@ -2608,6 +2611,7 @@ include("isvalid_fake_server.jl")
 
                 @testset "Cancel Request" begin
                     cancel_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+                    test_executemany_cancel(cancel_conn, conn)
                     task = errormonitor(Threads.@spawn begin
                         try
                             DBInterface.execute(cancel_conn, "SELECT pg_sleep(5)")
@@ -2745,6 +2749,7 @@ include("isvalid_fake_server.jl")
                     try
                         @test isopen(require_conn)
                         @test connection_uses_ssl(require_conn)
+                        test_executemany(require_conn)
                     finally
                         isopen(require_conn) && DBInterface.close!(require_conn)
                     end
