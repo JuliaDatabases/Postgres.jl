@@ -1184,6 +1184,77 @@ function exec(style::S, socket::BufferedConn, stmtname::String,
                    Ref{Union{Nothing, Int}}(nothing), Ref{UInt8}(UInt8('I')))
 end
 
+# A group contains only no-result Bind/Execute pairs followed by one Sync.
+# Reading while writing is necessary even for a bounded group: a NOTICE may
+# fill the server's output while a large parameter fills its input.
+function exec_batch(style::AbstractPostgresStyle, socket::BufferedConn,
+                    messages::Vector{UInt8}, count::Int,
+                    server_parameters::Dict{String, String}, debug::Bool)
+    writer = Threads.@spawn try
+        write(socket, messages)
+        flush(socket)
+        nothing
+    catch err
+        try
+            abort(socket)
+        catch
+        end
+        err
+    end
+    server_error = nothing
+    completed = 0
+    bound = false
+    status = UInt8('I')
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            if mt == UInt8('2')
+                (len == 0 && !bound && completed < count && server_error === nothing) ||
+                    throw(Error("unexpected BindComplete in executemany response"))
+                bound = true
+            elseif mt == UInt8('C')
+                (bound && server_error === nothing) ||
+                    throw(Error("unexpected CommandComplete in executemany response"))
+                commandComplete(len, socket)
+                completed += 1
+                bound = false
+            elseif mt == UInt8('E')
+                err = errorResponse(len, socket, debug)
+                server_error === nothing && (server_error = err)
+            elseif mt == UInt8('N')
+                notice_callback(style, noticeResponse(len, socket))
+            elseif mt == UInt8('A')
+                notification_callback(style, notificationResponse(len, socket))
+            elseif mt == UInt8('S')
+                parameterStatus!(server_parameters, len, socket)
+            elseif mt == UInt8('Z')
+                status = read_ready_status(socket, len)
+                (server_error !== nothing || (!bound && completed == count)) ||
+                    throw(Error("incomplete executemany response from server"))
+                status == (server_error === nothing ? UInt8('T') : UInt8('E')) ||
+                    throw(Error("unexpected transaction status in executemany response"))
+                break
+            else
+                throw(Error("unexpected message type '$(Char(mt))' in executemany response"))
+            end
+        end
+        write_error = fetch(writer)
+        write_error === nothing || throw(write_error)
+        return status, server_error
+    catch
+        # The caller still owns the connection lock. Stop and join the writer
+        # before that lock can be released or the connection can be reused.
+        try
+            abort(socket)
+        catch
+        end
+        write_error = fetch(writer)
+        server_error === nothing || throw(server_error)
+        write_error === nothing || throw(write_error)
+        rethrow()
+    end
+end
+
 # Execute an unnamed statement as one extended-query segment. There is one
 # Sync, after Parse/Describe/Bind/Execute. A transaction-mode pooler therefore
 # cannot return the backend between dependent protocol messages and replace the

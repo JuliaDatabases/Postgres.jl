@@ -634,6 +634,10 @@ function test_kerberos_integration()
                         # parameters larger than one packet are chunked on the way out
                         echoed = only(DBInterface.execute(enc_conn, "SELECT length(\$1::text) AS n", (repeat("y", 70000),))).n
                         @test echoed == 70000
+                        DBInterface.execute(enc_conn, "CREATE TEMP TABLE bulk_gss(id int, value text)")
+                        @test DBInterface.executemany(enc_conn, raw"INSERT INTO bulk_gss VALUES ($1, $2)",
+                            (collect(1:130), fill("encrypted", 130))) === nothing
+                        @test only(DBInterface.execute(enc_conn, "SELECT sum(id) AS n FROM bulk_gss")).n == 8515
                         if mode == "require"
                             cancel_task = errormonitor(Threads.@spawn begin
                                 try
