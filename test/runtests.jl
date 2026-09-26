@@ -494,6 +494,7 @@ end
 
 include("timestamps.jl")
 include("decimals.jl")
+include("result_decoding.jl")
 include("gssapi.jl")
 include("isvalid_fake_server.jl")
 
@@ -1013,6 +1014,7 @@ include("isvalid_fake_server.jl")
         end
     end
 
+    test_result_decoding()
     test_gssapi()
     test_isvalid_fake_server()
     test_isvalid_fragmentation()

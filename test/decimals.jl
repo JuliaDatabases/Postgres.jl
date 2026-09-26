@@ -50,6 +50,61 @@ function test_decimals()
         @test Postgres.API.parse_array("{1.23,4.56}", DataDecimals.Decimal64{2}) == DataDecimals.Decimal64{2}.(["1.23", "4.56"])
         @test Postgres._param(DataDecimals.Decimal64{4}("1.2300")) == "1.2300"
     end
+    @testset "Native decimal parsing preserves coefficient and scale" begin
+        texts = ["0", "-0", "+0", "-0.0000", "+0.0000", "  +12.3400\t", "\u200312.3400\u2003",
+                 ".5", "1.", "-.5", "+.5", "00012.3400", "0." * repeat("0", 100),
+                 repeat("1", 76) * ".0000", "0." * repeat("0", 16382) * "1"]
+        for n in 76:79
+            push!(texts, repeat("1", n), "-" * repeat("1", n), "0." * repeat("1", n), "0." * repeat("0", n))
+        end
+        rng = MersenneTwister(0xdec0de)
+        for _ in 1:200
+            digits = String(rand(rng, '0':'9', rand(rng, 1:80)))
+            split_at = rand(rng, 0:length(digits))
+            push!(texts, string(rand(rng, ("", "+", "-")), digits[1:split_at], ".", digits[split_at+1:end]))
+        end
+        for text in texts
+            # BigInt arithmetic is an independent oracle for the bounded
+            # decimal scanner, including scale that trailing zeros preserve.
+            stripped = strip(text)
+            negative = startswith(stripped, "-")
+            unsigned = (negative || startswith(stripped, "+")) ? stripped[2:end] : stripped
+            parts = split(unsigned, '.'; limit=2)
+            scale = length(parts) == 2 ? length(parts[2]) : 0
+            coeff = parse(BigInt, join(parts)) * (negative ? -1 : 1)
+            if typemin(DataDecimals.Int256) <= coeff <= typemax(DataDecimals.Int256) && scale <= 16383
+                value = Postgres.API.parse_numeric(text, :error)
+                @test value isa WireDecimal
+                @test BigInt(DataDecimals.unscaled(value)) == coeff
+                @test DataDecimals.scale(value) == scale
+                typed = Postgres.API.parse_decimal(WireDecimal, text)
+                @test BigInt(DataDecimals.unscaled(typed)) == coeff
+                @test DataDecimals.scale(typed) == scale
+            else
+                @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric(text, :error)
+                @test_throws InexactError Postgres.API.parse_decimal(WireDecimal, text)
+            end
+            T = DataDecimals.Decimal64{2}
+            expected = try
+                T(coeff // big(10)^scale)
+            catch err
+                err
+            end
+            if expected isa Exception
+                @test_throws typeof(expected) Postgres.API.parse_decimal(T, text)
+            else
+                @test Postgres.API.parse_decimal(T, text) === expected
+            end
+        end
+        for text in ("", " ", "+", "-", ".", "1..2", "1,2", "1/2", "1x", "1\0", "1.2.3", "1e", "1e+")
+            @test_throws Exception Postgres.API.parse_numeric(text, :error)
+            @test_throws Exception Postgres.API.parse_decimal(WireDecimal, text)
+        end
+        for text in ("0e100001", "0e-100001", "1e100001", "1e-100001")
+            @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric(text, :error)
+            @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_decimal(WireDecimal, text)
+        end
+    end
 end
 
 function test_decimal_roundtrips(conn)

@@ -1004,9 +1004,9 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, dr::DataRow)
                 f(dr.names[i], nothing)
             else
                 (len >= 0 && pos + len - 1 <= nbuf) || throw(Error("truncated DataRow message from server"))
-                str = unsafe_string(pointer(buf, pos), len)
+                bytes = @view buf[pos:pos+len-1]
                 pos += len
-                @inbounds applycast(f, dr.names[i], dr.typeIds[i], str, dr.type_registry)
+                @inbounds applycast(f, dr.names[i], dr.typeIds[i], bytes, dr.type_registry)
             end
         end
         pos == nbuf + 1 || throw(Error("DataRow message has trailing bytes"))

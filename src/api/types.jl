@@ -448,6 +448,16 @@ end
 end
 
 function parse_numeric(val::String, on_overflow::Symbol=:warn)::NumericValue
+    @static if pkgversion(Parsers) >= v"3"
+        # PostgreSQL emits fixed-point numeric text. The native decimal parser
+        # preserves its coefficient and scale without an intermediate BigInt.
+        # Longer coefficients and exponents retain the scale, bounds and error
+        # behavior of the fallback below.
+        if sizeof(val) <= 77 && !any(c -> c == 'e' || c == 'E', val)
+            value = Parsers.tryparse(PGDecimal, val)
+            value !== nothing && DataDecimals.scale(value) <= 16383 && return value
+        end
+    end
     num = parse_numeric_parts(val)
     if num !== nothing && num.scale <= 16383 && MIN_DECIMAL_COEFFICIENT <= num.coeff <= MAX_DECIMAL_COEFFICIENT
         return PGDecimal(DataDecimals.Int256(num.coeff), num.scale)
@@ -460,6 +470,13 @@ function parse_numeric(val::String, on_overflow::Symbol=:warn)::NumericValue
 end
 
 function parse_decimal(::Type{T}, val::String) where {T<:DataDecimals.AbstractDecimal}
+    @static if pkgversion(Parsers) >= v"3"
+        if T <: Union{DataDecimals.Decimal, DataDecimals.DecimalValue} &&
+           sizeof(val) <= 77 && !any(c -> c == 'e' || c == 'E', val)
+            value = Parsers.tryparse(T, val; rounding=DataDecimals.RoundExact)
+            value !== nothing && return value
+        end
+    end
     num = parse_numeric_parts(val)
     num === nothing && throw(InexactError(:parse_decimal, T, val))
     # Preserve the requested scale for variable-scale values. Fixed-scale
@@ -853,31 +870,29 @@ end
     return decode_bytea_escape(val)
 end
 
-function parse_boolean(val::String)
-    (val == "t" || val == "1") && return true
-    (val == "f" || val == "0") && return false
+function parse_boolean(val::Union{String, AbstractVector{UInt8}})
+    bytes = val isa String ? codeunits(val) : val
+    if length(bytes) == 1
+        (bytes[1] == UInt8('t') || bytes[1] == UInt8('1')) && return true
+        (bytes[1] == UInt8('f') || bytes[1] == UInt8('0')) && return false
+    end
     throw(PostgresInterfaceError("postgres value cannot be represented as Bool; select multi-bit bit(n) values as text"))
 end
 
-function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
+# DataRow supplies contiguous, bounds-checked views. Copy only at the boundary
+# where a parser or result needs an owned String.
+const FieldBytes = SubArray{UInt8, 1, Vector{UInt8}, Tuple{UnitRange{Int}}, true}
+_field_text(val::String) = val
+_field_text(val::FieldBytes) = GC.@preserve val unsafe_string(pointer(val), length(val))
+
+function parse_value(typeId::Int, val::Union{String, FieldBytes}, registry::Dict{Int, TypeInfo})
     info = type_info(registry, typeId)
     if info.parser !== nothing
-        return info.parser(val, registry)
+        return info.parser(_field_text(val), registry)
     end
     T = info.julia_type
     if T == Bool
         return parse_boolean(val)
-    elseif T == Char
-        return pg_parse_char(val)
-    elseif T == PGTimestamp
-        return pg_parse_timestamp(val)
-    elseif T == DateTime
-        if typeId == 1184
-            return parse_timestamptz(val)
-        end
-        return pg_parse_datetime(val)
-    elseif T == UUID
-        return UUID(val)
     elseif T == Int16
         return Parsers.parse(Int16, val)
     elseif T == Int32
@@ -890,6 +905,21 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
         return Parsers.parse(Float32, val)
     elseif T == Float64
         return Parsers.parse(Float64, val)
+    end
+    # Text, lazy JSON and custom parsers own their bytes. Fixed-width scalar
+    # decoders above can read directly from the row's bounded byte view.
+    val = _field_text(val)
+    if T == Char
+        return pg_parse_char(val)
+    elseif T == PGTimestamp
+        return pg_parse_timestamp(val)
+    elseif T == DateTime
+        if typeId == 1184
+            return parse_timestamptz(val)
+        end
+        return pg_parse_datetime(val)
+    elseif T == UUID
+        return UUID(val)
     elseif T == Date
         return pg_parse_date(val)
     elseif T == Time
@@ -923,7 +953,7 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
     return val
 end
 
-@inline function applycast(f, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+@inline function applycast(f, name, typeId, val, registry::Dict{Int, TypeInfo})
     f(name, parse_value(typeId, val, registry))
     return
 end
@@ -931,8 +961,8 @@ end
 # Typed fields can require a wider range than the default OID mapping. Defer
 # decoding until StructUtils supplies the declared field type. Other targets,
 # including Any and registered composites, retain the OID parser behavior.
-struct FieldValue
-    text::String
+struct FieldValue{V}
+    text::V
     oid::Int
     registry::Dict{Int, TypeInfo}
 end
@@ -940,32 +970,32 @@ end
 const WireFieldScalar = Union{Durations.Timestamp, DataDecimals.AbstractDecimal, DateTime}
 _wire_field(::Type{T}) where {T} = T <: Union{Missing, WireFieldScalar}
 _wire_field(::Type{<:AbstractVector{T}}) where {T} = T <: WireFieldScalar
-_field_source(::Type{T}, v::FieldValue) where {T} = _wire_field(T) ? v.text : parse_value(v.oid, v.text, v.registry)
+_field_source(::Type{T}, v::FieldValue) where {T} = _wire_field(T) ? _field_text(v.text) : parse_value(v.oid, v.text, v.registry)
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue) where {T} = StructUtils.make(st, T, _field_source(T, v))
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue, tags) where {T} = StructUtils.make(st, T, _field_source(T, v), tags)
 
 @static if isdefined(StructUtils, :InterpClosure) && isdefined(StructUtils, :HotStructClosure)
-    @inline function applycast(f::Union{StructUtils.InterpClosure, StructUtils.HotStructClosure}, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+    @inline function applycast(f::Union{StructUtils.InterpClosure, StructUtils.HotStructClosure}, name, typeId, val, registry::Dict{Int, TypeInfo})
         f(name, FieldValue(val, typeId, registry))
         return
     end
 end
 
 @static if isdefined(StructUtils, :StructClosure)
-    @inline function applycast(f::StructUtils.StructClosure, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+    @inline function applycast(f::StructUtils.StructClosure, name, typeId, val, registry::Dict{Int, TypeInfo})
         f(name, FieldValue(val, typeId, registry))
         return
     end
 end
 
 @static if isdefined(StructUtils, :FieldSink)
-    @inline function applycast(f::StructUtils.FieldSink, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+    @inline function applycast(f::StructUtils.FieldSink, name, typeId, val, registry::Dict{Int, TypeInfo})
         f(name, FieldValue(val, typeId, registry))
         return
     end
 end
 
-@inline function applycast(f::StructUtils.TupleClosure, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+@inline function applycast(f::StructUtils.TupleClosure, name, typeId, val, registry::Dict{Int, TypeInfo})
     f(name, FieldValue(val, typeId, registry))
     return
 end
