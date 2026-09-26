@@ -560,9 +560,108 @@ function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothi
     end
 end
 
-# DBInterface's generic connection overload prepares a statement without
-# closing it. That leaks named server statements when this driver's cache is
-# disabled. Keep the handle lifetime explicit for both bulk fallbacks.
+# Only native values in ordinary owned columns may be converted ahead of the
+# server. Custom indexing/conversion can have observable per-row side effects.
+function batch_parameter_type(::Type{T}) where {T}
+    T <: Union{Missing, Nothing, Bool, Int8, Int16, Int32, Int64, Int128,
+               UInt8, UInt16, UInt32, UInt64, UInt128, Float16, Float32, Float64,
+               String, SubString{String}, Dates.Date, Dates.DateTime, Dates.Time,
+               UUID, API.PGTimestamp, Durations.Timestamp{Dates.Nanosecond},
+               API.PGDecimal} && return true
+    T <: Vector && return batch_parameter_type(eltype(T))
+    T isa Union && return all(batch_parameter_type, Base.uniontypes(T))
+    return false
+end
+
+function batch_columns(stmt::Statement, params)
+    params isa Union{Tuple, NamedTuple, Vector} || return nothing
+    columns = params isa NamedTuple ? values(params) : params
+    isempty(columns) && return nothing
+    length(columns) == stmt.nparams || return nothing
+    all(x -> x isa Vector && batch_parameter_type(eltype(x)), columns) || return nothing
+    nrows = length(first(columns))
+    nrows > 1 || return nothing
+    all(x -> length(x) == nrows, columns) || return nothing
+    return columns
+end
+
+function flush_batch!(stmt::Statement, buf::IOBuffer, count::Int)
+    conn = stmt.conn
+    API._write_message_to_buffer(buf, conn.debug, ('S',))
+    status, server_error = API.exec_batch(conn.style, conn.socket, take!(buf), count,
+                                         conn.server_parameters, conn.debug)
+    conn.server_in_transaction = API.in_transaction_status(status)
+    server_error === nothing || throw(server_error)
+    return nothing
+end
+
+function execute_batch!(stmt::Statement, columns, row::Int, nrows::Int)
+    @lock stmt.conn.lock begin
+        checkstmt(stmt)
+        buf = IOBuffer()
+        count = 0
+        complete_bytes = 0
+        try
+            while row <= nrows && count < 64
+                try
+                    bind_params!(stmt.params, DBInterface.LazyIndex(columns, row), stmt.sql)
+                    API._write_message_to_buffer(buf, stmt.conn.debug,
+                        ('B', "", stmt.name, Int16(0), Int16(stmt.nparams), API.Params(stmt.params), Int16(0)))
+                    API._write_message_to_buffer(buf, stmt.conn.debug, ('E', "", Int32(0)))
+                finally
+                    fill!(stmt.params, missing)
+                end
+                complete_bytes = position(buf)
+                count += 1
+                row += 1
+                # One large row may exceed the byte target, as in execute.
+                complete_bytes >= 65536 && break
+            end
+        catch
+            # Earlier rows must reach the server before surfacing a later
+            # conversion error. Its error takes precedence, as in serial use.
+            truncate(buf, complete_bytes)
+            seekend(buf)
+            count > 0 && flush_batch!(stmt, buf, count)
+            rethrow()
+        end
+        flush_batch!(stmt, buf, count)
+        return row
+    end
+end
+
+function DBInterface.executemany(stmt::Statement, params)
+    conn = stmt.conn
+    columns = batch_columns(stmt, params)
+    if columns === nothing || !(conn.style isa API.PostgresStyle) ||
+       API.query_logging_enabled(conn.style) || conn.debug || stmt.nfields != 0
+        return invoke(DBInterface.executemany, Tuple{DBInterface.Statement, Any}, stmt, params)
+    end
+    nrows = length(first(columns))
+    DBInterface.transaction(conn) do
+        result = DBInterface.execute(stmt, DBInterface.LazyIndex(columns, 1))
+        tag = command_tag(result)
+        # Use prepared metadata and the actual command tag, not a SQL lexer.
+        # GSS wrap/unwrap share one security context and stay on the serial path.
+        pipeline = @lock conn.lock stmt.nfields == 0 &&
+            !(conn.socket.transport isa API.GSSConn) && tag !== nothing &&
+            first(split(tag; limit=2)) in ("INSERT", "UPDATE", "DELETE", "MERGE")
+        if pipeline
+            row = 2
+            while row <= nrows
+                row = execute_batch!(stmt, columns, row, nrows)
+            end
+        else
+            for row in 2:nrows
+                DBInterface.close!(DBInterface.execute(stmt, DBInterface.LazyIndex(columns, row)))
+            end
+        end
+    end
+    return nothing
+end
+
+# Keep the statement lifetime explicit on every supported DBInterface version,
+# including versions whose generic connection overload does not close it.
 function DBInterface.executemany(conn::Connection, sql::AbstractString, params)
     stmt = DBInterface.prepare(conn, sql)
     try
