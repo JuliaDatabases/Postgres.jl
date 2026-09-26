@@ -66,6 +66,22 @@ function test_result_decoding()
         @test StructUtils.make(target, row, Postgres.PostgresStyle()).value === Int64(141)
     end
 
+    @testset "Registered temporal types without custom parsers" begin
+        cases = ((1114, Postgres.API.PGTimestamp, "2024-01-02 03:04:05.123456", Durations.Timestamp{Microsecond}(2024, 1, 2, 3, 4, 5, 123, 456)),
+                 (1184, Postgres.API.PGTimestamp, "2024-01-02 03:04:05.123456+02:30", Durations.Timestamp{Microsecond}(2024, 1, 2, 0, 34, 5, 123, 456)),
+                 (1114, DateTime, "2024-01-02 03:04:05.123", DateTime(2024, 1, 2, 3, 4, 5, 123)),
+                 (1184, DateTime, "2024-01-02 03:04:05.123+02:30", DateTime(2024, 1, 2, 0, 34, 5, 123)))
+        for (oid, T, text, expected) in cases
+            row = decoding_row(["prefix", text, "suffix"], [25, oid, 25]; names=[:before, :value, :after])
+            Postgres.API.register_type!(row.type_registry, oid, T)
+            @test decoding_values(row) == ["prefix", expected, "suffix"]
+            # An Any field must still use the registered decoder, including
+            # timezone conversion and the chosen timestamp resolution.
+            target = NamedTuple{(:before, :value, :after), Tuple{String, Any, String}}
+            @test StructUtils.make(target, row, Postgres.PostgresStyle()).value === expected
+        end
+    end
+
     @testset "Decoded values own retained text" begin
         row = decoding_row(["hello α🙂", "{\"value\":\"saved α\"}", "custom β", "{first,second}", raw"\x0001ff"],
                            [25, 3802, 999_999, 1009, 17])
