@@ -98,6 +98,7 @@ function test_gssapi()
     try
         Base.invokelatest(test_gssapi_protocol)
         Base.invokelatest(test_gss_fragmentation)
+        Base.invokelatest(test_notification_gss_deadlines)
     finally
         # Close even contexts left behind by a failed test before restoring the
         # real library; a finalizer must never hand a fake handle to Kerberos.
