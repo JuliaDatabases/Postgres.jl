@@ -71,6 +71,19 @@ function consume_input!(io::BufferedConn)::Union{Int, Nothing}
     return n
 end
 
+# Claim only a complete PostgreSQL message. Parse the returned view before
+# collecting more input, which may compact or resize the shared buffer.
+function take_frame!(io::BufferedConn)
+    bytesavailable(io) >= 5 || return nothing
+    pos = io.pos
+    len = Int(ntoh(reinterpret(Int32, @view(io.buffer[pos+1:pos+4]))[1])) - 4
+    (0 <= len <= MAX_MESSAGE_LEN) || throw(Error("invalid message length from server"))
+    bytesavailable(io) >= 5 + len || return nothing
+    frame = IOBuffer(@view(io.buffer[pos:pos+4+len]))
+    io.pos += 5 + len
+    return frame
+end
+
 # On failure, abort TCP first: TLS close must not wait to send close_notify.
 function abort(io::BufferedConn)
     transport = io.transport

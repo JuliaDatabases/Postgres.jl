@@ -499,6 +499,7 @@ include("gssapi.jl")
 include("isvalid_fake_server.jl")
 include("execute_fake_server.jl")
 include("executemany.jl")
+include("notification_deadlines.jl")
 
 @testset "Postgres" begin
     test_timestamps()
@@ -1022,6 +1023,8 @@ include("executemany.jl")
     test_isvalid_fragmentation()
     test_execute_fake_server()
     test_executemany_protocol()
+    test_notification_deadlines()
+    test_notification_tls_deadlines()
 
     require_integration = get(ENV, "POSTGRES_REQUIRE_INTEGRATION", "false") == "true"
     if !docker_available()
