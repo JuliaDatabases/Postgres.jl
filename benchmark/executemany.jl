@@ -1,6 +1,7 @@
-# Run against a disposable local PostgreSQL server, or the loopback counting
-# proxy beside this file: julia --project benchmark/executemany.jl PORT [ROWS] [BYTES]
-# Both variants use the same statement, parameters and driver in one process.
+# Compare grouped executemany with DBInterface's row-by-row method on the same
+# statement and parameters, against a disposable local PostgreSQL server with a
+# trust-authenticated postgres account:
+# julia --project benchmark/executemany.jl PORT [ROWS] [BYTES]
 using Postgres
 const DBI = Postgres.DBInterface
 

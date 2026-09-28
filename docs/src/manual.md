@@ -177,34 +177,15 @@ DBInterface.executemany(stmt, ([1, 2, 3], ["a", "b", "c"]))
 DBInterface.close!(stmt)
 ```
 
-`executemany` returns `nothing`. When parameter collections contain rows, they
-run in one transaction, or a savepoint when the connection already has a
-transaction. An error rolls back that scope; an earlier database error takes
-precedence over a later parameter conversion error. Sequence increments and
-other PostgreSQL effects that are not transactional are not undone.
+`executemany` runs all rows in one transaction, or in a savepoint when a
+transaction is already open, so an error rolls back every row.
 
-For ordinary typed `Vector` columns, no-result `INSERT`, `UPDATE`, `DELETE`, and
-`MERGE` statements group up to 64 executions before waiting for the server.
-Groups also stop after reaching 64 KiB of encoded parameters and messages; a
-single row may exceed that byte target. The first row uses ordinary execution
-to confirm the command type. A `NamedTuple` supplies columns in field order.
-
-This path accepts fixed-width integers and floats, booleans, `String` and
-`SubString{String}`, `Date`/`DateTime`/`Time`, `UUID`, microsecond or nanosecond
-`Durations.Timestamp`, `DataDecimals.DecimalValue{DataDecimals.Int256}`, and
-`Vector` values containing these types. `missing` and `nothing` remain SQL
-NULLs; byte vectors and arrays keep the usual parameter encoding. Values may
-be encoded before earlier rows finish, so do not mutate input during the call.
-Ordinary Julia log handlers for NOTICE messages may run after later rows have
-already been sent. Use a custom Postgres style when per-row callback ordering
-is required.
-
-Other input types, dictionaries, result-returning statements, custom styles,
-query logging, debug mode, and GSS-encrypted connections use ordinary serial
-execution. TCP and TLS connections can read server responses while sending a
-group. Cancellation uses [`Postgres.cancel_query!`](@ref); a canceled group is
-drained and rolled back before the connection is reused. A transport or
-protocol failure closes the connection when its state cannot be recovered.
+For `INSERT`, `UPDATE`, `DELETE`, and `MERGE` statements that return no rows,
+with parameters given as `Vector` columns of fixed-width integers and floats,
+`Bool`, strings, dates, times, `UUID`s, timestamps, decimals, `missing`, or
+`Vector`s of these, rows are sent in groups of up to 64 without waiting for the
+server after each row. Other statements and inputs, custom styles, debug mode,
+and GSS-encrypted connections run one row at a time.
 
 ## Transactions
 

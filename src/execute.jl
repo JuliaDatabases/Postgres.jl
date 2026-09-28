@@ -614,12 +614,12 @@ function execute_batch!(stmt::Statement, columns, row::Int, nrows::Int)
                 complete_bytes = position(buf)
                 count += 1
                 row += 1
-                # One large row may exceed the byte target, as in execute.
+                # End the group at 64 KiB; the row that crosses it still goes whole.
                 complete_bytes >= 65536 && break
             end
         catch
-            # Earlier rows must reach the server before surfacing a later
-            # conversion error. Its error takes precedence, as in serial use.
+            # Send the rows already encoded before reporting a conversion
+            # error: as in serial execution, their server error wins.
             truncate(buf, complete_bytes)
             seekend(buf)
             count > 0 && flush_batch!(stmt, buf, count)
@@ -633,8 +633,8 @@ end
 function DBInterface.executemany(stmt::Statement, params)
     conn = stmt.conn
     columns = batch_columns(stmt, params)
-    if columns === nothing || !(conn.style isa API.PostgresStyle) ||
-       API.query_logging_enabled(conn.style) || conn.debug || stmt.nfields != 0
+    # Custom styles can observe per-row callbacks and query logs; keep them serial.
+    if columns === nothing || !(conn.style isa API.PostgresStyle) || conn.debug || stmt.nfields != 0
         return invoke(DBInterface.executemany, Tuple{DBInterface.Statement, Any}, stmt, params)
     end
     nrows = length(first(columns))
@@ -643,9 +643,9 @@ function DBInterface.executemany(stmt::Statement, params)
         tag = command_tag(result)
         # Use prepared metadata and the actual command tag, not a SQL lexer.
         # GSS wrap/unwrap share one security context and stay on the serial path.
-        pipeline = @lock conn.lock stmt.nfields == 0 &&
-            !(conn.socket.transport isa API.GSSConn) && tag !== nothing &&
-            first(split(tag; limit=2)) in ("INSERT", "UPDATE", "DELETE", "MERGE")
+        pipeline = tag !== nothing &&
+            first(split(tag; limit=2)) in ("INSERT", "UPDATE", "DELETE", "MERGE") &&
+            !(@lock conn.lock conn.socket.transport isa API.GSSConn)
         if pipeline
             row = 2
             while row <= nrows
