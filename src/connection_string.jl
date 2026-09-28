@@ -157,7 +157,8 @@ function check_ignored_param(key::String, value::String)
     inert = get(SECURITY_SENSITIVE_IGNORED, key, nothing)
     inert === nothing && return
     value in inert && return
-    throw(ArgumentError("connection parameter \"$key=$value\" is not supported by Postgres.jl and cannot be safely ignored"))
+    # never echo the value: for sslpassword it is the client key passphrase
+    throw(ArgumentError("connection parameter \"$key\" is set to a value Postgres.jl does not support and cannot safely ignore"))
 end
 
 # An unrecognized key is almost always a typo, and silently dropping it is
