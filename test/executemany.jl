@@ -1,6 +1,6 @@
 # Exercise the public bulk API against the scripted wire helpers in gssapi.jl.
 # Groups are observed from actual frontend Sync messages, not driver internals.
-function bulk_script(groups; fault=:none, tag="INSERT 0 1", backpressure=false, queries=String[])
+function bulk_script(groups; fault=:none, tag="INSERT 0 1", backpressure=false, queries=String[], stall=nothing)
     return serve_idle(sock -> begin
         status = UInt8('I')
         pending = 0
@@ -59,9 +59,12 @@ function bulk_script(groups; fault=:none, tag="INSERT 0 1", backpressure=false, 
                     send(sock, pgmsg('C', UInt8[0x49]))
                 elseif row == 2 && fault == :unexpected_type
                     send(sock, pgmsg('?', UInt8[]))
+                    # Stop reading so the client rejects this reply while
+                    # its writer is still blocked on a large row.
+                    stall === nothing || (wait(stall); return)
                 elseif row == 2 && fault == :callback
                     send(sock, notice_msg("NOTICE", "00000", "bulk callback"))
-                    drain(sock)
+                    stall === nothing ? drain(sock) : wait(stall)
                     return
                 else
                     send(sock, pgmsg('C', vcat(codeunits(tag), 0x00)))
@@ -196,10 +199,12 @@ function test_executemany_protocol()
                       :unexpected_type, :bad_ready, :idle_ready, :callback)
             @testset "$fault" begin
                 groups = Int[]
-                with_fake_server(bulk_script(groups; fault)) do port, accepted
+                stall = fault in (:unexpected_type, :callback) ? Base.Event() : nothing
+                with_fake_server(bulk_script(groups; fault, stall)) do port, accepted
                     conn = fake_connection(port, Postgres.PostgresStyle())
                     stmt = DBInterface.prepare(conn, raw"INSERT INTO fake VALUES ($1, $2)")
-                    values = fault == :writer_close ? ["small", repeat("x", 8 << 20), "last"] : fill("x", 3)
+                    values = fault == :writer_close ? ["small", repeat("x", 8 << 20), "last"] :
+                             stall === nothing ? fill("x", 3) : ["small", "small", repeat("x", 32 << 20)]
                     logger = fault == :callback ? BulkThrowLogger() : Base.CoreLogging.NullLogger()
                     task = Base.CoreLogging.with_logger(logger) do
                         @async connect_err(() -> DBInterface.executemany(stmt, ([1, 2, 3], values)))
@@ -220,8 +225,12 @@ function test_executemany_protocol()
                         elseif fault == :callback
                             @test err isa ErrorException
                             @test occursin("bulk logger failed", sprint(showerror, err))
+                        elseif fault == :unexpected_type
+                            @test err isa Postgres.API.Error
+                            @test occursin("unexpected message type", err.message)
                         end
                     finally
+                        stall === nothing || notify(stall)
                         Postgres.API.abort(conn.socket)
                     end
                 end

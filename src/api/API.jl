@@ -1190,17 +1190,19 @@ end
 function exec_batch(style::AbstractPostgresStyle, socket::BufferedConn,
                     messages::Vector{UInt8}, count::Int,
                     server_parameters::Dict{String, String}, debug::Bool)
-    writer = Threads.@spawn try
+    # Each side records its error before aborting the connection, so the first
+    # entry is the cause; a later one only reports that abort.
+    failures = Channel{Any}(2)
+    writer = errormonitor(Threads.@spawn try
         write(socket, messages)
         flush(socket)
-        nothing
     catch err
+        put!(failures, err)
         try
             abort(socket)
         catch
         end
-        err
-    end
+    end)
     server_error = nothing
     completed = 0
     bound = false
@@ -1219,8 +1221,7 @@ function exec_batch(style::AbstractPostgresStyle, socket::BufferedConn,
                 completed += 1
                 bound = false
             elseif mt == UInt8('E')
-                err = errorResponse(len, socket, debug)
-                server_error === nothing && (server_error = err)
+                server_error = something(server_error, errorResponse(len, socket, debug))
             elseif mt == UInt8('N')
                 notice_callback(style, noticeResponse(len, socket))
             elseif mt == UInt8('A')
@@ -1238,20 +1239,21 @@ function exec_batch(style::AbstractPostgresStyle, socket::BufferedConn,
                 throw(Error("unexpected message type '$(Char(mt))' in executemany response"))
             end
         end
-        write_error = fetch(writer)
-        write_error === nothing || throw(write_error)
+        wait(writer)
+        isready(failures) && throw(take!(failures))
         return status, server_error
-    catch
+    catch err
         # The caller still owns the connection lock. Stop and join the writer
         # before that lock can be released or the connection can be reused.
+        put!(failures, err)
         try
             abort(socket)
         catch
         end
-        write_error = fetch(writer)
+        wait(writer)
         server_error === nothing || throw(server_error)
-        write_error === nothing || throw(write_error)
-        rethrow()
+        cause = take!(failures)
+        cause === err ? rethrow() : throw(cause)
     end
 end
 
