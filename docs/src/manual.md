@@ -177,6 +177,16 @@ DBInterface.executemany(stmt, ([1, 2, 3], ["a", "b", "c"]))
 DBInterface.close!(stmt)
 ```
 
+`executemany` runs all rows in one transaction, or in a savepoint when a
+transaction is already open, so an error rolls back every row.
+
+For `INSERT`, `UPDATE`, `DELETE`, and `MERGE` statements that return no rows,
+with parameters given as `Vector` columns of fixed-width integers and floats,
+`Bool`, strings, dates, times, `UUID`s, timestamps, decimals, `missing`, or
+`Vector`s of these, rows are sent in groups of up to 64 without waiting for the
+server after each row. Other statements and inputs, custom styles, debug mode,
+and GSS-encrypted connections run one row at a time.
+
 ## Transactions
 
 Postgres.jl supports both its connection-passing helper and the DBInterface transaction API.
