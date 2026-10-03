@@ -649,6 +649,18 @@ include("notification_deadlines.jl")
         @test !occursin("top-secret", plain_shown)
         @test occursin("password=***", shown)
         @test occursin("password=***", plain_shown)
+        # Nor may an error rejecting an option: sslpassword is a key passphrase.
+        for dsn in ("host=h sslpassword=top-secret", "postgresql://u@h/db?sslpassword=top-secret")
+            err = try
+                Postgres.parse_dsn(dsn)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            @test occursin("sslpassword", err.msg)
+            @test !occursin("top-secret", sprint(showerror, err))
+        end
 
         # Malformed keyword DSNs must never degrade to a usable partial
         # configuration. In particular, a discarded security option could
