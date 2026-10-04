@@ -718,6 +718,8 @@ include("notification_deadlines.jl")
         end
     end
 
+    include("connection_string_errors.jl")
+
     @testset "API Type Parsers" begin
         registry = Dict(Postgres.API.DEFAULT_TYPE_REGISTRY)
 
