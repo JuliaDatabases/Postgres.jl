@@ -165,10 +165,15 @@ end
 # dangerous: "ssl_mode=verify-full" would leave sslmode unset and fall back to
 # an unverified connection while the caller believes otherwise. libpq errors
 # on unknown keywords for the same reason.
+function check_known_param(key::String)
+    (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
+        throw(ArgumentError("unrecognized connection parameter; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
+    return nothing
+end
+
 function check_known_params(values::Dict{String, String})
     for (key, value) in values
-        (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
-            throw(ArgumentError("unrecognized connection parameter \"$key\"; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
+        check_known_param(key)
         key in IGNORED_PARAMS && check_ignored_param(key, value)
     end
     return values
@@ -231,6 +236,8 @@ function parse_keyword_dsn(dsn::String)
         key_end = prevind(dsn, i)
         key = key_end < key_start ? "" : lowercase(String(dsn[key_start:key_end]))
         isempty(key) && throw(ArgumentError("empty connection parameter name"))
+        # A malformed DSN can put password text in the apparent key.
+        check_known_param(key)
         while i <= lastindex(dsn) && isspace(dsn[i])
             i = nextind(dsn, i)
         end
@@ -296,6 +303,9 @@ PostgreSQL URI (`"postgresql://user:pass@host:5432/dbname"`) into
 to the `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`,
 `PGCONNECT_TIMEOUT`, `PGSSL*`, `PGGSSENCMODE`, `PGKRBSRVNAME`, and
 `PGGSSDELEGATION` environment variables, then to defaults.
+
+Invalid URI syntax is reported as `ArgumentError` without retaining the
+underlying parser's input-bearing exception.
 """
 function parse_dsn(dsn::String)
     lowered = lowercase(dsn)
@@ -304,6 +314,18 @@ function parse_dsn(dsn::String)
 end
 
 function parse_uri(uri::String)
+    values = try
+        parse_uri_values(uri)
+    catch err
+        (err isa URIs.ParseError || err isa ArgumentError || err isa EOFError) || rethrow()
+        nothing
+    end
+    # Throw outside the catch so the exception chain cannot expose credentials.
+    values === nothing && throw(ArgumentError("invalid PostgreSQL URI; check syntax and percent-encoding"))
+    return params_from_values(values)
+end
+
+function parse_uri_values(uri::String)
     parsed = URIs.URI(uri)
     scheme = lowercase(String(parsed.scheme))
     (scheme == "postgres" || scheme == "postgresql") || throw(ArgumentError("invalid PostgreSQL URI scheme: $scheme"))
@@ -333,14 +355,10 @@ function parse_uri(uri::String)
     if !isempty(query)
         params = URIs.queryparams(query)
         for (key, value) in params
-            (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
-                throw(ArgumentError("unrecognized connection parameter \"$key\" in URI; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
-            key in IGNORED_PARAMS && check_ignored_param(key, value)
-            # keys we accept but don't implement must not reach params_from_values
-            key in KNOWN_PARAMS && (values[key] = value)
+            values[key] = value
         end
     end
-    return params_from_values(values)
+    return values
 end
 
 function parse_dsn(dsn::Nothing)
