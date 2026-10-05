@@ -560,6 +560,57 @@ function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothi
     end
 end
 
+"""
+    Postgres.execute_script(conn, sql) -> Vector{String}
+
+Run `sql`, which may hold several `;`-separated statements, as one simple-query
+message, like libpq's `PQexec`. Returns the command tag of each statement, e.g.
+`["CREATE TABLE", "ALTER TABLE"]`; result rows are discarded, so use
+`DBInterface.execute` for queries.
+
+The statements run in one implicit transaction unless `sql` contains its own
+transaction control, so commands that refuse to run inside a transaction block
+(`VACUUM`, `CREATE INDEX CONCURRENTLY`, ...) must be sent alone. On an error
+PostgreSQL skips the remaining statements and the error is thrown; the
+connection stays usable. The simple-query protocol has no parameters: use
+[`escape_literal`](@ref Postgres.escape_literal) or `DBInterface.execute` for
+values.
+
+COPY belongs to [`copy_from`](@ref Postgres.copy_from) and
+[`copy_to`](@ref Postgres.copy_to). A `COPY ... FROM STDIN` in a script is
+aborted, which fails the script like any other error (inside an explicit
+`BEGIN` the transaction is left failed until `ROLLBACK`). A `COPY ... TO
+STDOUT` is rejected only after the rest of the script has run: its data is
+discarded and, unless a later statement fails, the other statements' effects
+stand.
+"""
+function execute_script(conn::Connection, sql::AbstractString; debug::Bool=false)
+    sql_str = String(sql)
+    style = conn.style
+    log_enabled = API.query_logging_enabled(style)
+    start_ns = log_enabled ? time_ns() : 0
+    tags = String[]
+    try
+        @lock conn.lock begin
+            checkconn(conn)
+            status_ref = Ref{UInt8}(UInt8('I'))
+            try
+                tags = API.exec_script(style, conn.socket, sql_str, debug || conn.debug,
+                                       status_ref, conn.server_parameters)
+            finally
+                # as in execute_simple: a failed statement still drained to
+                # ReadyForQuery and its status is authoritative
+                conn.server_in_transaction = API.in_transaction_status(status_ref[])
+            end
+        end
+        log_enabled && query_log_safely(style, :execute_script, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
+        return tags
+    catch err
+        log_enabled && query_log_safely(style, :execute_script, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
+        rethrow()
+    end
+end
+
 # Only native values in ordinary owned columns may be converted ahead of the
 # server. Custom indexing/conversion can have observable per-row side effects.
 function batch_parameter_type(::Type{T}) where {T}

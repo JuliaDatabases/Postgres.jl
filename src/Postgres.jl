@@ -1507,7 +1507,7 @@ end
         "Error, Notification, PostgresRange, AbstractPostgresStyle, PostgresStyle, " *
         "query_logging_enabled, query_logger, notice_callback, notification_callback, parse_dsn, " *
         "transaction, @transaction, start_transaction, commit, rollback, in_transaction, " *
-        "cursor, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, " *
+        "cursor, execute_script, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, " *
         "register_type!, register_enum!, register_composite!, register_range!, " *
         "command_tag, rows_affected, cancel_query!, escape_identifier, escape_literal, " *
         "get_cached_statements, clear_statement_cache!, set_statement_cache_maxsize!, " *
