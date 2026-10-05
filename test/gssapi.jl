@@ -668,6 +668,12 @@ function test_kerberos_integration()
                 err = connect_err(() -> DBInterface.connect(Postgres.Connection, cfg.host, KRB_USER, nothing; dbname=cfg.dbname, port=cfg.port, gssencmode="prefer", krbsrvname="nosuchservice"))
                 @test err isa GSSAPI.GSSError
             finally
+                # a closed session's temp tables are dropped as its backend exits,
+                # which can trail close!; DROP ROLE fails while the role owns them
+                for _ in 1:100
+                    only(DBInterface.execute(admin, "SELECT count(*) AS n FROM pg_stat_activity WHERE usename = '$KRB_USER'")).n == 0 && break
+                    sleep(0.1)
+                end
                 DBInterface.execute(admin, "DROP ROLE IF EXISTS $KRB_USER")
                 DBInterface.close!(admin)
             end

@@ -407,6 +407,26 @@ function pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp{P}}) w
     return Durations.Timestamp{P}(Dates.UTInstant(P(Int64(ticks))))
 end
 
+# timestamp(tz) column into a Date field: the UTC date, as for DateTime fields
+pg_parse_date_any(s::AbstractString)::Date = occursin(':', s) ? Date(pg_parse_datetime_any(s)) : pg_parse_date(s)
+
+# Integer fields also read integral numeric text such as "12.00" (numeric
+# columns, or SUM over one). Out-of-range values throw InexactError, as when
+# converting a decoded column value; other text throws the parser's error.
+function pg_parse_integer(::Type{T}, s::AbstractString) where {T <: Integer}
+    x = Parsers.tryparse(T, s)
+    x === nothing || return x
+    wide = Parsers.tryparse(Int128, s)
+    if wide === nothing
+        dot = findfirst(==('.'), s)
+        if dot !== nothing && all(==('0'), SubString(s, dot + 1))
+            wide = Parsers.tryparse(Int128, SubString(s, 1, dot - 1))
+        end
+    end
+    wide === nothing && return Parsers.parse(T, s)
+    return convert(T, wide)
+end
+
 # timestamptz column into a DateTime field: sniff a trailing offset/Z
 function pg_parse_datetime_any(s::AbstractString)::DateTime
     isempty(s) && throw(ArgumentError("invalid postgres timestamp"))
@@ -970,9 +990,35 @@ end
 const WireFieldScalar = Union{Durations.Timestamp, DataDecimals.AbstractDecimal, DateTime}
 _wire_field(::Type{T}) where {T} = T <: Union{Missing, WireFieldScalar}
 _wire_field(::Type{<:AbstractVector{T}}) where {T} = T <: WireFieldScalar
-_field_source(::Type{T}, v::FieldValue) where {T} = _wire_field(T) ? _field_text(v.text) : parse_value(v.oid, v.text, v.registry)
-StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue) where {T} = StructUtils.make(st, T, _field_source(T, v))
-StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue, tags) where {T} = StructUtils.make(st, T, _field_source(T, v), tags)
+
+_field_source(::AbstractPostgresStyle, ::Type{T}, v::FieldValue) where {T} =
+    _wire_field(T) ? _field_text(v.text) : parse_value(v.oid, v.text, v.registry)
+
+# With the default style, field types that the lifts below (and StructUtils'
+# own String, Symbol and Enum lifts) parse from text decode from the column
+# text. The source stays a String, so typed reads compile to static calls
+# under `--trim`; OID decoding returns `Any`. Custom styles keep the OID decoder
+# so their lifts still receive decoded values, and other field types keep it too.
+const TextField = Union{String, Symbol, Bool, Char, Int8, Int16, Int32, Int64, Cuint, Float32, Float64,
+    Date, Time, DateTime, UUID, Vector{UInt8}, JSONType, Vector{String}, Vector{Int16}, Vector{Int32},
+    Vector{Int64}, Vector{Float32}, Vector{Float64}, Vector{Bool}, Vector{Date}, Vector{Time},
+    Vector{DateTime}, Vector{UUID}, Vector{Char}}
+_text_field(::Type{S}) where {S} = S !== Union{} && (S <: Union{TextField, Enum} || S === IntervalType || _wire_field(S))
+
+function _field_source(::PostgresStyle, ::Type{T}, v::FieldValue) where {T}
+    S = Base.nonnothingtype(Base.nonmissingtype(T))
+    _text_field(S) || return parse_value(v.oid, v.text, v.registry)
+    info = get(v.registry, v.oid, nothing)
+    if !_wire_field(S) && info !== nothing && info.parser !== nothing && info.julia_type <: S
+        # a parser registered for this column still applies when it produces
+        # the field's type (timestamps and decimals always parse the text)
+        x = info.parser(_field_text(v.text), v.registry)
+        x isa S && return x
+    end
+    return _field_text(v.text)
+end
+StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue) where {T} = StructUtils.make(st, T, _field_source(st, T, v))
+StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue, tags) where {T} = StructUtils.make(st, T, _field_source(st, T, v), tags)
 
 @static if isdefined(StructUtils, :InterpClosure) && isdefined(StructUtils, :HotStructClosure)
     @inline function applycast(f::Union{StructUtils.InterpClosure, StructUtils.HotStructClosure}, name, typeId, val, registry::Dict{Int, TypeInfo})
@@ -1000,16 +1046,16 @@ end
     return
 end
 
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Int8}, s::String) = Parsers.parse(Int8, s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Int8}, s::String) = pg_parse_integer(Int8, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = parse_boolean(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Char}, s::String) = pg_parse_char(s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Int16}, s::String) = Parsers.parse(Int16, s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Int32}, s::String) = Parsers.parse(Int32, s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Int64}, s::String) = Parsers.parse(Int64, s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Cuint}, s::String) = Parsers.parse(Cuint, s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Int16}, s::String) = pg_parse_integer(Int16, s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Int32}, s::String) = pg_parse_integer(Int32, s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Int64}, s::String) = pg_parse_integer(Int64, s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Cuint}, s::String) = pg_parse_integer(Cuint, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Float32}, s::String) = Parsers.parse(Float32, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Float64}, s::String) = Parsers.parse(Float64, s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Date}, s::String) = pg_parse_date(s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Date}, s::String) = pg_parse_date_any(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Time}, s::String) = pg_parse_time(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{DateTime}, s::String) = pg_parse_datetime_any(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{UUID}, s::String) = UUID(s), nothing

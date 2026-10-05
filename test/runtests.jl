@@ -500,6 +500,7 @@ include("isvalid_fake_server.jl")
 include("execute_fake_server.jl")
 include("executemany.jl")
 include("notification_deadlines.jl")
+include("trim_compile_tests.jl")
 
 @testset "Postgres" begin
     test_timestamps()
@@ -1050,6 +1051,7 @@ include("notification_deadlines.jl")
             conn = wait_for_connection(cfg)
             try
                 test_executemany(conn)
+                run_postgres_trim_compile_tests(cfg)
                 @testset "Auth" begin
                     if occursin("trust", DEFAULT_AUTH) || occursin("trust", DEFAULT_INITDB_ARGS)
                         conn_trust = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, nothing; dbname=cfg.dbname, port=cfg.port)
