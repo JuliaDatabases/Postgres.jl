@@ -984,6 +984,14 @@ include("notification_deadlines.jl")
         end
     end
 
+    @testset "Protocol Strings Reject NUL" begin
+        # the message is still buffered when the check throws, so nothing is sent
+        io = IOBuffer()
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.writemessage(io, false, 'Q', "SELECT 1\0")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.writepart(io, ("user", "a\0b"))
+        @test position(io) == 0
+    end
+
     @testset "Seeded Protocol And DSN Fuzz" begin
         rng = MersenneTwister(0xf022)
         registry = Dict(Postgres.API.DEFAULT_TYPE_REGISTRY)
@@ -1142,6 +1150,10 @@ include("notification_deadlines.jl")
                     @test err isa Postgres.API.Error
                     @test occursin("does not exist", err.message)
                     @test isopen(connp.socket)
+                    @test Tables.rowtable(DBInterface.execute(connp, "SELECT 1 AS a"))[1].a == 1
+
+                    # SQL with a NUL byte is rejected before anything is sent
+                    @test_throws Postgres.PostgresInterfaceError DBInterface.execute(connp, "SELECT 1\0")
                     @test Tables.rowtable(DBInterface.execute(connp, "SELECT 1 AS a"))[1].a == 1
 
                     # a consumer exception mid-result drains the remaining rows so
