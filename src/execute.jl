@@ -565,8 +565,9 @@ end
 
 Run `sql`, which may hold several `;`-separated statements, as one simple-query
 message, like libpq's `PQexec`. Returns the command tag of each statement, e.g.
-`["CREATE TABLE", "ALTER TABLE"]`; result rows are discarded, so use
-`DBInterface.execute` for queries.
+`["CREATE TABLE", "ALTER TABLE"]`; result rows and `COPY ... TO STDOUT` output
+are discarded, so use `DBInterface.execute` for queries and
+[`copy_to`](@ref Postgres.copy_to) for COPY output.
 
 The statements run in one implicit transaction unless `sql` contains its own
 transaction control, so commands that refuse to run inside a transaction block
@@ -576,13 +577,9 @@ connection stays usable. The simple-query protocol has no parameters: use
 [`escape_literal`](@ref Postgres.escape_literal) or `DBInterface.execute` for
 values.
 
-COPY belongs to [`copy_from`](@ref Postgres.copy_from) and
-[`copy_to`](@ref Postgres.copy_to). A `COPY ... FROM STDIN` in a script is
-aborted, which fails the script like any other error (inside an explicit
-`BEGIN` the transaction is left failed until `ROLLBACK`). A `COPY ... TO
-STDOUT` is rejected only after the rest of the script has run: its data is
-discarded and, unless a later statement fails, the other statements' effects
-stand.
+A `COPY ... FROM STDIN` in a script is aborted, which fails the script like
+any other error (inside an explicit `BEGIN` the transaction is left failed
+until `ROLLBACK`); use [`copy_from`](@ref Postgres.copy_from) to load data.
 """
 function execute_script(conn::Connection, sql::AbstractString; debug::Bool=false)
     sql_str = String(sql)

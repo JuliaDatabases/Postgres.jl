@@ -2582,9 +2582,10 @@ include("notification_deadlines.jl")
                     @test Postgres.execute_script(conn, "COMMIT") == ["COMMIT"]
                     @test !(@lock conn.lock conn.server_in_transaction)
 
-                    # COPY is rejected without desyncing the connection
+                    # COPY FROM STDIN is rejected without desyncing the
+                    # connection; COPY TO STDOUT output is discarded like rows
                     @test_throws Postgres.PostgresInterfaceError Postgres.execute_script(conn, "SELECT 1; COPY script_test FROM STDIN")
-                    @test_throws Postgres.PostgresInterfaceError Postgres.execute_script(conn, "COPY script_test TO STDOUT")
+                    @test Postgres.execute_script(conn, "COPY script_test TO STDOUT; SELECT 1") == ["COPY 2", "SELECT 1"]
                     @test Tables.rowtable(DBInterface.execute(conn, "SELECT 6 AS a"))[1].a == 6
                 end
 

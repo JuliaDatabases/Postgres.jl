@@ -109,7 +109,7 @@ function test_execute_script_fake_server()
         end
     end
 
-    @testset "COPY TO STDOUT is drained and rejected; a server error wins" begin
+    @testset "COPY TO STDOUT output is discarded like rows; a server error is thrown" begin
         with_fake_server(serve_idle(sock -> begin
             read_query(sock, "COPY t TO STDOUT; SELECT 1")
             send(sock, vcat(copy_response('H'), pgmsg('d', Vector{UInt8}("1\n")), pgmsg('c', UInt8[]),
@@ -120,9 +120,7 @@ function test_execute_script_fake_server()
             drain(sock)
         end)) do port, accepted
             conn = fake_connection(port, Postgres.PostgresStyle())
-            err = connect_err(() -> Postgres.execute_script(conn, "COPY t TO STDOUT; SELECT 1"))
-            @test err isa Postgres.PostgresInterfaceError
-            @test occursin("copy_to", errtext(err))
+            @test Postgres.execute_script(conn, "COPY t TO STDOUT; SELECT 1") == ["COPY 1", "SELECT 1"]
             @test isopen(conn)
             err = connect_err(() -> Postgres.execute_script(conn, "COPY (SELECT 1/0) TO STDOUT"))
             @test err isa Postgres.API.Error

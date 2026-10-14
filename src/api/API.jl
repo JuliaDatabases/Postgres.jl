@@ -1357,7 +1357,6 @@ function exec_script(style::S, socket::BufferedConn, query::String, debug::Bool,
     tags = String[]
     server_error = nothing
     copy_in_statement = false
-    copy_out_statement = false
     try
         while true
             mt, len = readheader(socket, debug)
@@ -1370,8 +1369,9 @@ function exec_script(style::S, socket::BufferedConn, query::String, debug::Bool,
                 # ReadyForQuery status is authoritative either way
                 tx_status_ref[] = read_ready_status(socket, len)
                 break
-            elseif mt == UInt8('T') || mt == UInt8('D') || mt == UInt8('I')
-                # row description / data row / empty query response
+            elseif mt in (UInt8('T'), UInt8('D'), UInt8('I'), UInt8('H'), UInt8('d'), UInt8('c'))
+                # row description / data row / empty query response, and
+                # COPY ... TO STDOUT output: discarded like query rows
                 skipbytes!(socket, len)
             elseif mt == UInt8('G')
                 # CopyInResponse: the server is waiting on us for data. Abort
@@ -1381,11 +1381,6 @@ function exec_script(style::S, socket::BufferedConn, query::String, debug::Bool,
                 skipbytes!(socket, len)
                 copy_in_statement = true
                 writemessage(socket, debug, 'f', "COPY FROM STDIN is not supported via execute_script")
-            elseif mt == UInt8('H') || mt == UInt8('d') || mt == UInt8('c')
-                # CopyOutResponse/CopyData/CopyDone: drain the copy-out stream
-                # through ReadyForQuery; a clear client error is thrown below
-                mt == UInt8('H') && (copy_out_statement = true)
-                skipbytes!(socket, len)
             elseif mt == UInt8('N')
                 notice_callback(style, noticeResponse(len, socket))
             elseif mt == UInt8('A')
@@ -1401,14 +1396,10 @@ function exec_script(style::S, socket::BufferedConn, query::String, debug::Bool,
         server_error === nothing || throw(server_error)
         rethrow()
     end
-    # same precedence as applyeach(::Exec): for copy-in the server error is
-    # just the CopyFail artifact, so the client error wins; for copy-out a
-    # server error is a genuine failure and is more informative than the
-    # misuse error. A rejected copy-out was still run, with the rest of the
-    # script: the simple protocol has no way to abort it.
+    # for copy-in the server error is just the CopyFail artifact, so the
+    # client error wins
     copy_in_statement && throw(PostgresInterfaceError("COPY ... FROM STDIN is not supported via execute_script; use Postgres.copy_from"))
     server_error === nothing || throw(server_error)
-    copy_out_statement && throw(PostgresInterfaceError("COPY ... TO STDOUT is not supported via execute_script; use Postgres.copy_to"))
     return tags
 end
 
