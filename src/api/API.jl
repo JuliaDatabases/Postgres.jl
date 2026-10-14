@@ -229,14 +229,14 @@ _msgsizeof_parts(parts::Tuple) = msgsizeof(first(parts)) + _msgsizeof_parts(Base
 
 writepart(io, x) = write(io, x)
 function writepart(io, x::String)
-    occursin('\0', x) && throw(Postgres.PostgresInterfaceError("PostgreSQL protocol strings cannot contain a NUL byte"))
+    occursin('\0', x) && throw(PostgresInterfaceError("PostgreSQL protocol strings cannot contain a NUL byte"))
     write(io, x)
     write(io, UInt8(0))
 end
 writepart(io, x::Integer) = write(io, hton(x))
 function writepart(io, x::Tuple{String, String})
     (occursin('\0', x[1]) || occursin('\0', x[2])) &&
-        throw(Postgres.PostgresInterfaceError("PostgreSQL startup parameters cannot contain a NUL byte"))
+        throw(PostgresInterfaceError("PostgreSQL startup parameters cannot contain a NUL byte"))
     write(io, x[1])
     write(io, UInt8(0))
     write(io, x[2])
