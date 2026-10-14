@@ -119,6 +119,8 @@ profiles = DBInterface.execute(conn, """
 
 The `postgres=(name=:column_name,)` tag is only needed when a column should map to a differently named field. Columns such as `id` or `name` can be left untagged because they already match the Julia field name.
 
+With the default `Postgres.PostgresStyle`, a field whose type Postgres.jl can parse from text (strings, symbols, enums, integers, floats, `Bool`, `Char`, `Date`, `Time`, `DateTime`, `UUID`, `Vector{UInt8}`, lazy JSON, timestamps, decimals, and vectors of these) is decoded from the column text by its declared type, optionally wrapped in `Union{Nothing, …}` or `Union{Missing, …}`. A `String` field receives any column's text, so a `json` or `jsonb` column can be read as its JSON text. An integer field also accepts integral `numeric` values such as `12.00`. A parser registered with `register_type!` still applies when it returns the field's type. Typed reads of these fields compile to static calls, so they work in `juliac --trim` builds. Other field types, and all fields read with a custom driver style, receive the value decoded by the column's type, so custom-style `lift` methods see decoded values.
+
 ### Driver Styles
 
 Connection behavior such as query logging, server notices, and asynchronous

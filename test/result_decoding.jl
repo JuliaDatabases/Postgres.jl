@@ -18,6 +18,19 @@ function decoding_values(row)
 end
 
 struct DecodingStyle <: Postgres.AbstractPostgresStyle end
+
+@enum DecodingColor decoding_red decoding_green
+
+struct StringFields
+    json::String
+    jsonb::String
+    int::String
+    id::String
+    at::Union{Nothing, String}
+    amount::Union{Missing, String}
+    tags::String
+    note::Union{Nothing, String}
+end
 StructUtils.lift(::DecodingStyle, ::Type{Int64}, value::Int32) = Int64(value) + 1, nothing
 
 function test_result_decoding()
@@ -80,6 +93,54 @@ function test_result_decoding()
             target = NamedTuple{(:before, :value, :after), Tuple{String, Any, String}}
             @test StructUtils.make(target, row, Postgres.PostgresStyle()).value === expected
         end
+    end
+
+    @testset "String fields take the column text" begin
+        texts = ["{\"a\": [1, 2]}", "{\"a\": [1, 2]}", "42", "c8b1cf79-de6a-54ab-a142-682c06a0de6a",
+                 "2024-01-02 03:04:05.123+02:30", "12.50", "{a,b}", nothing]
+        row = decoding_row(texts, [114, 3802, 23, 2950, 1184, 1700, 1009, 25]; names=collect(fieldnames(StringFields)))
+        @test StructUtils.make(StringFields, row, Postgres.PostgresStyle()) == StringFields(texts[1:7]..., nothing)
+        target = NamedTuple{(:json, :jsonb), Tuple{String, JSONType}}
+        typed = StructUtils.make(target, decoding_row(texts[1:2], [114, 3802]; names=[:json, :jsonb]), Postgres.PostgresStyle())
+        @test typed.json == texts[1]
+        @test JSON.parse(typed.jsonb)["a"] == [1, 2]
+        # untyped results keep the OID decoders
+        values = decoding_values(row)
+        @test values[2] isa JSONType && values[3] === Int32(42) && values[7] == ["a", "b"]
+        # a custom parser registered for a String column still applies
+        row = decoding_row(["abc"], [999_999]; names=[:value])
+        Postgres.API.register_type!(row.type_registry, 999_999, String; parser=(text::String, registry) -> uppercase(text))
+        @test StructUtils.make(NamedTuple{(:value,), Tuple{String}}, row, Postgres.PostgresStyle()).value == "ABC"
+    end
+
+    @testset "Typed fields decode the column text" begin
+        # values the OID decoders converted exactly before still convert
+        texts = ["12.00", "7.0", "2024-01-02 23:30:00-05", "{12.00,3}", "5", "decoding_red"]
+        names = [:total, :count, :day, :amounts, :maybe, :color]
+        row = decoding_row(texts, [1700, 1700, 1184, 1231, 20, 25]; names=names)
+        target = NamedTuple{Tuple(names), Tuple{Int64, Int32, Date, Vector{Int64}, Union{Nothing, Int64}, DecodingColor}}
+        typed = StructUtils.make(target, row, Postgres.PostgresStyle())
+        @test typed == (total=12, count=Int32(7), day=Date(2024, 1, 3), amounts=[12, 3], maybe=5, color=decoding_red)
+        @test_throws ArgumentError StructUtils.make(NamedTuple{(:total,), Tuple{Int64}},
+            decoding_row(["12.50"], [1700]; names=[:total]), Postgres.PostgresStyle())
+        # a registered decoder applies when it produces the field's type;
+        # otherwise the field decodes the text by its declared type
+        row = decoding_row(["decoding_red", "decoding_red"], [999_998, 999_998]; names=[:symbol, :color])
+        Postgres.API.register_type!(row.type_registry, 999_998, Symbol; parser=(text::String, registry) -> Symbol(text))
+        typed = StructUtils.make(NamedTuple{(:symbol, :color), Tuple{Symbol, DecodingColor}}, row, Postgres.PostgresStyle())
+        @test typed == (symbol=:decoding_red, color=decoding_red)
+    end
+
+    @testset "Date and DateTime parameters" begin
+        for x in (Date(2024, 1, 2), Date(12345, 1, 2), Date(-5, 1, 2), DateTime(2024, 1, 2, 3, 4, 5),
+                  DateTime(2024, 1, 2, 3, 4, 5, 7), DateTime(2024, 1, 2, 3, 4, 5, 120), DateTime(-44, 3, 15, 12))
+            @test Postgres._param(x) == string(x)
+        end
+    end
+
+    @testset "Protocol strings reject NUL bytes" begin
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.writepart(IOBuffer(), "a\0b")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.writepart(IOBuffer(), ("key", "a\0b"))
     end
 
     @testset "Decoded values own retained text" begin

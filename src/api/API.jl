@@ -229,14 +229,14 @@ _msgsizeof_parts(parts::Tuple) = msgsizeof(first(parts)) + _msgsizeof_parts(Base
 
 writepart(io, x) = write(io, x)
 function writepart(io, x::String)
-    occursin('\0', x) && throw(Postgres.PostgresInterfaceError("PostgreSQL protocol strings cannot contain a NUL byte"))
+    occursin('\0', x) && throw(PostgresInterfaceError("PostgreSQL protocol strings cannot contain a NUL byte"))
     write(io, x)
     write(io, UInt8(0))
 end
 writepart(io, x::Integer) = write(io, hton(x))
 function writepart(io, x::Tuple{String, String})
     (occursin('\0', x[1]) || occursin('\0', x[2])) &&
-        throw(Postgres.PostgresInterfaceError("PostgreSQL startup parameters cannot contain a NUL byte"))
+        throw(PostgresInterfaceError("PostgreSQL startup parameters cannot contain a NUL byte"))
     write(io, x[1])
     write(io, UInt8(0))
     write(io, x[2])
@@ -301,15 +301,14 @@ function writestartupmessage(
     user::String,
     dbname::String,
     application_name::Union{Nothing, String},
-    options::Union{Nothing, String},
-    statement_timeout::Union{Nothing, Int},
+    options::String,
 )::Nothing
     # statement_timeout is applied with a SET after connect rather than through
     # the startup `options` parameter: poolers (pgbouncer) reject unknown
     # startup options outright, so sending it here fails the whole connection.
     # A caller-supplied `options` value is different: it is passed through as
     # given, like libpq does, and an empty value is not sent at all.
-    send_options = options !== nothing && !isempty(options)
+    send_options = !isempty(options)
     len = 8 + msgsizeof(("user", user)) + msgsizeof(("database", dbname)) +
           msgsizeof(("client_encoding", "UTF8")) + 1
     application_name !== nothing && (len += msgsizeof(("application_name", application_name)))
@@ -329,11 +328,16 @@ function writestartupmessage(
     return nothing
 end
 
+_write_messages_to_buffer(buf, debug, ::Tuple{}) = nothing
+function _write_messages_to_buffer(buf, debug, msgs::Tuple)
+    _write_message_to_buffer(buf, debug, first(msgs))
+    _write_messages_to_buffer(buf, debug, Base.tail(msgs))
+    return nothing
+end
+
 function writemessages(socket, debug::Bool, msgs::Vararg{Tuple, N}) where {N}
     buf = IOBuffer()
-    for msg in msgs
-        _write_message_to_buffer(buf, debug, msg)
-    end
+    _write_messages_to_buffer(buf, debug, msgs)
     write(socket, take!(buf))
     flush(socket)
     return
@@ -829,7 +833,7 @@ function _startup!(socket, debug::Bool, user::String, dbname::String, @nospecial
     application_name_v = application_name::Union{String, Nothing}
     options_v = options::Union{String, Nothing}
     statement_timeout_v = statement_timeout::Union{Int, Nothing}
-    writestartupmessage(socket, debug, user, dbname, application_name_v, options_v, statement_timeout_v)
+    writestartupmessage(socket, debug, user, dbname, application_name_v, something(options_v, ""))
     # read initial response
     mt, len = readheader(socket, debug, MAX_PREAUTH_MESSAGE_LEN)
     if mt == UInt8('E')
