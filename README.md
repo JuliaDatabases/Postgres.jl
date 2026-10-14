@@ -125,6 +125,20 @@ Postgres.clear_statement_cache!(conn)
 DBInterface.close!(conn)
 ```
 
+## SQL scripts
+
+`DBInterface.execute` runs one statement per call. `Postgres.execute_script` runs a string of
+several statements, in one implicit transaction unless the script contains its own `BEGIN`/`COMMIT`,
+and returns each command tag.
+
+```julia
+using Postgres, DBInterface
+conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
+Postgres.execute_script(conn, "CREATE TEMP TABLE t (a int); COMMENT ON TABLE t IS 'one; two'")
+# ["CREATE TABLE", "COMMENT"]
+DBInterface.close!(conn)
+```
+
 ## Transactions
 
 ```julia

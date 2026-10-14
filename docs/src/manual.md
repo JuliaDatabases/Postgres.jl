@@ -221,6 +221,25 @@ finally
 end
 ```
 
+## SQL Scripts
+
+`DBInterface.execute` runs one statement per call. `Postgres.execute_script`
+runs a string of several statements, such as a migration or a schema file, in
+one round trip and returns each statement's command tag.
+
+```julia
+Postgres.execute_script(conn, """
+    CREATE TEMP TABLE script_demo (a int);
+    ALTER TABLE script_demo ALTER COLUMN a SET NOT NULL;
+    COMMENT ON TABLE script_demo IS 'one; two';
+""")
+# ["CREATE TABLE", "ALTER TABLE", "COMMENT"]
+```
+
+The statements run in one implicit transaction unless the script contains its
+own `BEGIN`/`COMMIT`: if one fails, the earlier ones are rolled back and the
+error is thrown. Scripts take no parameters and discard result rows.
+
 ## COPY
 
 Use `Postgres.copy_from` and `Postgres.copy_to` for PostgreSQL's COPY protocol.

@@ -1345,6 +1345,64 @@ end
 
 exec(socket::BufferedConn, query::String, debug::Bool) = exec(PostgresStyle(), socket, query, debug)
 
+# Run a query string that may hold several statements as one simple-query
+# message, like libpq's PQexec, and return the command tag of each statement
+# that completed. Row data is skipped. After an ErrorResponse the server skips
+# the rest of the string; the first error is kept and surfaced once the stream
+# reaches ReadyForQuery, so the connection stays usable.
+function exec_script(style::S, socket::BufferedConn, query::String, debug::Bool,
+                     tx_status_ref::Base.RefValue{UInt8},
+                     server_parameters::Dict{String, String}) where {S <: AbstractPostgresStyle}
+    writemessage(socket, debug, 'Q', query)
+    tags = String[]
+    server_error = nothing
+    copy_in_statement = false
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            if mt == UInt8('C')
+                push!(tags, commandComplete(len, socket))
+            elseif mt == UInt8('E')
+                server_error = something(server_error, errorResponse(len, socket, debug))
+            elseif mt == UInt8('Z')
+                # publish through the Ref before any throw below: the
+                # ReadyForQuery status is authoritative either way
+                tx_status_ref[] = read_ready_status(socket, len)
+                break
+            elseif mt in (UInt8('T'), UInt8('D'), UInt8('I'), UInt8('H'), UInt8('d'), UInt8('c'))
+                # row description / data row / empty query response, and
+                # COPY ... TO STDOUT output: discarded like query rows
+                skipbytes!(socket, len)
+            elseif mt == UInt8('G')
+                # CopyInResponse: the server is waiting on us for data. Abort
+                # the copy with CopyFail (no Sync in the simple protocol) so the
+                # stream returns to ready instead of deadlocking; a clear client
+                # error is thrown below.
+                skipbytes!(socket, len)
+                copy_in_statement = true
+                writemessage(socket, debug, 'f', "COPY FROM STDIN is not supported via execute_script")
+            elseif mt == UInt8('N')
+                notice_callback(style, noticeResponse(len, socket))
+            elseif mt == UInt8('A')
+                notification_callback(style, notificationResponse(len, socket))
+            elseif mt == UInt8('S')
+                parameterStatus!(server_parameters, len, socket)
+            else
+                close_and_throw(socket, Error("unexpected message type '$(Char(mt))' from server; connection protocol state is corrupted"))
+            end
+        end
+    catch
+        close(socket)
+        server_error === nothing || throw(server_error)
+        rethrow()
+    end
+    # for copy-in the server error is just the CopyFail artifact, so the
+    # client error wins
+    copy_in_statement && throw(PostgresInterfaceError("COPY ... FROM STDIN is not supported via execute_script; use Postgres.copy_from"))
+    server_error === nothing || throw(server_error)
+    return tags
+end
+
 function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessage(socket, debug, 'Q', query)
     error_msg = nothing

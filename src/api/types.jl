@@ -43,9 +43,9 @@ query_logging_enabled(::AbstractPostgresStyle) = false
 
 Called after each query when
 [`query_logging_enabled`](@ref Postgres.API.query_logging_enabled) is true for
-`style`. `event` is `:execute`, `:copy_from`, or `:copy_to`; `info` carries
-`sql`, `duration_ns`, `success`, the bound `params` (for `:execute`), and
-`error` when the query failed.
+`style`. `event` is `:execute`, `:execute_script`, `:copy_from`, or
+`:copy_to`; `info` carries `sql`, `duration_ns`, `success`, the bound `params`
+(for `:execute`), and `error` when the query failed.
 
 `info.params` holds the query's parameter values, so a logger that records
 them will record whatever sensitive data those queries carry.
