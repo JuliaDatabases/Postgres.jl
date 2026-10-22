@@ -982,6 +982,14 @@ include("notification_deadlines.jl")
             values = [random_array_string(rng) for _ in 1:rand(rng, 0:8)]
             @test Postgres.API.parse_array_by_oid(Postgres._param(values), 25, registry) == values
         end
+        # Other elements are quoted too: their text can hold commas, spaces,
+        # braces, or spell NULL, which would split or null the element.
+        @test Postgres._param([Dates.Month(1) + Dates.Day(2), Dates.Day(3)]) ==
+              "{\"1 month, 2 days\", \"3 days\"}"
+        symbols = [:NULL, Symbol("a,b"), Symbol("{x}"), Symbol("q\"\\")]
+        @test Postgres.API.parse_array_by_oid(Postgres._param(symbols), 25, registry) == string.(symbols)
+        @test Postgres._param(Union{Missing, Float64}[1.5, missing, -Inf]) == "{1.5, NULL, -Inf}"
+        @test Postgres._param([[1, 2], [3, 4]]) == "{{1, 2}, {3, 4}}"
     end
 
     @testset "Protocol Strings Reject NUL" begin
@@ -1366,6 +1374,11 @@ include("notification_deadlines.jl")
                     text_array_param = ["He said \"hi\"", "C:\\temp\\x", "", "NULL", "{brace, comma}"]
                     text_array_row = only(Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::text[] AS text_array", (text_array_param,))))
                     @test text_array_row.text_array == text_array_param
+                    interval_array_param = [Dates.Month(1) + Dates.Day(2), Dates.Hour(3)]
+                    interval_array_row = only(Tables.rowtable(DBInterface.execute(conn,
+                        raw"SELECT array_length($1::interval[], 1) AS n, $1::interval[]::text AS t", (interval_array_param,))))
+                    @test interval_array_row.n == 2
+                    @test interval_array_row.t == "{\"1 mon 2 days\",03:00:00}"
                     array_types_row = only(Tables.rowtable(DBInterface.execute(conn, """
                         SELECT
                             ARRAY['12345678-1234-5678-1234-567812345678']::uuid[] AS uuid_array,

@@ -281,7 +281,11 @@ _aparam(x::AbstractString)::String = string("\"", replace(x, r"([\"\\])" => s"\\
 _aparam(x::AbstractVector{UInt8})::String = _aparam(_param(x))
 _aparam(::Missing)::String = "NULL"
 _aparam(::Nothing)::String = "NULL"
-_aparam(x)::String = _param(x)
+_aparam(x::Union{Integer, AbstractFloat})::String = _param(x)
+_aparam(x::AbstractVector)::String = _param(x) # a nested dimension
+# Quote every other element's text: an interval renders with commas and
+# spaces ("1 month, 2 days"), and a Symbol can spell NULL or hold braces.
+_aparam(x)::String = _aparam(_param(x))
 function _param(x::AbstractVector)::String
     io = IOBuffer()
     write(io, '{')
