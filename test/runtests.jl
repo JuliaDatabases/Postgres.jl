@@ -498,6 +498,7 @@ include("result_decoding.jl")
 include("gssapi.jl")
 include("isvalid_fake_server.jl")
 include("execute_fake_server.jl")
+include("execute_script_fake_server.jl")
 include("executemany.jl")
 include("notification_deadlines.jl")
 include("trim_compile_tests.jl")
@@ -516,7 +517,7 @@ include("trim_compile_tests.jl")
                 :Error, :Notification, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
                 :query_logging_enabled, :query_logger, :notice_callback, :notification_callback, :parse_dsn,
                 :transaction, Symbol("@transaction"), :start_transaction, :commit, :rollback, :in_transaction,
-                :cursor, :copy_from, :copy_to, :listen!, :unlisten!, :notify!, :wait_for_notification,
+                :cursor, :execute_script, :copy_from, :copy_to, :listen!, :unlisten!, :notify!, :wait_for_notification,
                 :register_type!, :register_enum!, :register_composite!, :register_range!,
                 :command_tag, :rows_affected, :cancel_query!, :escape_identifier, :escape_literal,
                 :get_cached_statements, :clear_statement_cache!, :set_statement_cache_maxsize!,
@@ -984,6 +985,14 @@ include("trim_compile_tests.jl")
         end
     end
 
+    @testset "Protocol Strings Reject NUL" begin
+        # the message is still buffered when the check throws, so nothing is sent
+        io = IOBuffer()
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.writemessage(io, false, 'Q', "SELECT 1\0")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.writepart(io, ("user", "a\0b"))
+        @test position(io) == 0
+    end
+
     @testset "Seeded Protocol And DSN Fuzz" begin
         rng = MersenneTwister(0xf022)
         registry = Dict(Postgres.API.DEFAULT_TYPE_REGISTRY)
@@ -1037,6 +1046,7 @@ include("trim_compile_tests.jl")
     test_isvalid_fake_server()
     test_isvalid_fragmentation()
     test_execute_fake_server()
+    test_execute_script_fake_server()
     test_executemany_protocol()
     test_notification_deadlines()
     test_notification_tls_deadlines()
@@ -1142,6 +1152,10 @@ include("trim_compile_tests.jl")
                     @test err isa Postgres.API.Error
                     @test occursin("does not exist", err.message)
                     @test isopen(connp.socket)
+                    @test Tables.rowtable(DBInterface.execute(connp, "SELECT 1 AS a"))[1].a == 1
+
+                    # SQL with a NUL byte is rejected before anything is sent
+                    @test_throws Postgres.PostgresInterfaceError DBInterface.execute(connp, "SELECT 1\0")
                     @test Tables.rowtable(DBInterface.execute(connp, "SELECT 1 AS a"))[1].a == 1
 
                     # a consumer exception mid-result drains the remaining rows so
@@ -2536,6 +2550,57 @@ include("trim_compile_tests.jl")
                     @test_throws Postgres.PostgresInterfaceError Postgres.cursor(conn, "COPY copy_test FROM STDIN")
                     @test !Postgres.in_transaction(conn)
                     @test Tables.rowtable(DBInterface.execute(conn, "SELECT 4 AS a"))[1].a == 4
+                end
+
+                @testset "Execute Script" begin
+                    # several statements in one string, with a ';' inside a
+                    # literal and a dollar-quoted body; rows are discarded
+                    tags = Postgres.execute_script(conn, """
+                        CREATE TEMP TABLE script_test (a int);
+                        ALTER TABLE script_test ALTER COLUMN a SET NOT NULL;
+                        COMMENT ON TABLE script_test IS 'one; two';
+                        CREATE FUNCTION pg_temp.script_fn() RETURNS int AS \$\$ SELECT 1; \$\$ LANGUAGE sql;
+                        INSERT INTO script_test VALUES (1), (2);
+                        SELECT * FROM script_test;
+                    """)
+                    @test tags == ["CREATE TABLE", "ALTER TABLE", "COMMENT", "CREATE FUNCTION", "INSERT 0 2", "SELECT 2"]
+                    @test Postgres.execute_script(conn, "") == String[]
+
+                    # a failing statement skips the rest and rolls back the
+                    # implicit transaction; the connection stays usable
+                    err = try
+                        Postgres.execute_script(conn, "CREATE TEMP TABLE script_rollback (a int); SELECT 1/0; CREATE TEMP TABLE script_never (a int)")
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa Postgres.API.Error
+                    @test err.code == "22012"
+                    @test !(@lock conn.lock conn.server_in_transaction)
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT to_regclass('script_rollback') IS NULL AS gone"))[1].gone
+
+                    # commands that refuse a transaction block fail inside a
+                    # multi-statement string, as with libpq's PQexec
+                    err = try
+                        Postgres.execute_script(conn, "SELECT 1; VACUUM script_test")
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa Postgres.API.Error
+                    @test err.code == "25001"
+
+                    # transaction control inside a script is tracked
+                    @test Postgres.execute_script(conn, "BEGIN; SELECT 1") == ["BEGIN", "SELECT 1"]
+                    @test @lock conn.lock conn.server_in_transaction
+                    @test Postgres.execute_script(conn, "COMMIT") == ["COMMIT"]
+                    @test !(@lock conn.lock conn.server_in_transaction)
+
+                    # COPY FROM STDIN is rejected without desyncing the
+                    # connection; COPY TO STDOUT output is discarded like rows
+                    @test_throws Postgres.PostgresInterfaceError Postgres.execute_script(conn, "SELECT 1; COPY script_test FROM STDIN")
+                    @test Postgres.execute_script(conn, "COPY script_test TO STDOUT; SELECT 1") == ["COPY 2", "SELECT 1"]
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT 6 AS a"))[1].a == 6
                 end
 
                 @testset "Cursor Streaming" begin
