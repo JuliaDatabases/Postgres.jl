@@ -32,6 +32,8 @@ function test_typed_read_compatibility(conn)
                     end
                     @test DBInterface.execute(conn, "SELECT ARRAY[1e15::$pgtype, -1e15::$pgtype] AS value", (),
                         NamedTuple{(:value,), Tuple{Vector{Int64}}}).value == [Int64(decoded), -Int64(decoded)]
+                    @test DBInterface.execute(conn, "SELECT ARRAY[100::$pgtype] AS value", (),
+                        NamedTuple{(:value,), Tuple{Vector{UInt8}}}).value == UInt8[100]
                 end
                 widened = DBInterface.execute(conn, "SELECT 0.1::float4 AS value", (), NamedTuple{(:value,), Tuple{Float64}}).value
                 @test widened === Float64(0.1f0)
@@ -200,6 +202,9 @@ function test_result_decoding()
             @test_throws InexactError decoding_field(Int8, "1.28e+2", oid)
             @test decoding_field(Cuint, "1e+2", oid) === Cuint(100)
             @test_throws InexactError decoding_field(Cuint, "-1e+2", oid)
+            @test decoding_field(Vector{UInt8}, "{1e+2}", array_oid) == UInt8[100]
+            @test_throws InexactError decoding_field(Vector{UInt8}, "{2.56e+2}", array_oid)
+            @test_throws InexactError decoding_field(Vector{UInt8}, "{-1e+2}", array_oid)
             for T in (Vector{Int64}, Union{Nothing, Vector{Int64}}, Union{Missing, Vector{Int64}})
                 @test decoding_field(T, "{1e+15,-1e+15}", array_oid) == Int64[parse(F, "1e+15"), parse(F, "-1e+15")]
             end

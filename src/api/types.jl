@@ -416,9 +416,9 @@ function pg_parse_time_any(s::AbstractString)::Time
     return occursin(' ', s) ? convert(Time, pg_parse_timestamp(s)) : pg_parse_time(s)
 end
 
-# Integer fields also read integral numeric text such as "12.00" (numeric
-# columns, or SUM over one). Out-of-range values throw InexactError, as when
-# converting a decoded column value; other text throws the parser's error.
+# Integer fields also read integral numeric text such as "12.00". Widening to
+# Int128 detects values outside the target range and throws InexactError;
+# text outside Int128's range or in other forms throws the target parser's error.
 function pg_parse_integer(::Type{T}, s::AbstractString) where {T <: Integer}
     x = Parsers.tryparse(T, s)
     x === nothing || return x
@@ -1028,7 +1028,7 @@ function _field_source(::PostgresStyle, ::Type{T}, v::FieldValue) where {T}
     if S <: Union{Signed, Unsigned, AbstractFloat}
         v.oid == 700 && return convert(S, Parsers.parse(Float32, text))
         v.oid == 701 && return convert(S, Parsers.parse(Float64, text))
-    elseif S <: Union{Vector{<:Signed}, Vector{<:AbstractFloat}}
+    elseif S <: Union{Vector{<:Signed}, Vector{<:Unsigned}, Vector{<:AbstractFloat}}
         # These concrete targets require flat arrays with no NULL elements.
         v.oid == 1021 && return convert(S, parse_array(text, Float32)::Vector{Float32})
         v.oid == 1022 && return convert(S, parse_array(text, Float64)::Vector{Float64})

@@ -38,6 +38,7 @@ struct TrimCompatibility
     absent_int::Union{Missing, Int64}
     widened::Float64
     integers::Vector{Int64}
+    octets::Vector{UInt8}
     widened_array::Vector{Float64}
     clock::Time
     maybe_clock::Union{Nothing, Time}
@@ -93,6 +94,7 @@ function run_postgres_trim_queries()::Nothing
             SELECT 1e15::float4 AS float4_int, 1e15::float8 AS float8_int,
                    NULL::float8 AS absent_int, 0.1::float4 AS widened,
                    ARRAY[1e15::float4, -1e15::float4] AS integers,
+                   ARRAY[100::float4] AS octets,
                    ARRAY[0.1::float4] AS widened_array,
                    '1969-12-31 23:59:59.999999'::timestamp AS clock,
                    '1800-01-01 00:00:00.123456+00'::timestamptz AS maybe_clock,
@@ -104,6 +106,7 @@ function run_postgres_trim_queries()::Nothing
         _check(compat.absent_int === missing, "unexpected nullable integer")
         _check(compat.widened === Float64(0.1f0) && compat.widened_array == [Float64(0.1f0)], "lost float4 precision")
         _check(compat.integers == Int64[999999986991104, -999999986991104], "unexpected exponent array conversion")
+        _check(compat.octets == UInt8[100], "unexpected unsigned array conversion")
         _check(compat.clock === Time(23, 59, 59, 999, 999) && compat.clocks == [compat.clock], "lost timestamp time precision")
         _check(compat.maybe_clock === Time(0, 0, 0, 123, 456) && compat.absent_clock === missing, "unexpected timestamp offset or NULL")
         _check(compat.json_null === "null" && compat.sql_null === nothing, "confused JSON null with SQL NULL")
