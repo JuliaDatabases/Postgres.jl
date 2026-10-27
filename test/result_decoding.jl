@@ -13,9 +13,9 @@ end
 
 function test_typed_read_compatibility(conn)
     @testset "Typed read compatibility on PostgreSQL" begin
+        # settings that change how the float and timestamp values below print
         settings = ("SET LOCAL TimeZone = 'UTC'", "SET LOCAL TimeZone = 'Asia/Kolkata'",
-                    "SET LOCAL TimeZone = 'America/New_York'", "SET LOCAL IntervalStyle = 'iso_8601'",
-                    "SET LOCAL bytea_output = 'escape'", "SET LOCAL extra_float_digits = 0",
+                    "SET LOCAL TimeZone = 'America/New_York'", "SET LOCAL extra_float_digits = 0",
                     "SET LOCAL extra_float_digits = 3")
         for setting in settings
             DBInterface.transaction(conn) do
@@ -179,6 +179,9 @@ function test_result_decoding()
         target = NamedTuple{Tuple(names), Tuple{Int64, Int32, Date, Vector{Int64}, Union{Nothing, Int64}, DecodingColor}}
         typed = StructUtils.make(target, row, Postgres.PostgresStyle())
         @test typed == (total=12, count=Int32(7), day=Date(2024, 1, 3), amounts=[12, 3], maybe=5, color=decoding_red)
+        # byte vectors decode bytea text, but integer arrays by element
+        @test decoding_field(Vector{UInt8}, "\\x0102", 17) == UInt8[1, 2]
+        @test decoding_field(Vector{UInt8}, "{1,2}", 1007) == UInt8[1, 2]
         @test_throws ArgumentError StructUtils.make(NamedTuple{(:total,), Tuple{Int64}},
             decoding_row(["12.50"], [1700]; names=[:total]), Postgres.PostgresStyle())
         # a registered decoder applies when it produces the field's type;

@@ -262,17 +262,10 @@ Base.close(cursor::Cursor) = DBInterface.close!(cursor)
 _param(x::AbstractString)::String = String(x)
 _param(x)::String = string(x)
 # Same text as `string(x)`, whose Dates formatting is not trim-safe.
-function _padded(n::Integer, width::Int)
-    digits = string(abs(n))
-    for _ in ncodeunits(digits)+1:width
-        digits = string('0', digits) # lpad is not trim-safe
-    end
-    return n < 0 ? string('-', digits) : digits
-end
-_param(x::Date)::String = string(_padded(year(x), 4), '-', _padded(month(x), 2), '-', _padded(day(x), 2))
+_param(x::Date)::String = string(string(year(x); pad=4), '-', string(month(x); pad=2), '-', string(day(x); pad=2))
 function _param(x::DateTime)::String
-    text = string(_param(Date(x)), 'T', _padded(hour(x), 2), ':', _padded(minute(x), 2), ':', _padded(second(x), 2))
-    return iszero(millisecond(x)) ? text : string(text, '.', _padded(millisecond(x), 3))
+    text = string(_param(Date(x)), 'T', string(hour(x); pad=2), ':', string(minute(x); pad=2), ':', string(second(x); pad=2))
+    return iszero(millisecond(x)) ? text : string(text, '.', string(millisecond(x); pad=3))
 end
 function _param(x::Durations.Timestamp)::String
     # PostgreSQL would round finer fractions. Require an exact conversion.

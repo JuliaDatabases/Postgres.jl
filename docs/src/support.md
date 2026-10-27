@@ -108,5 +108,11 @@ represented as a Boolean and raise an error. Select them as text, for example
 
 ## Native Compilation
 
-JuliaC `--trim` compilation is not supported in Postgres.jl. Normal Julia
-package precompilation is supported and is part of CI.
+JuliaC `--trim` builds work with `--trim=unsafe-warn`. Postgres.jl itself has
+no trim verifier errors on Julia 1.12 and later, but it reaches parts of
+released Julia's Base64 (SCRAM authentication) and `Dates.CompoundPeriod`
+(interval decoding) that are not trim-safe, so `--trim=safe` rejects the build.
+CI compiles a workload of connections, prepared statements, transactions,
+parameters, and typed reads, and runs it against PostgreSQL with trust
+authentication. Typed reads into general unions, and reads with a custom driver
+style, use runtime dispatch.
