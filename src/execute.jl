@@ -261,6 +261,12 @@ Base.close(cursor::Cursor) = DBInterface.close!(cursor)
 
 _param(x::AbstractString)::String = String(x)
 _param(x)::String = string(x)
+# Same text as `string(x)`, whose Dates formatting is not trim-safe.
+_param(x::Date)::String = string(string(year(x); pad=4), '-', string(month(x); pad=2), '-', string(day(x); pad=2))
+function _param(x::DateTime)::String
+    text = string(_param(Date(x)), 'T', string(hour(x); pad=2), ':', string(minute(x); pad=2), ':', string(second(x); pad=2))
+    return iszero(millisecond(x)) ? text : string(text, '.', string(millisecond(x); pad=3))
+end
 function _param(x::Durations.Timestamp)::String
     # PostgreSQL would round finer fractions. Require an exact conversion.
     timestamp = x isa Durations.Timestamp{Dates.Nanosecond} ? convert(API.PGTimestamp, x) : x
@@ -333,6 +339,12 @@ end
 function build_params(params, nparams::Int, sql::AbstractString)
     dest = Union{String, Missing}[missing for _ = 1:nparams]
     bind_params!(dest, params, sql)
+    return dest
+end
+
+function build_unchecked_params(params::Tuple)
+    dest = Vector{Union{String, Missing}}(undef, length(params))
+    bind_tuple_params!(dest, params)
     return dest
 end
 
