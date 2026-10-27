@@ -487,11 +487,15 @@ function fetch_portal!(cursor::Cursor)
     return
 end
 
+# After the last row, close the cursor: its own transaction would otherwise stay
+# open and take in every later statement on the connection, uncommitted.
+finish!(cursor::Cursor) = (DBInterface.close!(cursor); nothing)
+
 function Base.iterate(cursor::Cursor, state=nothing)
-    cursor.done && cursor.index > length(cursor.buffer) && return nothing
+    cursor.done && cursor.index > length(cursor.buffer) && return finish!(cursor)
     if cursor.index > length(cursor.buffer)
         fetch_portal!(cursor)
-        cursor.index > length(cursor.buffer) && cursor.done && return nothing
+        cursor.index > length(cursor.buffer) && cursor.done && return finish!(cursor)
     end
     row = cursor.buffer[cursor.index]
     cursor.index += 1
@@ -780,9 +784,11 @@ end
     Postgres.cursor(stmt, params=nothing; fetchsize=1000) -> Cursor
 
 Execute a query and stream its result rows in batches of `fetchsize` instead
-of materializing them all at once. The returned cursor iterates rows; close it
-with `DBInterface.close!(cursor)`. A cursor requires a transaction: one is
-started (and committed on close) if the connection isn't already in one.
+of materializing them all at once. The returned cursor iterates rows and closes
+itself after the last one; close a cursor you stop reading early with
+`DBInterface.close!(cursor)`. A cursor requires a transaction: one is started
+(and committed on close) if the connection isn't already in one, and until then
+every statement on the connection runs inside it.
 """
 function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize::Integer=1000, debug::Bool=false)
     owns_transaction = false
