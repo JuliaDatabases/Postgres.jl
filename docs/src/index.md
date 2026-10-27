@@ -219,4 +219,6 @@ Postgres.Notification
 Postgres.PostgresRange
 Postgres.ConnectionParams
 Postgres.parse_dsn
+Postgres.validate_dsn
+Postgres.ConnectionParameterError
 ```

@@ -515,6 +515,7 @@ include("notification_deadlines.jl")
                 :Connection, :ConnectionPool, :ConnectionParams, :PostgresInterfaceError,
                 :Error, :Notification, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
                 :query_logging_enabled, :query_logger, :notice_callback, :notification_callback, :parse_dsn,
+                :validate_dsn, :ConnectionParameterError,
                 :transaction, Symbol("@transaction"), :start_transaction, :commit, :rollback, :in_transaction,
                 :cursor, :execute_script, :copy_from, :copy_to, :listen!, :unlisten!, :notify!, :wait_for_notification,
                 :register_type!, :register_enum!, :register_composite!, :register_range!,
