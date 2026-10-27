@@ -32,6 +32,21 @@ struct TrimTotals
     rows::Union{Nothing, Int64}
 end
 
+struct TrimCompatibility
+    float4_int::Int64
+    float8_int::Union{Nothing, Int64}
+    absent_int::Union{Missing, Int64}
+    widened::Float64
+    integers::Vector{Int64}
+    widened_array::Vector{Float64}
+    clock::Time
+    maybe_clock::Union{Nothing, Time}
+    absent_clock::Union{Missing, Time}
+    clocks::Vector{Time}
+    json_null::Union{Nothing, String}
+    sql_null::Union{Nothing, String}
+end
+
 const TRIM_PROFILE_SELECT = """
     SELECT profile_id, display_name, nickname, created_at, deleted_at, birthday, active,
            score, balance, status, uid, flags, tags, settings
@@ -50,7 +65,7 @@ function _postgres_trim_connect()
         sslmode="disable",
         connect_timeout=5,
         application_name="postgres_trim",
-        options="-c search_path=public",
+        options="-c search_path=public -c timezone=UTC",
         statement_timeout=30_000,
         statement_cache_maxsize=4,
     )
@@ -73,6 +88,26 @@ end
 function run_postgres_trim_queries()::Nothing
     conn = _postgres_trim_connect()
     try
+        DBInterface.execute(conn, "SET TimeZone = 'Asia/Kolkata'")
+        compat = DBInterface.execute(conn, """
+            SELECT 1e15::float4 AS float4_int, 1e15::float8 AS float8_int,
+                   NULL::float8 AS absent_int, 0.1::float4 AS widened,
+                   ARRAY[1e15::float4, -1e15::float4] AS integers,
+                   ARRAY[0.1::float4] AS widened_array,
+                   '1969-12-31 23:59:59.999999'::timestamp AS clock,
+                   '1800-01-01 00:00:00.123456+00'::timestamptz AS maybe_clock,
+                   NULL::timestamp AS absent_clock,
+                   ARRAY['1970-01-01 05:21:09.999999+05:21:10'::timestamptz] AS clocks,
+                   'null'::jsonb AS json_null, NULL::jsonb AS sql_null
+            """, (), TrimCompatibility)
+        _check(compat.float4_int == 999999986991104 && compat.float8_int === Int64(1000000000000000), "unexpected exponent conversion")
+        _check(compat.absent_int === missing, "unexpected nullable integer")
+        _check(compat.widened === Float64(0.1f0) && compat.widened_array == [Float64(0.1f0)], "lost float4 precision")
+        _check(compat.integers == Int64[999999986991104, -999999986991104], "unexpected exponent array conversion")
+        _check(compat.clock === Time(23, 59, 59, 999, 999) && compat.clocks == [compat.clock], "lost timestamp time precision")
+        _check(compat.maybe_clock === Time(0, 0, 0, 123, 456) && compat.absent_clock === missing, "unexpected timestamp offset or NULL")
+        _check(compat.json_null === "null" && compat.sql_null === nothing, "confused JSON null with SQL NULL")
+        DBInterface.execute(conn, "RESET TimeZone")
         DBInterface.execute(conn, "DROP TYPE IF EXISTS trim_status")
         DBInterface.execute(conn, "CREATE TYPE trim_status AS ENUM ('trim_active', 'trim_paused')")
         DBInterface.execute(conn, """

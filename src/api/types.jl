@@ -410,6 +410,12 @@ end
 # timestamp(tz) column into a Date field: the UTC date, as for DateTime fields
 pg_parse_date_any(s::AbstractString)::Date = occursin(':', s) ? Date(pg_parse_datetime_any(s)) : pg_parse_date(s)
 
+# Timestamp columns contribute their UTC time of day without losing microseconds.
+function pg_parse_time_any(s::AbstractString)::Time
+    _check_temporal_special(s, "timestamp")
+    return occursin(' ', s) ? convert(Time, pg_parse_timestamp(s)) : pg_parse_time(s)
+end
+
 # Integer fields also read integral numeric text such as "12.00" (numeric
 # columns, or SUM over one). Out-of-range values throw InexactError, as when
 # converting a decoded column value; other text throws the parser's error.
@@ -996,14 +1002,15 @@ _field_source(::AbstractPostgresStyle, ::Type{T}, v::FieldValue) where {T} =
 
 # With the default style, field types that the lifts below (and StructUtils'
 # own String, Symbol and Enum lifts) parse from text decode from the column
-# text. The source stays a String, so typed reads compile to static calls
-# under `--trim`; OID decoding returns `Any`. Custom styles keep the OID decoder
-# so their lifts still receive decoded values, and other field types keep it too.
+# text. Floating columns retain their precision for numeric targets. These
+# sources have inferred types under `--trim`; OID decoding returns `Any`.
+# Custom styles keep the OID decoder so their lifts still receive decoded values,
+# and other field types keep it too.
 const TextField = Union{String, Symbol, Bool, Char, Int8, Int16, Int32, Int64, Cuint, Float32, Float64,
     Date, Time, DateTime, UUID, Vector{UInt8}, JSONType, Vector{String}, Vector{Int16}, Vector{Int32},
     Vector{Int64}, Vector{Float32}, Vector{Float64}, Vector{Bool}, Vector{Date}, Vector{Time},
     Vector{DateTime}, Vector{UUID}, Vector{Char}}
-_text_field(::Type{S}) where {S} = S !== Union{} && (S <: Union{TextField, Enum} || S === IntervalType || _wire_field(S))
+_text_field(::Type{S}) where {S} = S === IntervalType || (S !== Union{} && !(S isa Union) && (S <: Union{TextField, Enum} || _wire_field(S)))
 
 function _field_source(::PostgresStyle, ::Type{T}, v::FieldValue) where {T}
     S = Base.nonnothingtype(Base.nonmissingtype(T))
@@ -1015,7 +1022,18 @@ function _field_source(::PostgresStyle, ::Type{T}, v::FieldValue) where {T}
         x = info.parser(_field_text(v.text), v.registry)
         x isa S && return x
     end
-    return _field_text(v.text)
+    text = _field_text(v.text)
+    # Conversions must use the column's floating precision, including exponent
+    # output. Parsing float4 directly as Float64 would silently change its value.
+    if S <: Union{Signed, Unsigned, AbstractFloat}
+        v.oid == 700 && return convert(S, Parsers.parse(Float32, text))
+        v.oid == 701 && return convert(S, Parsers.parse(Float64, text))
+    elseif S <: Union{Vector{<:Signed}, Vector{<:AbstractFloat}}
+        # These concrete targets require flat arrays with no NULL elements.
+        v.oid == 1021 && return convert(S, parse_array(text, Float32)::Vector{Float32})
+        v.oid == 1022 && return convert(S, parse_array(text, Float64)::Vector{Float64})
+    end
+    return text
 end
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue) where {T} = StructUtils.make(st, T, _field_source(st, T, v))
 StructUtils.make(st::AbstractPostgresStyle, ::Type{T}, v::FieldValue, tags) where {T} = StructUtils.make(st, T, _field_source(st, T, v), tags)
@@ -1056,7 +1074,7 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Cuint}, s::String) = pg_parse_i
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Float32}, s::String) = Parsers.parse(Float32, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Float64}, s::String) = Parsers.parse(Float64, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Date}, s::String) = pg_parse_date_any(s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Time}, s::String) = pg_parse_time(s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Time}, s::String) = pg_parse_time_any(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{DateTime}, s::String) = pg_parse_datetime_any(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{UUID}, s::String) = UUID(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{IntervalType}, s::String) = parse_interval(s), nothing

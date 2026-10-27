@@ -1042,6 +1042,7 @@ include("trim_compile_tests.jl")
     end
 
     test_result_decoding()
+    test_trim_verifier_diagnostics()
     test_gssapi()
     test_isvalid_fake_server()
     test_isvalid_fragmentation()
@@ -1061,6 +1062,7 @@ include("trim_compile_tests.jl")
             conn = wait_for_connection(cfg)
             try
                 test_executemany(conn)
+                test_typed_read_compatibility(conn)
                 run_postgres_trim_compile_tests(cfg)
                 @testset "Auth" begin
                     if occursin("trust", DEFAULT_AUTH) || occursin("trust", DEFAULT_INITDB_ARGS)

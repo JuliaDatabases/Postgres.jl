@@ -4,7 +4,7 @@ using Parsers, Dates, UUIDs
 import Durations, DataDecimals
 import ..parse_decimal
 import ..pg_parse_timestamp
-import ..pg_parse_date, ..pg_parse_date_any, ..pg_parse_time, ..pg_parse_datetime_any, ..pg_parse_char, ..pg_parse_integer
+import ..pg_parse_date, ..pg_parse_date_any, ..pg_parse_time_any, ..pg_parse_datetime_any, ..pg_parse_char, ..pg_parse_integer
 
 const BRACKET_OPEN = UInt8('[')
 const BRACKET_CLOSE = UInt8(']')
@@ -94,7 +94,7 @@ function parse_scalar(token::String, inner_type::Type{T}, quoted::Bool) where {T
     inner_type === Float32 && return Parsers.parse(Float32, token)
     inner_type === Float64 && return Parsers.parse(Float64, token)
     inner_type === Date && return pg_parse_date_any(token)
-    inner_type === Time && return pg_parse_time(token)
+    inner_type === Time && return pg_parse_time_any(token)
     inner_type <: Durations.Timestamp && return pg_parse_timestamp(token, inner_type)
     inner_type === DateTime && return pg_parse_datetime_any(token)
     inner_type === UUID && return UUID(token)

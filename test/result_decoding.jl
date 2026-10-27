@@ -11,11 +11,67 @@ function decoding_row(values, oids; names=[Symbol("c", i) for i in eachindex(val
     return Postgres.API.DataRow(take!(io), names, oids, Dict(Postgres.API.DEFAULT_TYPE_REGISTRY))
 end
 
+function test_typed_read_compatibility(conn)
+    @testset "Typed read compatibility on PostgreSQL" begin
+        settings = ("SET LOCAL TimeZone = 'UTC'", "SET LOCAL TimeZone = 'Asia/Kolkata'",
+                    "SET LOCAL TimeZone = 'America/New_York'", "SET LOCAL IntervalStyle = 'iso_8601'",
+                    "SET LOCAL bytea_output = 'escape'", "SET LOCAL extra_float_digits = 0",
+                    "SET LOCAL extra_float_digits = 3")
+        for setting in settings
+            DBInterface.transaction(conn) do
+                DBInterface.execute(conn, "SET LOCAL DateStyle = 'ISO, YMD'")
+                DBInterface.execute(conn, setting)
+                for pgtype in ("float4", "float8")
+                    sql = "SELECT 1e15::$pgtype AS value"
+                    decoded = only(DBInterface.execute(conn, sql)).value
+                    for T in (Int64, Union{Nothing, Int64}, Union{Missing, Int64})
+                        @test DBInterface.execute(conn, sql, (), NamedTuple{(:value,), Tuple{T}}).value === Int64(decoded)
+                    end
+                    for value in ("3.5", "1e19", "'NaN'", "'Infinity'")
+                        @test_throws InexactError DBInterface.execute(conn, "SELECT $value::$pgtype AS value", (), NamedTuple{(:value,), Tuple{Int64}})
+                    end
+                    @test DBInterface.execute(conn, "SELECT ARRAY[1e15::$pgtype, -1e15::$pgtype] AS value", (),
+                        NamedTuple{(:value,), Tuple{Vector{Int64}}}).value == [Int64(decoded), -Int64(decoded)]
+                end
+                widened = DBInterface.execute(conn, "SELECT 0.1::float4 AS value", (), NamedTuple{(:value,), Tuple{Float64}}).value
+                @test widened === Float64(0.1f0)
+                for (expr, T, expected) in (("42::int8", Union{Int64, String}, Int64(42)),
+                                          ("'42'::text", Union{Int64, String}, "42"),
+                                          ("1.5::float8", Union{Int64, Float64}, 1.5),
+                                          ("NULL::float8", Union{Missing, Int64, Float64}, missing),
+                                          ("'null'::json", Union{Nothing, String}, "null"),
+                                          ("NULL::jsonb", Union{Nothing, String}, nothing))
+                    @test DBInterface.execute(conn, "SELECT $expr AS value", (), NamedTuple{(:value,), Tuple{T}}).value === expected
+                end
+                # The old date forces named zones to emit historical second offsets.
+                for expr in ("'1800-01-01 00:00:00.123456'::timestamp", "'1800-01-01 00:00:00.123456+00'::timestamptz")
+                    expected = Time(0, 0, 0, 123, 456)
+                    for T in (Time, Union{Nothing, Time}, Union{Missing, Time})
+                        @test DBInterface.execute(conn, "SELECT $expr AS value", (), NamedTuple{(:value,), Tuple{T}}).value === expected
+                    end
+                    @test DBInterface.execute(conn, "SELECT ARRAY[$expr] AS value", (), NamedTuple{(:value,), Tuple{Vector{Time}}}).value == [expected]
+                    @test isequal(DBInterface.execute(conn, "SELECT ARRAY[$expr, NULL] AS value", (),
+                        NamedTuple{(:value,), Tuple{Vector{Union{Missing, Time}}}}).value, [expected, missing])
+                end
+                for (expr, expected) in (("9223372036854775807.00::numeric", typemax(Int64)),
+                                         ("-9223372036854775808.00::numeric", typemin(Int64)))
+                    @test DBInterface.execute(conn, "SELECT $expr AS value", (), NamedTuple{(:value,), Tuple{Int64}}).value === expected
+                end
+                @test_throws InexactError DBInterface.execute(conn, "SELECT 9223372036854775808::numeric AS value", (), NamedTuple{(:value,), Tuple{Int64}})
+                @test_throws ArgumentError DBInterface.execute(conn, "SELECT 9007199254740993.5::numeric AS value", (), NamedTuple{(:value,), Tuple{Int64}})
+            end
+        end
+    end
+end
+
 function decoding_values(row)
     values = Any[]
     StructUtils.applyeach(Postgres.PostgresStyle(), (name, value) -> push!(values, value), row)
     return values
 end
+
+decoding_field(::Type{T}, text, oid) where {T} = StructUtils.make(
+    NamedTuple{(:value,), Tuple{T}}, decoding_row([text], [oid]; names=[:value]), Postgres.PostgresStyle()).value
 
 struct DecodingStyle <: Postgres.AbstractPostgresStyle end
 
@@ -129,6 +185,86 @@ function test_result_decoding()
         Postgres.API.register_type!(row.type_registry, 999_998, Symbol; parser=(text::String, registry) -> Symbol(text))
         typed = StructUtils.make(NamedTuple{(:symbol, :color), Tuple{Symbol, DecodingColor}}, row, Postgres.PostgresStyle())
         @test typed == (symbol=:decoding_red, color=decoding_red)
+    end
+
+    @testset "Floating columns retain their precision in typed conversions" begin
+        for (oid, array_oid, F) in ((700, 1021, Float32), (701, 1022, Float64))
+            for text in ("1e+15", "-1e+15", "1e+18", "-1e+18", "9.223371e18", "-9.223372e18"), T in (Int64, Union{Nothing, Int64}, Union{Missing, Int64})
+                @test decoding_field(T, text, oid) === Int64(parse(F, text))
+            end
+            for text in ("3.5", "1e-2", "1e+19", "-1e+19", "NaN", "Infinity", "-Infinity")
+                @test_throws InexactError decoding_field(Int64, text, oid)
+                @test_throws InexactError decoding_field(Vector{Int64}, "{$text}", array_oid)
+            end
+            @test decoding_field(Int8, "1e+2", oid) === Int8(100)
+            @test_throws InexactError decoding_field(Int8, "1.28e+2", oid)
+            @test decoding_field(Cuint, "1e+2", oid) === Cuint(100)
+            @test_throws InexactError decoding_field(Cuint, "-1e+2", oid)
+            for T in (Vector{Int64}, Union{Nothing, Vector{Int64}}, Union{Missing, Vector{Int64}})
+                @test decoding_field(T, "{1e+15,-1e+15}", array_oid) == Int64[parse(F, "1e+15"), parse(F, "-1e+15")]
+            end
+        end
+        @test decoding_field(Float64, "0.1", 700) === Float64(0.1f0)
+        @test decoding_field(Vector{Float64}, "{0.1}", 1021) == [Float64(0.1f0)]
+        @test decoding_field(Int64, "9223372036854775807.00", 1700) === typemax(Int64)
+        @test decoding_field(Int64, "-9223372036854775808.00", 1700) === typemin(Int64)
+        @test_throws InexactError decoding_field(Int64, "9223372036854775808.00", 1700)
+        @test_throws ArgumentError decoding_field(Int64, "9007199254740993.5", 1700)
+        # Exponent-form text is not a floating column and must not round through Float64.
+        @test_throws ArgumentError decoding_field(Int64, "9007199254740993e0", 25)
+        for (T, expected) in ((Union{Nothing, Int64}, nothing), (Union{Missing, Int64}, missing),
+                              (Union{Nothing, Vector{Int64}}, nothing), (Union{Missing, Vector{Int64}}, missing))
+            @test decoding_field(T, nothing, 701) === expected
+        end
+        row = decoding_row(["1e+15"], [701]; names=[:value])
+        Postgres.API.register_type!(row.type_registry, 701, Int64; parser=(text::String, registry) -> Int64(42))
+        @test StructUtils.make(NamedTuple{(:value,), Tuple{Int64}}, row, Postgres.PostgresStyle()).value === Int64(42)
+    end
+
+    @testset "General unions retain the decoded column type" begin
+        for T in (Union{Int64, Float64}, Union{Nothing, Int64, Float64}, Union{Missing, Int64, Float64})
+            @test decoding_field(T, "1.5", 701) === 1.5
+            @test decoding_field(T, "42", 20) === Int64(42)
+        end
+        for T in (Union{Int64, String}, Union{Nothing, Int64, String}, Union{Missing, Int64, String})
+            @test decoding_field(T, "42", 20) === Int64(42)
+            @test decoding_field(T, "42", 25) === "42"
+        end
+        @test decoding_field(Union{Nothing, Int64, String}, nothing, 20) === nothing
+        @test decoding_field(Union{Missing, Int64, Float64}, nothing, 701) === missing
+        @test decoding_field(Vector{Union{Int64, String}}, "{42}", 1016) == Int64[42]
+        @test isequal(decoding_field(Vector{Union{Missing, Int64, Float64}}, "{1.5,NULL}", 1022), [1.5, missing])
+        # IntervalType is an intentional union with its own text lift.
+        @test decoding_field(Postgres.API.IntervalType, "1 year 2 mons", 1186) == Year(1) + Month(2)
+    end
+
+    @testset "Timestamp columns into Time fields" begin
+        expected = Time(23, 59, 59, 999, 999)
+        for (oid, array_oid, text) in ((1114, 1115, "1969-12-31 23:59:59.999999"),
+                                      (1184, 1185, "1970-01-01 05:21:09.999999+05:21:10"),
+                                      (1184, 1185, "1969-12-31 18:38:49.999999-05:21:10"))
+            for T in (Time, Union{Nothing, Time}, Union{Missing, Time})
+                @test decoding_field(T, text, oid) === expected
+            end
+            for T in (Vector{Time}, Union{Nothing, Vector{Time}}, Union{Missing, Vector{Time}})
+                @test decoding_field(T, "{\"$text\"}", array_oid) == [expected]
+            end
+        end
+        @test decoding_field(Time, "03:04:05.123456789", 1083) === Time(3, 4, 5, 123, 456, 789)
+        @test decoding_field(Union{Nothing, Time}, nothing, 1114) === nothing
+        @test decoding_field(Union{Missing, Time}, nothing, 1184) === missing
+        @test decoding_field(Union{Nothing, Vector{Time}}, nothing, 1185) === nothing
+        @test_throws Postgres.PostgresInterfaceError decoding_field(Time, "infinity", 1114)
+        @test_throws Postgres.PostgresInterfaceError decoding_field(Time, "0001-01-01 00:00:00 BC", 1114)
+    end
+
+    @testset "JSON null stays distinct from SQL NULL in text fields" begin
+        for oid in (114, 3802)
+            @test decoding_field(Union{Nothing, String}, "null", oid) === "null"
+            @test decoding_field(Union{Missing, String}, "null", oid) === "null"
+            @test decoding_field(Union{Nothing, String}, nothing, oid) === nothing
+            @test decoding_field(Union{Missing, String}, nothing, oid) === missing
+        end
     end
 
     @testset "Date and DateTime parameters" begin
