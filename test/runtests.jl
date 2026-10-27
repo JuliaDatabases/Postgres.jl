@@ -2605,8 +2605,18 @@ include("notification_deadlines.jl")
                     cur = Postgres.cursor(conn, "SELECT generate_series(1, 5) AS n"; fetchsize=2)
                     values = [row.n for row in cur]
                     @test values == [1, 2, 3, 4, 5]
+                    # reading the last row committed the cursor's own transaction
+                    @test !Postgres.in_transaction(conn)
                     DBInterface.close!(cur)
                     @test !Postgres.in_transaction(conn)
+                    # so a later write autocommits instead of joining it
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS cursor_after")
+                    DBInterface.execute(conn, "CREATE TABLE cursor_after (id int)")
+                    @test length(Tables.columntable(Postgres.cursor(conn,
+                        "SELECT generate_series(1, 3) AS n"; fetchsize=2)).n) == 3
+                    DBInterface.execute(conn, "INSERT INTO cursor_after VALUES (1)")
+                    @test !Postgres.in_transaction(conn)
+                    @test !conn.server_in_transaction
 
                     # The documented Statement overload must own a transaction
                     # when called outside one, or the first Sync drops a
@@ -2629,21 +2639,23 @@ include("notification_deadlines.jl")
                     DBInterface.close!(mismatch_cursor_stmt)
 
                     # A fully exhausted named portal still exists until Close
-                    # or transaction end. Cursor close must release it now,
-                    # even inside a caller-owned long transaction.
+                    # or transaction end. Reading the last row must release
+                    # it, even inside a caller-owned long transaction, which
+                    # stays open.
                     Postgres.start_transaction(conn)
                     portal_stmt = DBInterface.prepare(conn,
                         "SELECT generate_series(1, 5) AS n")
                     portal_cursor = Postgres.cursor(portal_stmt; fetchsize=2)
-                    @test length(collect(portal_cursor)) == 5
                     portal_name = portal_cursor.portal
                     @test only(DBInterface.execute(conn,
                         "SELECT count(*)::int AS n FROM pg_cursors WHERE name = \$1",
                         (portal_name,))).n == 1
-                    DBInterface.close!(portal_cursor)
+                    @test length(collect(portal_cursor)) == 5
                     @test only(DBInterface.execute(conn,
                         "SELECT count(*)::int AS n FROM pg_cursors WHERE name = \$1",
                         (portal_name,))).n == 0
+                    @test Postgres.in_transaction(conn)
+                    DBInterface.close!(portal_cursor)
                     DBInterface.close!(portal_stmt)
                     Postgres.rollback(conn)
 
