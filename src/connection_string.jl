@@ -63,7 +63,7 @@ function parse_optional_int(value::Union{String, Nothing}, key::String="")
     value === nothing && return nothing
     isempty(value) && return nothing
     parsed = tryparse(Int, value)
-    parsed === nothing && throw(ArgumentError("invalid value \"$value\" for connection parameter \"$key\"; expected an integer"))
+    parsed === nothing && throw(ArgumentError("invalid value \"$(escape_string(value))\" for connection parameter \"$key\"; expected an integer"))
     return parsed
 end
 
@@ -127,7 +127,7 @@ function parse_bool_param(value::Union{String, Nothing}, default::Bool, key::Str
     lowered = lowercase(value)
     lowered in ("1", "on", "true", "yes") && return true
     lowered in ("0", "off", "false", "no") && return false
-    throw(ArgumentError("invalid value \"$value\" for connection parameter \"$key\"; expected a boolean (on/off, true/false, yes/no, 1/0)"))
+    throw(ArgumentError("invalid value \"$(escape_string(value))\" for connection parameter \"$key\"; expected a boolean (on/off, true/false, yes/no, 1/0)"))
 end
 
 # Ignored keywords that change security or connection-selection behavior when

@@ -675,6 +675,11 @@ include("notification_deadlines.jl")
         # parameter rather than silently defaulting
         @test_throws ArgumentError Postgres.parse_dsn("host=h reconnect=ture")
         @test_throws ArgumentError Postgres.parse_dsn("host=h port=abc")
+        # the echoed value is escaped, so it can't pass for another parameter's message
+        err = try Postgres.parse_dsn("host=h port='1\\\" for connection parameter \\\"password'") catch e e end
+        @test err.msg == "invalid value \"1\\\" for connection parameter \\\"password\" for connection parameter \"port\"; expected an integer"
+        err = try Postgres.parse_dsn("host=h reconnect='a\\\\b'") catch e e end
+        @test startswith(err.msg, "invalid value \"a\\\\b\" for connection parameter \"reconnect\"")
 
         # an empty value (an unset PGPORT expanded by a process manager) falls
         # back to the default instead of failing to parse
