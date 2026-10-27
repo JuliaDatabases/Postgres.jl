@@ -676,6 +676,11 @@ include("trim_compile_tests.jl")
         # parameter rather than silently defaulting
         @test_throws ArgumentError Postgres.parse_dsn("host=h reconnect=ture")
         @test_throws ArgumentError Postgres.parse_dsn("host=h port=abc")
+        # the echoed value is escaped, so it can't pass for another parameter's message
+        err = try Postgres.parse_dsn("host=h port='1\\\" for connection parameter \\\"password'") catch e e end
+        @test err.msg == "invalid value \"1\\\" for connection parameter \\\"password\" for connection parameter \"port\"; expected an integer"
+        err = try Postgres.parse_dsn("host=h reconnect='a\\\\b'") catch e e end
+        @test startswith(err.msg, "invalid value \"a\\\\b\" for connection parameter \"reconnect\"")
 
         # an empty value (an unset PGPORT expanded by a process manager) falls
         # back to the default instead of failing to parse
@@ -983,6 +988,14 @@ include("trim_compile_tests.jl")
             values = [random_array_string(rng) for _ in 1:rand(rng, 0:8)]
             @test Postgres.API.parse_array_by_oid(Postgres._param(values), 25, registry) == values
         end
+        # Other elements are quoted too: their text can hold commas, spaces,
+        # braces, or spell NULL, which would split or null the element.
+        @test Postgres._param([Dates.Month(1) + Dates.Day(2), Dates.Day(3)]) ==
+              "{\"1 month, 2 days\", \"3 days\"}"
+        symbols = [:NULL, Symbol("a,b"), Symbol("{x}"), Symbol("q\"\\")]
+        @test Postgres.API.parse_array_by_oid(Postgres._param(symbols), 25, registry) == string.(symbols)
+        @test Postgres._param(Union{Missing, Float64}[1.5, missing, -Inf]) == "{1.5, NULL, -Inf}"
+        @test Postgres._param([[1, 2], [3, 4]]) == "{{1, 2}, {3, 4}}"
     end
 
     @testset "Protocol Strings Reject NUL" begin
@@ -1370,6 +1383,11 @@ include("trim_compile_tests.jl")
                     text_array_param = ["He said \"hi\"", "C:\\temp\\x", "", "NULL", "{brace, comma}"]
                     text_array_row = only(Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::text[] AS text_array", (text_array_param,))))
                     @test text_array_row.text_array == text_array_param
+                    interval_array_param = [Dates.Month(1) + Dates.Day(2), Dates.Hour(3)]
+                    interval_array_row = only(Tables.rowtable(DBInterface.execute(conn,
+                        raw"SELECT array_length($1::interval[], 1) AS n, $1::interval[]::text AS t", (interval_array_param,))))
+                    @test interval_array_row.n == 2
+                    @test interval_array_row.t == "{\"1 mon 2 days\",03:00:00}"
                     array_types_row = only(Tables.rowtable(DBInterface.execute(conn, """
                         SELECT
                             ARRAY['12345678-1234-5678-1234-567812345678']::uuid[] AS uuid_array,
@@ -2609,8 +2627,18 @@ include("trim_compile_tests.jl")
                     cur = Postgres.cursor(conn, "SELECT generate_series(1, 5) AS n"; fetchsize=2)
                     values = [row.n for row in cur]
                     @test values == [1, 2, 3, 4, 5]
+                    # reading the last row committed the cursor's own transaction
+                    @test !Postgres.in_transaction(conn)
                     DBInterface.close!(cur)
                     @test !Postgres.in_transaction(conn)
+                    # so a later write autocommits instead of joining it
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS cursor_after")
+                    DBInterface.execute(conn, "CREATE TABLE cursor_after (id int)")
+                    @test length(Tables.columntable(Postgres.cursor(conn,
+                        "SELECT generate_series(1, 3) AS n"; fetchsize=2)).n) == 3
+                    DBInterface.execute(conn, "INSERT INTO cursor_after VALUES (1)")
+                    @test !Postgres.in_transaction(conn)
+                    @test !conn.server_in_transaction
 
                     # The documented Statement overload must own a transaction
                     # when called outside one, or the first Sync drops a
@@ -2633,21 +2661,23 @@ include("trim_compile_tests.jl")
                     DBInterface.close!(mismatch_cursor_stmt)
 
                     # A fully exhausted named portal still exists until Close
-                    # or transaction end. Cursor close must release it now,
-                    # even inside a caller-owned long transaction.
+                    # or transaction end. Reading the last row must release
+                    # it, even inside a caller-owned long transaction, which
+                    # stays open.
                     Postgres.start_transaction(conn)
                     portal_stmt = DBInterface.prepare(conn,
                         "SELECT generate_series(1, 5) AS n")
                     portal_cursor = Postgres.cursor(portal_stmt; fetchsize=2)
-                    @test length(collect(portal_cursor)) == 5
                     portal_name = portal_cursor.portal
                     @test only(DBInterface.execute(conn,
                         "SELECT count(*)::int AS n FROM pg_cursors WHERE name = \$1",
                         (portal_name,))).n == 1
-                    DBInterface.close!(portal_cursor)
+                    @test length(collect(portal_cursor)) == 5
                     @test only(DBInterface.execute(conn,
                         "SELECT count(*)::int AS n FROM pg_cursors WHERE name = \$1",
                         (portal_name,))).n == 0
+                    @test Postgres.in_transaction(conn)
+                    DBInterface.close!(portal_cursor)
                     DBInterface.close!(portal_stmt)
                     Postgres.rollback(conn)
 

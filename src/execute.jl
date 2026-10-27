@@ -287,7 +287,11 @@ _aparam(x::AbstractString)::String = string("\"", replace(x, r"([\"\\])" => s"\\
 _aparam(x::AbstractVector{UInt8})::String = _aparam(_param(x))
 _aparam(::Missing)::String = "NULL"
 _aparam(::Nothing)::String = "NULL"
-_aparam(x)::String = _param(x)
+_aparam(x::Union{Integer, AbstractFloat})::String = _param(x)
+_aparam(x::AbstractVector)::String = _param(x) # a nested dimension
+# Quote every other element's text: an interval renders with commas and
+# spaces ("1 month, 2 days"), and a Symbol can spell NULL or hold braces.
+_aparam(x)::String = _aparam(_param(x))
 function _param(x::AbstractVector)::String
     io = IOBuffer()
     write(io, '{')
@@ -364,8 +368,8 @@ end
 # stays statically resolvable under --trim
 @inline function (f::RowClosure)(k, @nospecialize(v))
     if v === nothing
-        # translate nothing -> missing for Tables.jl
-        @inbounds f.types[f.i] = Union{f.types[f.i], Missing}
+        # translate nothing -> missing for Tables.jl; building the Union allocates, so only once
+        @inbounds Missing <: f.types[f.i] || (f.types[f.i] = Union{f.types[f.i], Missing})
         @inbounds f.data[f.i] = missing
     else
         # the OID-derived column type is a default; widen the schema whenever
@@ -495,11 +499,15 @@ function fetch_portal!(cursor::Cursor)
     return
 end
 
+# After the last row, close the cursor: its own transaction would otherwise stay
+# open and take in every later statement on the connection, uncommitted.
+finish!(cursor::Cursor) = (DBInterface.close!(cursor); nothing)
+
 function Base.iterate(cursor::Cursor, state=nothing)
-    cursor.done && cursor.index > length(cursor.buffer) && return nothing
+    cursor.done && cursor.index > length(cursor.buffer) && return finish!(cursor)
     if cursor.index > length(cursor.buffer)
         fetch_portal!(cursor)
-        cursor.index > length(cursor.buffer) && cursor.done && return nothing
+        cursor.index > length(cursor.buffer) && cursor.done && return finish!(cursor)
     end
     row = cursor.buffer[cursor.index]
     cursor.index += 1
@@ -788,9 +796,11 @@ end
     Postgres.cursor(stmt, params=nothing; fetchsize=1000) -> Cursor
 
 Execute a query and stream its result rows in batches of `fetchsize` instead
-of materializing them all at once. The returned cursor iterates rows; close it
-with `DBInterface.close!(cursor)`. A cursor requires a transaction: one is
-started (and committed on close) if the connection isn't already in one.
+of materializing them all at once. The returned cursor iterates rows and closes
+itself after the last one; close a cursor you stop reading early with
+`DBInterface.close!(cursor)`. A cursor requires a transaction: one is started
+(and committed on close) if the connection isn't already in one, and until then
+every statement on the connection runs inside it.
 """
 function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize::Integer=1000, debug::Bool=false)
     owns_transaction = false

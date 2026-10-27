@@ -17,23 +17,44 @@ Base.bytesavailable(io::BufferedConn) = length(io.buffer) - io.pos + 1
 Base.eof(io::BufferedConn) = bytesavailable(io) == 0 && (io.ended || eof(io.transport))
 Base.unsafe_write(io::BufferedConn, p::Ptr{UInt8}, n::UInt) = unsafe_write(io.transport, p, n)
 
-function Base.read(io::BufferedConn, ::Type{UInt8})
-    if bytesavailable(io) > 0
-        b = io.buffer[io.pos]
-        io.pos += 1
-        return b
+# Protocol fields are read a few bytes at a time and the transports read the
+# socket on every call, so take whatever one transport read returns (up to the
+# scratch size) into the buffer. Returns false at EOF.
+function fill_buffer!(io::BufferedConn)::Bool
+    io.ended && return false
+    if io.pos > 1
+        deleteat!(io.buffer, 1:io.pos-1)
+        io.pos = 1
     end
-    io.ended && throw(EOFError())
-    return read(io.transport, UInt8)
+    n = readbytes!(io.transport, io.scratch, length(io.scratch); all=false)
+    n == 0 && (io.ended = true; return false)
+    append!(io.buffer, @view(io.scratch[1:n]))
+    return true
+end
+
+function Base.read(io::BufferedConn, ::Type{UInt8})
+    bytesavailable(io) > 0 || fill_buffer!(io) || throw(EOFError())
+    b = io.buffer[io.pos]
+    io.pos += 1
+    return b
 end
 
 function Base.unsafe_read(io::BufferedConn, p::Ptr{UInt8}, n::UInt)
-    k = min(Int(n), bytesavailable(io))
-    GC.@preserve io unsafe_copyto!(p, pointer(io.buffer, io.pos), k)
-    io.pos += k
-    if k < n
-        io.ended && throw(EOFError())
-        unsafe_read(io.transport, p + k, n - UInt(k))
+    remaining = Int(n)
+    while remaining > 0
+        if bytesavailable(io) == 0
+            # a remainder larger than the scratch buffer goes straight to `p`
+            if remaining >= length(io.scratch) && !io.ended
+                unsafe_read(io.transport, p, UInt(remaining))
+                return nothing
+            end
+            fill_buffer!(io) || throw(EOFError())
+        end
+        k = min(remaining, bytesavailable(io))
+        GC.@preserve io unsafe_copyto!(p, pointer(io.buffer, io.pos), k)
+        io.pos += k
+        p += k
+        remaining -= k
     end
     return nothing
 end
@@ -42,11 +63,21 @@ function Base.readbytes!(io::BufferedConn, buf::AbstractVector{UInt8}, nb::Integ
     n = Int(nb)
     n >= 0 || throw(ArgumentError("nb must be nonnegative"))
     length(buf) < n && resize!(buf, n)
-    k = min(n, bytesavailable(io))
-    copyto!(buf, 1, io.buffer, io.pos, k)
-    io.pos += k
-    (k == n || io.ended || (!all && k > 0)) && return k
-    return k + readbytes!(io.transport, @view(buf[k+1:n]), n-k; all)
+    total = 0
+    while total < n
+        if bytesavailable(io) == 0
+            if n - total >= length(io.scratch) && !io.ended
+                return total + readbytes!(io.transport, @view(buf[total+1:n]), n-total; all)
+            end
+            fill_buffer!(io) || break
+        end
+        k = min(n - total, bytesavailable(io))
+        copyto!(buf, total + 1, io.buffer, io.pos, k)
+        io.pos += k
+        total += k
+        all || break
+    end
+    return total
 end
 
 # Collect at most one scratch buffer per call. Partial messages stay here,
