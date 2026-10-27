@@ -20,6 +20,25 @@ execute_connection(port; reconnect=false) = Postgres.Connection(host="127.0.0.1"
 
 function test_execute_fake_server()
 @testset "unnamed execute against a scripted server" begin
+    @testset "protocol reads take buffered input" begin
+        big = fill(0x2a, 20_000) # larger than the read-ahead buffer
+        with_fake_server((sock, n) -> begin
+            send(sock, vcat(pgmsg('Z', [UInt8('I')]), pgmsg('d', big), pgmsg('Z', [UInt8('T')])))
+        end) do port, accepted
+            io = Postgres.API.BufferedConn(Postgres.API.connectsocket("127.0.0.1", port, nothing))
+            sleep(0.2) # let the whole burst reach the socket
+            @test Postgres.API.readheader(io) == (UInt8('Z'), 1)
+            # one transport read fetched more than the 5-byte header
+            @test bytesavailable(io) > 0
+            @test read(io, UInt8) == UInt8('I')
+            @test Postgres.API.readheader(io) == (UInt8('d'), length(big))
+            @test Postgres.API.readbody(io, length(big)) == big
+            @test Postgres.API.readheader(io) == (UInt8('Z'), 1)
+            @test read(io, UInt8) == UInt8('T')
+            @test_throws EOFError read(io, UInt8)
+            close(io)
+        end
+    end
     # the replies the server gets out before the connection is lost
     partial_replies = (
         "before ParseComplete" => UInt8[],

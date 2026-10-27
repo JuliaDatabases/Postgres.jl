@@ -352,8 +352,8 @@ end
 # stays statically resolvable under --trim
 @inline function (f::RowClosure)(k, @nospecialize(v))
     if v === nothing
-        # translate nothing -> missing for Tables.jl
-        @inbounds f.types[f.i] = Union{f.types[f.i], Missing}
+        # translate nothing -> missing for Tables.jl; building the Union allocates, so only once
+        @inbounds Missing <: f.types[f.i] || (f.types[f.i] = Union{f.types[f.i], Missing})
         @inbounds f.data[f.i] = missing
     else
         # the OID-derived column type is a default; widen the schema whenever
