@@ -218,6 +218,18 @@ struct Params
     params::Vector{Union{String, Missing}}
 end
 
+# Bind carries its parameter count in 16 bits, which PostgreSQL reads unsigned;
+# libpq's limit (PQ_QUERY_PARAM_MAX_LIMIT) is the same.
+const MAX_BIND_PARAMS = 65535
+
+@noinline _too_many_params(n) = throw(PostgresInterfaceError(
+    "a statement can bind at most $MAX_BIND_PARAMS parameters, but $n were given"))
+
+function bind_param_count(n::Integer)
+    n <= MAX_BIND_PARAMS || _too_many_params(n)
+    return UInt16(n)
+end
+
 msgsizeof(x::String) = sizeof(x) + 1
 msgsizeof(x::AbstractVector{UInt8}) = length(x)
 msgsizeof(x) = sizeof(x)
@@ -930,9 +942,12 @@ function readprepareddescription(socket, debug::Bool,
     try
         mt, len = read_expected(socket, debug, 't'; server_parameters=server_parameters)
         len >= 2 || close_and_throw(socket, Error("truncated ParameterDescription message from server"))
-        nparams = Int(ntoh(read(socket, Int16)))
-        nparams >= 0 || close_and_throw(socket, Error("invalid ParameterDescription count from server"))
-        len == 2 + 4nparams || close_and_throw(socket, Error("invalid ParameterDescription length from server"))
+        nparams = Int(ntoh(read(socket, UInt16)))
+        # the server truncates the count of a statement with more placeholders
+        # than a Bind message can carry, but sends every type OID
+        len == 2 + 4nparams || close_and_throw(socket, Error(len > 2 + 4MAX_BIND_PARAMS ?
+            "statement has more than $MAX_BIND_PARAMS parameters, the most a Bind message can carry" :
+            "invalid ParameterDescription length from server"))
         skipbytes!(socket, len - 2)
         mt, len = read_expected(socket, debug, 'T', 'n'; server_parameters=server_parameters)
         if mt == UInt8('n')
@@ -1179,7 +1194,7 @@ function exec(style::S, socket::BufferedConn, stmtname::String,
               server_parameters::Dict{String, String}=Dict{String, String}()) where {S <: AbstractPostgresStyle}
     #TODO: support binary format: here and in applycast
     npformats = Int16(0) # all params use text format
-    nparams = Int16(length(params))
+    nparams = bind_param_count(length(params))
     # bind, then execute, then sync
     writemessages(socket, debug, ('B', "", stmtname, npformats, nparams, Params(params), Int16(0)), ('E', "", Int32(rowlimit)), ('S',))
     waitfor(socket, debug, '2'; server_parameters=server_parameters)
@@ -1271,7 +1286,7 @@ function exec_unnamed(style::S, socket::BufferedConn, sql::String,
                       rowlimit::Int=0,
                       server_parameters::Dict{String, String}=Dict{String, String}()) where {S <: AbstractPostgresStyle}
     npformats = Int16(0)
-    nparams = Int16(length(params))
+    nparams = bind_param_count(length(params))
     writemessages(socket, debug,
         ('P', "", sql, Int16(0)),
         ('D', UInt8('S'), ""),
