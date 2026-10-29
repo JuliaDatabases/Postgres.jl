@@ -2,7 +2,7 @@ module Postgres
 
 using DBInterface, Dates, UUIDs, Parsers, Tables, StructUtils, JSON, ConcurrentUtilities, Reseau
 
-import Durations
+import Durations, DataDecimals
 
 export DBInterface
 
@@ -1100,6 +1100,7 @@ end
 Base.close(pool::ConnectionPool) = DBInterface.close!(pool)
 
 include("execute.jl")
+include("load.jl")
 
 # Transaction control statements run over the simple-query protocol: one
 # atomic message with a single ReadyForQuery, instead of the unnamed
@@ -1507,7 +1508,7 @@ end
         "Error, Notification, PostgresRange, AbstractPostgresStyle, PostgresStyle, " *
         "query_logging_enabled, query_logger, notice_callback, notification_callback, parse_dsn, " *
         "transaction, @transaction, start_transaction, commit, rollback, in_transaction, " *
-        "cursor, execute_script, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, " *
+        "cursor, execute_script, copy_from, copy_to, load!, listen!, unlisten!, notify!, wait_for_notification, " *
         "register_type!, register_enum!, register_composite!, register_range!, " *
         "command_tag, rows_affected, cancel_query!, escape_identifier, escape_literal, " *
         "get_cached_statements, clear_statement_cache!, set_statement_cache_maxsize!, " *
