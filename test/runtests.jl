@@ -2625,6 +2625,7 @@ include("trim_compile_tests.jl")
 
                 @testset "Cursor Streaming" begin
                     cur = Postgres.cursor(conn, "SELECT generate_series(1, 5) AS n"; fetchsize=2)
+                    @test cur isa DBInterface.Cursor
                     values = [row.n for row in cur]
                     @test values == [1, 2, 3, 4, 5]
                     # reading the last row committed the cursor's own transaction
