@@ -212,7 +212,10 @@ function abort_cursor_transaction!(conn::Connection)
     return
 end
 
-function DBInterface.close!(cursor::Cursor)
+DBInterface.close!(cursor::Cursor) = close_cursor!(cursor, true)
+
+# `commit=false` rolls back the transaction the cursor opened for itself.
+function close_cursor!(cursor::Cursor, commit::Bool)
     owns_transaction = cursor.owns_transaction
     owned_statement = cursor.owned_statement
     cursor.owned_statement = nothing
@@ -235,7 +238,7 @@ function DBInterface.close!(cursor::Cursor)
         # must not commit whatever transaction the caller has open now
         cursor.owns_transaction = false
         if owns_transaction
-            if closed_cleanly
+            if closed_cleanly && commit
                 # a COMMIT failure here means the caller's writes did not land,
                 # so it must propagate rather than be swallowed
                 finish_cursor_transaction!(cursor.conn)
@@ -491,10 +494,23 @@ end
 
 function fetch_portal!(cursor::Cursor)
     conn = cursor.conn
-    @lock conn.lock begin
-        checkconn(conn)
-        API.writemessages(conn.socket, conn.debug, ('E', cursor.portal, Int32(cursor.fetchsize)), ('S',))
-        read_portal_batch!(cursor)
+    try
+        @lock conn.lock begin
+            checkconn(conn)
+            API.writemessages(conn.socket, conn.debug, ('E', cursor.portal, Int32(cursor.fetchsize)), ('S',))
+            read_portal_batch!(cursor)
+        end
+    catch
+        # The failed batch's rows are gone, and a server error also leaves the
+        # transaction aborted. End the cursor, as a failed first batch does, so
+        # reading on cannot skip those rows and the connection does not stay
+        # stuck in the cursor's aborted transaction.
+        try
+            close_cursor!(cursor, false)
+        catch
+            # keep the batch error, which is the one the caller needs
+        end
+        rethrow()
     end
     return
 end
@@ -800,7 +816,8 @@ of materializing them all at once. The returned cursor iterates rows and closes
 itself after the last one; close a cursor you stop reading early with
 `DBInterface.close!(cursor)`. A cursor requires a transaction: one is started
 (and committed on close) if the connection isn't already in one, and until then
-every statement on the connection runs inside it.
+every statement on the connection runs inside it. If reading a batch fails, the
+cursor closes itself and rolls back the transaction it started.
 """
 function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize::Integer=1000, debug::Bool=false)
     owns_transaction = false

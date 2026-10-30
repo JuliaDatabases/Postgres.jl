@@ -2719,6 +2719,27 @@ include("trim_compile_tests.jl")
                     @test !Postgres.in_transaction(dead_conn)
                     @test Tables.rowtable(DBInterface.execute(dead_conn, "SELECT 1 AS a"))[1].a == 1
                     DBInterface.close!(dead_conn)
+
+                    # A batch that fails after the first one closes the cursor
+                    # and rolls back its own transaction: the connection stays
+                    # usable, even when the cursor itself is out of reach.
+                    failing_sql = "SELECT 1 / (g - 3) AS x FROM generate_series(1, 5) g"
+                    failing = Postgres.cursor(conn, failing_sql; fetchsize=1)
+                    @test_throws Postgres.Error collect(failing)
+                    @test !Postgres.in_transaction(conn)
+                    @test only(DBInterface.execute(conn, "SELECT 1 AS a")).a == 1
+                    DBInterface.close!(failing)
+                    @test_throws Postgres.Error Tables.columntable(Postgres.cursor(conn, failing_sql; fetchsize=1))
+                    @test only(DBInterface.execute(conn, "SELECT 1 AS a")).a == 1
+                    # Reading on after a failed batch must not skip its rows.
+                    undecodable = Postgres.cursor(conn,
+                        "SELECT g, CASE WHEN g = 3 THEN 'infinity'::date END AS d FROM generate_series(1, 5) g"; fetchsize=1)
+                    row, state = iterate(undecodable)
+                    row, state = iterate(undecodable, state)
+                    @test row.g == 2
+                    @test_throws Postgres.PostgresInterfaceError iterate(undecodable, state)
+                    @test iterate(undecodable) === nothing
+                    @test !Postgres.in_transaction(conn)
                 end
 
                 @testset "Notice Callback (style)" begin
