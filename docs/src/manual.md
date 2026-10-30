@@ -189,6 +189,20 @@ with parameters given as `Vector` columns of fixed-width integers and floats,
 server after each row. Other statements and inputs, custom styles, debug mode,
 and GSS-encrypted connections run one row at a time.
 
+## Loading Tables
+
+`Postgres.load!` writes any Tables.jl source (a `DataFrame`, `CSV.File`, a
+`NamedTuple` of columns, another query's result) into a table, creating the
+table from the source's column types if it does not exist. Rows are sent with
+`COPY ... FROM STDIN` in one transaction, so a failure adds no rows.
+
+```julia
+using CSV
+Postgres.load!(CSV.File("sales.csv"), conn, "sales")
+Postgres.load!((id = [1, 2], payload = ["{}", "[]"]), conn, "events"; coltypes=Dict(:payload => "jsonb"))
+CSV.File("more_sales.csv") |> Postgres.load!(conn, "sales")
+```
+
 ## Transactions
 
 Postgres.jl supports both its connection-passing helper and the DBInterface transaction API.

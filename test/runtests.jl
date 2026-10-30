@@ -517,7 +517,7 @@ include("trim_compile_tests.jl")
                 :Error, :Notification, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
                 :query_logging_enabled, :query_logger, :notice_callback, :notification_callback, :parse_dsn,
                 :transaction, Symbol("@transaction"), :start_transaction, :commit, :rollback, :in_transaction,
-                :cursor, :execute_script, :copy_from, :copy_to, :listen!, :unlisten!, :notify!, :wait_for_notification,
+                :cursor, :execute_script, :copy_from, :copy_to, :load!, :listen!, :unlisten!, :notify!, :wait_for_notification,
                 :register_type!, :register_enum!, :register_composite!, :register_range!,
                 :command_tag, :rows_affected, :cancel_query!, :escape_identifier, :escape_literal,
                 :get_cached_statements, :clear_statement_cache!, :set_statement_cache_maxsize!,
@@ -2589,6 +2589,77 @@ include("trim_compile_tests.jl")
                     @test_throws Postgres.PostgresInterfaceError Postgres.cursor(conn, "COPY copy_test FROM STDIN")
                     @test !Postgres.in_transaction(conn)
                     @test Tables.rowtable(DBInterface.execute(conn, "SELECT 4 AS a"))[1].a == 4
+                end
+
+                @testset "Load Tables" begin
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS load_test")
+                    tbl = (i16 = Int16[1, 2], i32 = Int32[3, 4], i64 = [5, 6], f = [1.5, -Inf], b = [true, false],
+                           s = ["tab\there", "line\nback\\slash \"q\" ,{}"], m = [missing, "x"],
+                           d = [Date(2024, 1, 2), Date(1999, 12, 31)],
+                           dt = [DateTime(2024, 1, 2, 3, 4, 5, 6), DateTime(2000)],
+                           ts = [Durations.Timestamp{Microsecond}(DateTime(2024, 1, 2)) + Microsecond(7),
+                                 Durations.Timestamp{Microsecond}(DateTime(2001))],
+                           u = [UUID("2b1e4c4e-9b2f-4b7a-9c1d-1c2d3e4f5a6b"), UUID(0)],
+                           amt = [DataDecimals.Decimal64{2}("12.34"), DataDecimals.Decimal64{2}("-0.01")],
+                           bytes = [UInt8[0x00, 0x5c, 0xff], UInt8[]],
+                           arr = [[1, 2], Int[]], sarr = [["a\tb", "c\\d", "e\"f"], String[]],
+                           iv = [Dates.CompoundPeriod(Month(1), Day(2)), Dates.CompoundPeriod(Second(3))])
+                    @test Postgres.load!(tbl, conn, "load_test") == "\"load_test\""
+                    coltype(table, column) = only(DBInterface.execute(conn, raw"""
+                        SELECT format_type(atttypid, atttypmod) AS t FROM pg_attribute
+                        WHERE attrelid = to_regclass($1) AND attname = $2""", (table, column))).t
+                    @test [coltype("load_test", String(k)) for k in keys(tbl)] == ["smallint", "integer", "bigint",
+                        "double precision", "boolean", "text", "text", "date", "timestamp(3) without time zone",
+                        "timestamp without time zone", "uuid", "numeric(18,2)", "bytea", "bigint[]", "text[]", "interval"]
+                    back = Tables.columntable(DBInterface.execute(conn, "SELECT * FROM load_test ORDER BY i64"))
+                    for k in keys(tbl)
+                        @test isequal(collect(back[k]), collect(tbl[k]))
+                    end
+                    # appends by default; append=false replaces; the curried form works in a pipe
+                    Postgres.load!((i64 = [7], s = ["new"]), conn, "load_test")
+                    @test only(DBInterface.execute(conn, "SELECT count(*) AS n FROM load_test")).n == 3
+                    (i64 = [8], s = ["only"]) |> Postgres.load!(conn, "load_test"; append=false)
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT i64, s FROM load_test")) == [(i64=8, s="only")]
+                    # a failing value loads nothing, and a table the call created is removed
+                    inexact = Durations.Timestamp{Nanosecond}(DateTime(2024)) + Nanosecond(1)
+                    @test_throws InexactError Postgres.load!(
+                        (i64 = [9, 10], ts = [Durations.Timestamp{Nanosecond}(DateTime(2024)), inexact]), conn, "load_test")
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT i64 FROM load_test")) == [(i64=8,)]
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS load_new")
+                    @test_throws InexactError Postgres.load!((t = [inexact],), conn, "load_new")
+                    @test only(DBInterface.execute(conn, "SELECT to_regclass('load_new') IS NULL AS gone")).gone
+                    @test !Postgres.in_transaction(conn)
+                    # rows spanning several COPY batches, with a column type override
+                    n = 60_000
+                    big = (id = collect(1:n), payload = [string(i, "-", "x"^80) for i in 1:n])
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS load_big")
+                    Postgres.load!(big, conn, "load_big"; coltypes=Dict(:payload => "varchar(100)"))
+                    totals() = Tables.rowtable(DBInterface.execute(conn,
+                        "SELECT count(*) AS n, sum(id)::bigint AS s, max(length(payload))::bigint AS l FROM load_big"))
+                    @test totals() == [(n=n, s=div(n * (n + 1), 2), l=86)]
+                    @test coltype("load_big", "payload") == "character varying(100)"
+                    # a server error in a later batch rolls back the batches already sent
+                    bad = (id = [string.(1:n); "not a number"], payload = fill("y"^80, n + 1))
+                    @test_throws Postgres.API.Error Postgres.load!(bad, conn, "load_big")
+                    @test totals() == [(n=n, s=div(n * (n + 1), 2), l=86)]
+                    @test !Postgres.in_transaction(conn)
+                    # JSON values read from the server, and JSONText, load as jsonb with their JSON text
+                    json_src = Tables.columntable(DBInterface.execute(conn, raw"""SELECT '{"a": [1, 2], "s": "é"}'::jsonb AS j"""))
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS load_json")
+                    Postgres.load!((j = json_src.j, t = [JSON.JSONText("[true, null]")]), conn, "load_json")
+                    @test [coltype("load_json", c) for c in ("j", "t")] == ["jsonb", "jsonb"]
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT j::text AS j, t::text AS t FROM load_json"))) ==
+                        (j = """{"a": [1, 2], "s": "é"}""", t = "[true, null]")
+                    DBInterface.execute(conn, "DROP TABLE load_json")
+                    # a source without a schema, and a schema-qualified name used as written
+                    DBInterface.execute(conn, "DROP SCHEMA IF EXISTS load_schema CASCADE")
+                    DBInterface.execute(conn, "CREATE SCHEMA load_schema")
+                    @test Postgres.load!(((a = i, b = "r$i") for i in 1:3), conn, "load_schema.rows"; quoteidentifiers=false) == "load_schema.rows"
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT a, b FROM load_schema.rows ORDER BY a")) ==
+                        [(a=1, b="r1"), (a=2, b="r2"), (a=3, b="r3")]
+                    @test_throws ArgumentError Postgres.load!(NamedTuple(), conn, "load_none")
+                    DBInterface.execute(conn, "DROP SCHEMA load_schema CASCADE")
+                    DBInterface.execute(conn, "DROP TABLE load_test, load_big")
                 end
 
                 @testset "Execute Script" begin
