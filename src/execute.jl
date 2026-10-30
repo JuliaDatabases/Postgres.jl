@@ -690,7 +690,7 @@ function execute_batch!(stmt::Statement, columns, row::Int, nrows::Int)
                 try
                     bind_params!(stmt.params, DBInterface.LazyIndex(columns, row), stmt.sql)
                     API._write_message_to_buffer(buf, stmt.conn.debug,
-                        ('B', "", stmt.name, Int16(0), Int16(stmt.nparams), API.Params(stmt.params), Int16(0)))
+                        ('B', "", stmt.name, Int16(0), API.bind_param_count(stmt.nparams), API.Params(stmt.params), Int16(0)))
                     API._write_message_to_buffer(buf, stmt.conn.debug, ('E', "", Int32(0)))
                 finally
                     fill!(stmt.params, missing)
@@ -789,7 +789,7 @@ function cursor(stmt::Statement, params=nothing; fetchsize::Integer=1000,
                     stmt.typeIds, types, lookup, max(1, Int(fetchsize)),
                     ResultRow[], 1, false, 0, false, owned_stmt,
                     owns_transaction)
-                API.writemessages(conn.socket, conn.debug, ('B', portal, stmt.name, Int16(0), Int16(length(stmt.params)), API.Params(stmt.params), Int16(0)), ('E', portal, Int32(cursor.fetchsize)), ('S',))
+                API.writemessages(conn.socket, conn.debug, ('B', portal, stmt.name, Int16(0), API.bind_param_count(length(stmt.params)), API.Params(stmt.params), Int16(0)), ('E', portal, Int32(cursor.fetchsize)), ('S',))
                 read_portal_batch!(cursor)
                 return cursor
             finally

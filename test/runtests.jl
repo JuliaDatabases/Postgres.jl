@@ -1302,6 +1302,16 @@ include("trim_compile_tests.jl")
                     DBInterface.close!(stmt)
                     @test_throws Postgres.PostgresInterfaceError DBInterface.execute(stmt, (1,))
                 end
+                @testset "Bind Parameter Count" begin
+                    # Bind's 16-bit parameter count is unsigned: up to 65535
+                    placeholders(n) = "SELECT array_length(ARRAY[" * join(("\$$i::int" for i in 1:n), ",") * "], 1) AS n"
+                    @test only(DBInterface.execute(conn, placeholders(40000), collect(1:40000))).n == 40000
+                    stmt = DBInterface.prepare(conn, placeholders(65535))
+                    @test only(DBInterface.execute(stmt, collect(1:65535))).n == 65535
+                    DBInterface.close!(stmt)
+                    @test_throws Postgres.PostgresInterfaceError DBInterface.execute(conn, placeholders(65536), collect(1:65536))
+                    @test only(DBInterface.execute(conn, "SELECT 1 AS a")).a == 1
+                end
                 @testset "Result Handling" begin
                     res = DBInterface.execute(conn, "SELECT 1 AS a, 2 AS b")
                     rows = Tables.rowtable(res)
