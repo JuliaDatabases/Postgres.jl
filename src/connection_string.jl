@@ -65,15 +65,15 @@ default_user() = get(ENV, "PGUSER", get(ENV, "USER", get(ENV, "USERNAME", "")))
 Why a connection string is invalid, as returned by `Postgres.validate_dsn`.
 
 - `key`: the name of the parameter that failed, or `nothing` when there is no
-  recognized parameter to name (an unknown or empty key, or a malformed URI).
-  It is always a parameter name Postgres.jl supports or accepts and ignores,
-  never text taken from a value.
+  recognized parameter to name (an unknown or empty key, a malformed URI, or
+  malformed UTF-8). It is always a parameter name Postgres.jl supports or
+  accepts and ignores, never text taken from a value.
 - `reason`: `:unknown_key`, `:invalid_value`, `:unsupported_ignored` (an
   ignored libpq parameter set to a value that cannot be safely ignored), or
-  `:malformed` (keyword-string syntax or URI errors).
+  `:malformed` (keyword-string syntax or URI errors, or malformed UTF-8 in the
+  connection string).
 - `msg`: the message `Postgres.parse_dsn` throws for the same input. Only
-  `:invalid_value` messages for integer and boolean parameters include the
-  rejected value.
+  `:invalid_value` messages can include the rejected value, escaped.
 """
 struct ConnectionParameterError <: Exception
     key::Union{String, Nothing}
@@ -146,11 +146,18 @@ const IGNORED_PARAMS = Set([
     "tcp_user_timeout", "load_balance_hosts", "replication",
 ])
 
+# lowercase throws InvalidCharError, which carries part of the input, on a
+# malformed or overlong character. Percent-decoded URI values and environment
+# variables can contain one. Surrogates and code points above U+10FFFF are not
+# valid UTF-8 either, but lowercase accepts them, so they parse as before.
+has_malformed_char(s::String) = any(c -> Base.ismalformed(c) || Base.isoverlong(c), s)
+
 function parse_bool_param(value::Union{String, Nothing}, default::Bool, key::String)
     value === nothing && return default
     # an empty value means "unset", as it does for the integer parameters
     isempty(value) && return default
-    lowered = lowercase(value)
+    # a malformed value is left as is and fails the checks below
+    lowered = has_malformed_char(value) ? value : lowercase(value)
     lowered in ("1", "on", "true", "yes") && return true
     lowered in ("0", "off", "false", "no") && return false
     return ConnectionParameterError(key, :invalid_value, "invalid value \"$(escape_string(value))\" for connection parameter \"$key\"; expected a boolean (on/off, true/false, yes/no, 1/0)")
@@ -223,6 +230,13 @@ function params_from_values(values::Dict{String, String})
     port isa ConnectionParameterError && return port
     connect_timeout = parse_optional_int(get(merged, "connect_timeout", nothing), "connect_timeout")
     connect_timeout isa ConnectionParameterError && return connect_timeout
+    # other sslmode and gssencmode values are checked when connecting, but a
+    # malformed one can never match and cannot be lowercased
+    for (key, accepted) in (("sslmode", "disable, prefer, require, verify-full"), ("gssencmode", "disable, prefer, require"))
+        value = get(merged, key, nothing)
+        (value === nothing || !has_malformed_char(value)) ||
+            return ConnectionParameterError(key, :invalid_value, "invalid value \"$(escape_string(value))\" for connection parameter \"$key\"; expected one of $accepted")
+    end
     gssdelegation = parse_bool_param(get(merged, "gssdelegation", nothing), false, "gssdelegation")
     gssdelegation isa ConnectionParameterError && return gssdelegation
     statement_timeout = parse_optional_int(get(merged, "statement_timeout", nothing), "statement_timeout")
@@ -385,6 +399,7 @@ function throw_parameter_error(result)
 end
 
 function try_parse_dsn(dsn::String)
+    has_malformed_char(dsn) && return ConnectionParameterError(nothing, :malformed, "connection string contains malformed UTF-8")
     lowered = lowercase(dsn)
     if startswith(lowered, "postgres://") || startswith(lowered, "postgresql://")
         values = parse_uri(dsn)

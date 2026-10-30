@@ -76,6 +76,14 @@ end
         ("host='unterminated", "host", :malformed),
         ("host='h'trailing", "host", :malformed),
         ("postgresql://u:p@h:notaport/db", nothing, :malformed),
+        ("host=h\xff", nothing, :malformed),
+        ("host=h password=se\xffcret", nothing, :malformed),
+        # percent-decoding can produce invalid UTF-8 from a valid string
+        ("postgresql://u@h/db?reconnect=%ff", "reconnect", :invalid_value),
+        ("postgresql://u@h/db?debug=%C3", "debug", :invalid_value),
+        ("postgresql://u@h/db?gssdelegation=%ff", "gssdelegation", :invalid_value),
+        ("postgresql://u@h/db?sslmode=%ff", "sslmode", :invalid_value),
+        ("postgresql://u@h/db?gssencmode=%C3", "gssencmode", :invalid_value),
         # the key names the parameter even when the value imitates another message
         ("host=h port='1\\\" for connection parameter \\\"password'", "port", :invalid_value),
     )
@@ -118,10 +126,35 @@ end
         end
         @test err.msg == thrown.msg
     end
+    # a malformed sslmode or gssencmode is reported where lowercase used to throw
+    for (dsn, key) in (("postgresql://u@h/db?port=abc&sslmode=%ff", "port"),
+                       ("postgresql://u@h/db?connect_timeout=x&gssencmode=%ff", "connect_timeout"),
+                       ("postgresql://u@h/db?sslmode=%ff&gssdelegation=2", "sslmode"))
+        @test Postgres.validate_dsn(dsn).key == key
+    end
+    # Windows keeps environment variables as UTF-16, so they cannot hold malformed UTF-8
+    if !Sys.iswindows()
+        withenv("PGSSLMODE" => "\xff") do
+            err = Postgres.validate_dsn("host=h")
+            @test err.key == "sslmode" && err.reason === :invalid_value
+            thrown = try
+                Postgres.parse_dsn("host=h")
+            catch e
+                e
+            end
+            @test err.msg == thrown.msg
+            @test Postgres.validate_dsn("host=h sslmode=require") === nothing
+        end
+    end
 
     @test Postgres.validate_dsn("host=h port=5433 sslmode=require reconnect=on") === nothing
     @test Postgres.validate_dsn("postgresql://u:p@h:5433/db?application_name=app") === nothing
     @test Postgres.validate_dsn("host=h channel_binding=prefer keepalives=1") === nothing
+    # only malformed UTF-8 is rejected: lowercase accepts surrogates, and passwords are bytes
+    @test Postgres.validate_dsn("host=h password=p\xed\xa0\x80") === nothing
+    @test Postgres.parse_dsn("host=h password=p\xed\xa0\x80").password == "p\xed\xa0\x80"
+    @test Postgres.parse_dsn("postgresql://u:%ff@h/db").password == "\xff"
+    @test Postgres.validate_dsn("postgresql://u@h/db?sslmode=%ed%a0%80") === nothing
     withenv("PGPORT" => nothing) do
         @test Postgres.validate_dsn(nothing) === nothing
     end
