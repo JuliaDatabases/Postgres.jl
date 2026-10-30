@@ -278,6 +278,10 @@ end
 _param(x::Missing) = x
 _param(::Nothing) = missing
 _param(x::AbstractVector{UInt8})::String = string("\\x", bytes2hex(x))
+# json/jsonb results are lazy JSON values; bind them (and raw JSONText) as
+# their JSON text, not as Julia's display of them.
+_param(x::JSON.LazyValue)::String = JSON.parse(x, JSON.JSONText).value
+_param(x::JSON.JSONText)::String = x.value
 # convert to postgres array literal syntax: { x, y, z }
 # strings must be double-quoted and double quotes and backslashes escaped
 # missing values are NULL

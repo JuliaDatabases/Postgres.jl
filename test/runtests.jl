@@ -1399,6 +1399,15 @@ include("trim_compile_tests.jl")
                     @test array_types_row.date_array == Date[Date(2024, 1, 28)]
                     @test isequal(array_types_row.numeric_array, [Postgres.API.parse_numeric("123.45"), missing])
                     @test JSON.parse(only(array_types_row.jsonb_array))["a"] == 1
+                    # JSON values read from the server bind back as their JSON text
+                    json_text = """{"n": 12345678901234567890.5, "s": "é"}"""
+                    json_value = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '$json_text'::jsonb AS j"))).j
+                    json_row = only(Tables.rowtable(DBInterface.execute(conn,
+                        raw"SELECT $1::text AS t, $2::jsonb[]::text AS a, $3::json::text AS raw",
+                        (json_value, [json_value.n, missing], JSON.JSONText("[1, 2]")))))
+                    @test json_row.t == json_text
+                    @test json_row.a == "{12345678901234567890.5,NULL}"
+                    @test json_row.raw == "[1, 2]"
                 end
 
                 @testset "Binary Array Round Trips" begin
