@@ -76,7 +76,7 @@ end
 DBInterface.getconnection(stmt::Statement) = stmt.conn
 
 # parametric on the connection's style, same rationale as Statement{S}
-mutable struct Cursor{S <: API.AbstractPostgresStyle}
+mutable struct Cursor{S <: API.AbstractPostgresStyle} <: DBInterface.Cursor
     const conn::Connection{Statement{S}, S}
     const portal::String
     const names::Vector{Symbol}
