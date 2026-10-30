@@ -212,7 +212,10 @@ function abort_cursor_transaction!(conn::Connection)
     return
 end
 
-function DBInterface.close!(cursor::Cursor)
+DBInterface.close!(cursor::Cursor) = close_cursor!(cursor, true)
+
+# `commit=false` rolls back the transaction the cursor opened for itself.
+function close_cursor!(cursor::Cursor, commit::Bool)
     owns_transaction = cursor.owns_transaction
     owned_statement = cursor.owned_statement
     cursor.owned_statement = nothing
@@ -235,7 +238,7 @@ function DBInterface.close!(cursor::Cursor)
         # must not commit whatever transaction the caller has open now
         cursor.owns_transaction = false
         if owns_transaction
-            if closed_cleanly
+            if closed_cleanly && commit
                 # a COMMIT failure here means the caller's writes did not land,
                 # so it must propagate rather than be swallowed
                 finish_cursor_transaction!(cursor.conn)
@@ -278,6 +281,10 @@ end
 _param(x::Missing) = x
 _param(::Nothing) = missing
 _param(x::AbstractVector{UInt8})::String = string("\\x", bytes2hex(x))
+# json/jsonb results are lazy JSON values; bind them (and raw JSONText) as
+# their JSON text, not as Julia's display of them.
+_param(x::JSON.LazyValue)::String = JSON.parse(x, JSON.JSONText).value
+_param(x::JSON.JSONText)::String = x.value
 # convert to postgres array literal syntax: { x, y, z }
 # strings must be double-quoted and double quotes and backslashes escaped
 # missing values are NULL
@@ -491,10 +498,23 @@ end
 
 function fetch_portal!(cursor::Cursor)
     conn = cursor.conn
-    @lock conn.lock begin
-        checkconn(conn)
-        API.writemessages(conn.socket, conn.debug, ('E', cursor.portal, Int32(cursor.fetchsize)), ('S',))
-        read_portal_batch!(cursor)
+    try
+        @lock conn.lock begin
+            checkconn(conn)
+            API.writemessages(conn.socket, conn.debug, ('E', cursor.portal, Int32(cursor.fetchsize)), ('S',))
+            read_portal_batch!(cursor)
+        end
+    catch
+        # The failed batch's rows are gone, and a server error also leaves the
+        # transaction aborted. End the cursor, as a failed first batch does, so
+        # reading on cannot skip those rows and the connection does not stay
+        # stuck in the cursor's aborted transaction.
+        try
+            close_cursor!(cursor, false)
+        catch
+            # keep the batch error, which is the one the caller needs
+        end
+        rethrow()
     end
     return
 end
@@ -674,7 +694,7 @@ function execute_batch!(stmt::Statement, columns, row::Int, nrows::Int)
                 try
                     bind_params!(stmt.params, DBInterface.LazyIndex(columns, row), stmt.sql)
                     API._write_message_to_buffer(buf, stmt.conn.debug,
-                        ('B', "", stmt.name, Int16(0), Int16(stmt.nparams), API.Params(stmt.params), Int16(0)))
+                        ('B', "", stmt.name, Int16(0), API.bind_param_count(stmt.nparams), API.Params(stmt.params), Int16(0)))
                     API._write_message_to_buffer(buf, stmt.conn.debug, ('E', "", Int32(0)))
                 finally
                     fill!(stmt.params, missing)
@@ -773,7 +793,7 @@ function cursor(stmt::Statement, params=nothing; fetchsize::Integer=1000,
                     stmt.typeIds, types, lookup, max(1, Int(fetchsize)),
                     ResultRow[], 1, false, 0, false, owned_stmt,
                     owns_transaction)
-                API.writemessages(conn.socket, conn.debug, ('B', portal, stmt.name, Int16(0), Int16(length(stmt.params)), API.Params(stmt.params), Int16(0)), ('E', portal, Int32(cursor.fetchsize)), ('S',))
+                API.writemessages(conn.socket, conn.debug, ('B', portal, stmt.name, Int16(0), API.bind_param_count(length(stmt.params)), API.Params(stmt.params), Int16(0)), ('E', portal, Int32(cursor.fetchsize)), ('S',))
                 read_portal_batch!(cursor)
                 return cursor
             finally
@@ -800,7 +820,8 @@ of materializing them all at once. The returned cursor iterates rows and closes
 itself after the last one; close a cursor you stop reading early with
 `DBInterface.close!(cursor)`. A cursor requires a transaction: one is started
 (and committed on close) if the connection isn't already in one, and until then
-every statement on the connection runs inside it.
+every statement on the connection runs inside it. If reading a batch fails, the
+cursor closes itself and rolls back the transaction it started.
 """
 function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize::Integer=1000, debug::Bool=false)
     owns_transaction = false

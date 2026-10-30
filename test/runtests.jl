@@ -1302,6 +1302,16 @@ include("trim_compile_tests.jl")
                     DBInterface.close!(stmt)
                     @test_throws Postgres.PostgresInterfaceError DBInterface.execute(stmt, (1,))
                 end
+                @testset "Bind Parameter Count" begin
+                    # Bind's 16-bit parameter count is unsigned: up to 65535
+                    placeholders(n) = "SELECT array_length(ARRAY[" * join(("\$$i::int" for i in 1:n), ",") * "], 1) AS n"
+                    @test only(DBInterface.execute(conn, placeholders(40000), collect(1:40000))).n == 40000
+                    stmt = DBInterface.prepare(conn, placeholders(65535))
+                    @test only(DBInterface.execute(stmt, collect(1:65535))).n == 65535
+                    DBInterface.close!(stmt)
+                    @test_throws Postgres.PostgresInterfaceError DBInterface.execute(conn, placeholders(65536), collect(1:65536))
+                    @test only(DBInterface.execute(conn, "SELECT 1 AS a")).a == 1
+                end
                 @testset "Result Handling" begin
                     res = DBInterface.execute(conn, "SELECT 1 AS a, 2 AS b")
                     rows = Tables.rowtable(res)
@@ -1399,6 +1409,15 @@ include("trim_compile_tests.jl")
                     @test array_types_row.date_array == Date[Date(2024, 1, 28)]
                     @test isequal(array_types_row.numeric_array, [Postgres.API.parse_numeric("123.45"), missing])
                     @test JSON.parse(only(array_types_row.jsonb_array))["a"] == 1
+                    # JSON values read from the server bind back as their JSON text
+                    json_text = """{"n": 12345678901234567890.5, "s": "é"}"""
+                    json_value = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '$json_text'::jsonb AS j"))).j
+                    json_row = only(Tables.rowtable(DBInterface.execute(conn,
+                        raw"SELECT $1::text AS t, $2::jsonb[]::text AS a, $3::json::text AS raw",
+                        (json_value, [json_value.n, missing], JSON.JSONText("[1, 2]")))))
+                    @test json_row.t == json_text
+                    @test json_row.a == "{12345678901234567890.5,NULL}"
+                    @test json_row.raw == "[1, 2]"
                 end
 
                 @testset "Binary Array Round Trips" begin
@@ -2782,6 +2801,27 @@ include("trim_compile_tests.jl")
                     @test !Postgres.in_transaction(dead_conn)
                     @test Tables.rowtable(DBInterface.execute(dead_conn, "SELECT 1 AS a"))[1].a == 1
                     DBInterface.close!(dead_conn)
+
+                    # A batch that fails after the first one closes the cursor
+                    # and rolls back its own transaction: the connection stays
+                    # usable, even when the cursor itself is out of reach.
+                    failing_sql = "SELECT 1 / (g - 3) AS x FROM generate_series(1, 5) g"
+                    failing = Postgres.cursor(conn, failing_sql; fetchsize=1)
+                    @test_throws Postgres.Error collect(failing)
+                    @test !Postgres.in_transaction(conn)
+                    @test only(DBInterface.execute(conn, "SELECT 1 AS a")).a == 1
+                    DBInterface.close!(failing)
+                    @test_throws Postgres.Error Tables.columntable(Postgres.cursor(conn, failing_sql; fetchsize=1))
+                    @test only(DBInterface.execute(conn, "SELECT 1 AS a")).a == 1
+                    # Reading on after a failed batch must not skip its rows.
+                    undecodable = Postgres.cursor(conn,
+                        "SELECT g, CASE WHEN g = 3 THEN 'infinity'::date END AS d FROM generate_series(1, 5) g"; fetchsize=1)
+                    row, state = iterate(undecodable)
+                    row, state = iterate(undecodable, state)
+                    @test row.g == 2
+                    @test_throws Postgres.PostgresInterfaceError iterate(undecodable, state)
+                    @test iterate(undecodable) === nothing
+                    @test !Postgres.in_transaction(conn)
                 end
 
                 @testset "Notice Callback (style)" begin
