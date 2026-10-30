@@ -2643,6 +2643,14 @@ include("trim_compile_tests.jl")
                     @test_throws Postgres.API.Error Postgres.load!(bad, conn, "load_big")
                     @test totals() == [(n=n, s=div(n * (n + 1), 2), l=86)]
                     @test !Postgres.in_transaction(conn)
+                    # JSON values read from the server, and JSONText, load as jsonb with their JSON text
+                    json_src = Tables.columntable(DBInterface.execute(conn, raw"""SELECT '{"a": [1, 2], "s": "é"}'::jsonb AS j"""))
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS load_json")
+                    Postgres.load!((j = json_src.j, t = [JSON.JSONText("[true, null]")]), conn, "load_json")
+                    @test [coltype("load_json", c) for c in ("j", "t")] == ["jsonb", "jsonb"]
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT j::text AS j, t::text AS t FROM load_json"))) ==
+                        (j = """{"a": [1, 2], "s": "é"}""", t = "[true, null]")
+                    DBInterface.execute(conn, "DROP TABLE load_json")
                     # a source without a schema, and a schema-qualified name used as written
                     DBInterface.execute(conn, "DROP SCHEMA IF EXISTS load_schema CASCADE")
                     DBInterface.execute(conn, "CREATE SCHEMA load_schema")

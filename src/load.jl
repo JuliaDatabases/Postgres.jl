@@ -20,6 +20,8 @@ pgtype(::Type{UUID}) = "uuid"
 pgtype(::Type{<:API.IntervalType}) = "interval"
 pgtype(::Type{<:DataDecimals.AbstractDecimal}) = "numeric"
 pgtype(::Type{D}) where {D <: DataDecimals.Decimal} = "numeric($(precision(D)), $(DataDecimals.scale(D)))"
+# JSON values (from json/jsonb columns, or JSON.JSONText); COPY sends their JSON text
+pgtype(::Type{<:Union{JSON.LazyValue, JSON.JSONText}}) = "jsonb"
 pgtype(::Type{<:AbstractVector{T}}) where {T} = string(coltype(T), "[]")
 # Everything else is sent as its parameter text (`string(x)`).
 pgtype(::Type) = "text"
@@ -68,7 +70,8 @@ If the table does not exist, it is created with one column per source column,
 typed from the source schema: integers as `smallint`/`integer`/`bigint`, floats
 as `real`/`double precision`, `Bool` as `boolean`, `Date`, `Time`, `DateTime`
 and `Timestamp`s as `date`/`time`/`timestamp`, `UUID` as `uuid`, decimals as
-`numeric(P, S)`, byte vectors as `bytea`, other vectors as arrays, and
+`numeric(P, S)`, byte vectors as `bytea`, JSON values (read from `json` or
+`jsonb` columns, or `JSON.JSONText`) as `jsonb`, other vectors as arrays, and
 everything else as `text`. `coltypes` overrides the type of a column by name,
 e.g. `coltypes=Dict(:payload => "jsonb")`. Columns are nullable. An existing
 table keeps its definition; source columns are matched to its columns by name.
