@@ -501,10 +501,10 @@ function fetch_portal!(cursor::Cursor)
             read_portal_batch!(cursor)
         end
     catch
-        # The failed batch's rows are gone, and a server error has aborted the
-        # transaction. End the cursor, as a failed first batch does, so reading
-        # on cannot skip those rows and the connection does not stay stuck in
-        # the cursor's aborted transaction.
+        # The failed batch's rows are gone, and a server error also leaves the
+        # transaction aborted. End the cursor, as a failed first batch does, so
+        # reading on cannot skip those rows and the connection does not stay
+        # stuck in the cursor's aborted transaction.
         try
             close_cursor!(cursor, false)
         catch
