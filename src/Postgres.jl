@@ -906,6 +906,19 @@ end
 function DBInterface.close!(conn::Connection)
     @lock conn.lock begin
         if !conn.closed
+            # Send Terminate first, like libpq's closePGconn (sendTerminateConn
+            # in fe-connect.c), so the server sees an orderly close rather than
+            # an unexpected EOF. Best effort: the connection may already be
+            # broken, and close must not throw. A reentrant close, from a
+            # callback inside an operation, runs while that operation still
+            # owns the stream, and an executemany writer may be blocked on the
+            # socket: only closing the socket wakes it, so skip Terminate there.
+            if conn.lock.reentrancy_cnt == 1 && isopen(conn.socket)
+                try
+                    API.writemessage(conn.socket, conn.debug, 'X')
+                catch
+                end
+            end
             close(conn.socket)
             conn.closed = true
         end
