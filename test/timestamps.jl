@@ -25,6 +25,17 @@ function test_timestamps()
         @test first(StructUtils.lift(Postgres.PostgresStyle(), Durations.Timestamp{Nanosecond}, "1970-01-01 00:00:00.000001")) === Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1000)
         # Explicit DateTime targets retain their historical millisecond floor.
         @test first(StructUtils.lift(Postgres.PostgresStyle(), DateTime, "1969-12-31 23:59:59.999999")) == DateTime(1969, 12, 31, 23, 59, 59, 999)
+        # DateTime and Date targets read timestamptz offsets, LMT-era seconds included
+        @test first(StructUtils.lift(Postgres.PostgresStyle(), DateTime, "1880-01-01 05:21:10.9999+05:21:10")) == DateTime(1880, 1, 1, 0, 0, 0, 999)
+        @test Postgres.API.parse_array("{\"2024-02-13 05:28:17+02\"}", DateTime) == [DateTime(2024, 2, 13, 3, 28, 17)]
+        @test first(StructUtils.lift(Postgres.PostgresStyle(), Date, "2024-02-13 01:28:17+02")) == Date(2024, 2, 12)
+        # malformed text, including an offset PostgreSQL never writes, stays an ArgumentError
+        for text in ("2024-02-13 05:28:17+24", "2024-02-13 05:28:17 junk", "2024-02-13 05:28")
+            @test_throws ArgumentError Postgres.API.pg_parse_timestamp(text)
+            @test_throws ArgumentError Postgres.API.pg_parse_datetime(text)
+        end
+        err = try Postgres.API.pg_parse_timestamp("2024-02-13 05:28:17+24") catch e e end
+        @test occursin("the offset is out of range", err.msg)
         @test Postgres.API.parse_array("{\"1969-12-31 23:59:59.999999\"}", MicroTimestamp) == [expected]
     end
 end
