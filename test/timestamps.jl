@@ -13,7 +13,13 @@ function test_timestamps()
         for value in (MicroTimestamp(1), MicroTimestamp(10000), typemax(MicroTimestamp))
             @test Postgres.API.pg_parse_timestamp(string(value)) === value
         end
-        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_timestamp("294276-12-31 23:59:59.999999")
+        # JSON text, such as row_to_json output, writes a `T` and `Z` or an offset
+        @test Postgres.API.pg_parse_timestamp("1969-12-31T23:59:59.999999Z") === expected
+        @test Postgres.API.pg_parse_timestamp("1969-12-31T18:38:49.999999-05:21:10") === expected
+        # past `Timestamp{Microsecond}`'s range: a range error when a coarser resolution
+        # holds the text, and the parser's own error when none does
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_timestamp("294276-12-31 23:59:59")
+        @test_throws ArgumentError Postgres.API.pg_parse_timestamp("294276-12-31 23:59:59.999999")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_timestamp(string(typemax(MicroTimestamp), "-00:00:01"))
         @test_throws InexactError Postgres._param(Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1))
         @test Postgres._param(Durations.Timestamp{Nanosecond}(1970) + Nanosecond(1000)) == "1970-01-01T00:00:00.000001Z"
@@ -29,13 +35,14 @@ function test_timestamps()
         @test first(StructUtils.lift(Postgres.PostgresStyle(), DateTime, "1880-01-01 05:21:10.9999+05:21:10")) == DateTime(1880, 1, 1, 0, 0, 0, 999)
         @test Postgres.API.parse_array("{\"2024-02-13 05:28:17+02\"}", DateTime) == [DateTime(2024, 2, 13, 3, 28, 17)]
         @test first(StructUtils.lift(Postgres.PostgresStyle(), Date, "2024-02-13 01:28:17+02")) == Date(2024, 2, 12)
-        # malformed text, including an offset PostgreSQL never writes, stays an ArgumentError
-        for text in ("2024-02-13 05:28:17+24", "2024-02-13 05:28:17 junk", "2024-02-13 05:28")
+        # text the ISO DateStyle never writes, including an out-of-range offset
+        for text in ("2024-02-13 05:28:17+24", "2024-02-13 05:28:17 junk", "2024-02-13x05:28:17")
             @test_throws ArgumentError Postgres.API.pg_parse_timestamp(text)
             @test_throws ArgumentError Postgres.API.pg_parse_datetime(text)
         end
-        err = try Postgres.API.pg_parse_timestamp("2024-02-13 05:28:17+24") catch e e end
-        @test occursin("the offset is out of range", err.msg)
+        # past `Timestamp{Microsecond}`'s range, DateTime fields read at milliseconds
+        @test first(StructUtils.lift(Postgres.PostgresStyle(), DateTime, "294276-12-31 23:59:59.999+00")) ==
+              DateTime(294276, 12, 31, 23, 59, 59, 999)
         @test Postgres.API.parse_array("{\"1969-12-31 23:59:59.999999\"}", MicroTimestamp) == [expected]
     end
 end

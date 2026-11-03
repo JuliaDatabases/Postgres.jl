@@ -258,7 +258,7 @@ end
 # generic Dates machinery and — decisive under `juliac --trim` — fully static:
 # Parsers' dateformat path iterates a type-erased Vector{AbstractDateToken},
 # which is dynamic dispatch per token. Timestamps, which add an optional UTC
-# offset, go through `Durations.iso2timestamp` instead.
+# offset, go through `Durations.ZonedTimestamp` instead.
 @inline _pg_digit(b::UInt8)::Int = Int(b - UInt8('0'))
 @inline _pg_isdigit(b::UInt8)::Bool = UInt8('0') <= b <= UInt8('9')
 
@@ -357,39 +357,65 @@ end
     return
 end
 
-# timestamp(tz) text into a DateTime field: the UTC time, floored to milliseconds
+# The ISO DateStyle text of timestamp and timestamptz values. A timestamptz value
+# ends with its UTC offset, which `Durations.ZonedTimestamp` reads after this.
+const PG_TIMESTAMP_FORMAT = Dates.DateFormat("yyyy-mm-dd HH:MM:SS.n")
+
+# timestamp(tz) text into a DateTime field: the UTC time, floored to milliseconds.
+# `Timestamp{Microsecond}`'s range ends in year 294247, before PostgreSQL's; past it,
+# text with no digits finer than a millisecond reads as `Timestamp{Millisecond}`.
 function pg_parse_datetime(s::AbstractString)::DateTime
-    _check_temporal_special(s, "timestamp")
-    return DateTime(Durations.iso2timestamp(Durations.Timestamp{Dates.Millisecond}, s, RoundDown))
+    try
+        return DateTime(pg_parse_timestamp(s, Durations.Timestamp{Dates.Microsecond}))
+    catch e
+        e isa PostgresInterfaceError || rethrow()
+        return DateTime(pg_parse_timestamp(s, Durations.Timestamp{Dates.Millisecond}))
+    end
 end
 
 pg_parse_timestamp(s::AbstractString) = pg_parse_timestamp(s, PGTimestamp)
 pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp}) = pg_parse_timestamp(s, Durations.Timestamp{Dates.Nanosecond})
 
-# `iso2timestamp` throws ArgumentError both for malformed text and for a valid
-# timestamp that `Timestamp{P}` cannot hold. Parsing again with digits finer
-# than the resolution dropped tells them apart: a value that then fits raises
-# InexactError, and one that fits only `Timestamp{Second}` is out of range.
+# The UTC time: timestamptz text carries an offset, and timestamp text, which has
+# none, reads as UTC.
 function pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp{P}}) where {P}
     _check_temporal_special(s, "timestamp")
     try
-        return Durations.iso2timestamp(Durations.Timestamp{P}, s)
+        return _pg_utc_timestamp(Durations.Timestamp{P}, s)
     catch e
-        e isa ArgumentError || rethrow()
-        _parses_rounded_down(Durations.Timestamp{P}, s) && throw(InexactError(:pg_parse_timestamp, Durations.Timestamp{P}, s))
-        _parses_rounded_down(Durations.Timestamp{Dates.Second}, s) &&
-            throw(PostgresInterfaceError("postgres timestamp is outside the range of Durations.Timestamp{$P}; select it as text or request a wider-range Timestamp resolution"))
-        rethrow()
+        # An OverflowError means the offset moved the UTC time out of range. For an
+        # ArgumentError, reading again at a resolution that holds the value tells digits
+        # finer than `P` from a time outside its range: PostgreSQL writes at most six
+        # fraction digits, and a coarser resolution reaches further. Text that no
+        # resolution reads keeps the parser's error.
+        if e isa ArgumentError
+            if _pg_reads(Durations.Timestamp{Dates.Microsecond}, s)
+                P in (Dates.Second, Dates.Millisecond) && throw(InexactError(:pg_parse_timestamp, Durations.Timestamp{P}, s))
+            elseif _pg_reads(Durations.Timestamp{Dates.Millisecond}, s)
+                P === Dates.Second && throw(InexactError(:pg_parse_timestamp, Durations.Timestamp{P}, s))
+            else
+                rethrow()
+            end
+        elseif !(e isa OverflowError)
+            rethrow()
+        end
+        throw(PostgresInterfaceError("postgres timestamp is outside the range of Durations.Timestamp{$P}; select it as text or request a wider-range Timestamp resolution"))
     end
 end
 
-# Whether `s` reads as a `T` once digits finer than its resolution are dropped.
-function _parses_rounded_down(::Type{T}, s::AbstractString) where {T}
+function _pg_utc_timestamp(::Type{Durations.Timestamp{P}}, s::AbstractString) where {P}
+    # JSON text, such as `row_to_json` output, writes a `T` between the date and the time
+    zt = UInt8('T') in codeunits(s) ? Durations.ZonedTimestamp{P,:UTC}(s, Durations.ISOTimestampFormat) :
+        Durations.ZonedTimestamp{P,:UTC}(s, PG_TIMESTAMP_FORMAT)
+    return Durations.Timestamp{P}(zt, Dates.UTC)
+end
+
+function _pg_reads(::Type{T}, s::AbstractString) where {T}
     try
-        Durations.iso2timestamp(T, s, RoundDown)
+        _pg_utc_timestamp(T, s)
         return true
     catch e
-        e isa ArgumentError || rethrow()
+        e isa ArgumentError || e isa OverflowError || rethrow()
         return false
     end
 end
