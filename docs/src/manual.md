@@ -26,6 +26,19 @@ conn = DBInterface.connect(
 )
 ```
 
+An invalid connection string throws an `ArgumentError`. To check one without
+connecting or catching, use `Postgres.validate_dsn`. It returns `nothing`, or a
+`Postgres.ConnectionParameterError` whose `reason` is `:unknown_key`,
+`:invalid_value`, `:unsupported_ignored`, or `:malformed`, and whose `key` names
+the parameter (or is `nothing` when there is none to name).
+
+```julia
+err = Postgres.validate_dsn("host=127.0.0.1 port=abc")
+if err !== nothing && err.reason === :invalid_value
+    println("invalid value for ", err.key)   # invalid value for port
+end
+```
+
 Session defaults such as the schema search path are set with libpq's `options`
 keyword (or the `PGOPTIONS` environment variable). The value is sent to the
 server in the startup packet, so it also applies after an automatic reconnect.
