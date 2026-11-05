@@ -278,6 +278,10 @@ Postgres.cancel_query!(conn)
 
 The running query raises a `Postgres.Error` with PostgreSQL SQLSTATE `57014`.
 
+The request carries only the backend pid and cancel key, so it also works on a
+connection that an `InterruptException` closed mid-query. That connection cannot
+be reused, but its statement keeps running on the server until it is cancelled.
+
 ## LISTEN And NOTIFY
 
 Use one connection to listen and another to notify.
