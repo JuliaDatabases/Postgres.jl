@@ -2859,6 +2859,25 @@ include("trim_compile_tests.jl")
                     @test result.code == "57014"
                     DBInterface.close!(cancel_conn)
 
+                    # an interrupt mid-statement closes the socket but leaves the
+                    # statement running; the cancel still reaches it with the pid
+                    # and key the connection holds
+                    interrupted = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+                    pid = interrupted.pid
+                    task = @async connect_err(() -> DBInterface.execute(interrupted, "SELECT pg_sleep(30)"))
+                    started = timedwait(5.0; pollint=0.05) do
+                        only(DBInterface.execute(conn, "SELECT count(*) AS n FROM pg_stat_activity WHERE pid = $pid AND state = 'active'")).n == 1
+                    end
+                    @test started === :ok
+                    schedule(task, InterruptException(); error=true)
+                    @test fetch(task) isa InterruptException
+                    @test !isopen(interrupted)
+                    Postgres.cancel_query!(interrupted)
+                    stopped = timedwait(10.0; pollint=0.05) do
+                        only(DBInterface.execute(conn, "SELECT count(*) AS n FROM pg_stat_activity WHERE pid = $pid AND state = 'active'")).n == 0
+                    end
+                    @test stopped === :ok
+
                     # the cancel key must never go out in the clear when the
                     # connection it cancels required TLS; the refusal is a
                     # thrown error, not a silent no-op (this server has no SSL,
