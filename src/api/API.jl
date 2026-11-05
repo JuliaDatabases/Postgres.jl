@@ -1,7 +1,7 @@
 module API
 
 using UUIDs, Dates, Reseau, SASLAuth, MD5, Parsers, StructUtils, JSON, Random
-import ..PostgresInterfaceError
+import ..PostgresInterfaceError, ..SSLMODES, ..GSSENCMODES
 
 import Durations, DataDecimals
 
@@ -758,8 +758,13 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
     sslcapath_v = sslcapath::Union{String, Nothing}
     sslservername_v = sslservername::Union{String, Nothing}
     statement_timeout_v = statement_timeout::Union{Int, Nothing}
+    # The public constructors reject invalid modes with an ArgumentError before
+    # getting here, so these checks are a backstop for direct callers. They run
+    # before any dial, so no negotiation path (GSS included) skips either one.
     gssencmode_str = gssencmode === nothing ? "disable" : lowercase(gssencmode::String)
-    gssencmode_str == "disable" || gssencmode_str == "prefer" || gssencmode_str == "require" || throw(Error("invalid gssencmode: $gssencmode_str"))
+    gssencmode_str in GSSENCMODES || throw(Error("invalid gssencmode: $gssencmode_str"))
+    sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(sslmode_v::String)
+    sslmode_str in SSLMODES || throw(Error("invalid sslmode: $sslmode_str"))
     krbsrvname_str = krbsrvname === nothing ? "postgres" : krbsrvname::String
     # GSS encryption is only attempted when initiator credentials (a ticket)
     # can be acquired; `require` without them fails before any dial, as in libpq
@@ -813,8 +818,8 @@ function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbnam
     sslcapath_v = sslcapath::Union{String, Nothing}
     sslservername_v = sslservername::Union{String, Nothing}
     statement_timeout_v = statement_timeout::Union{Int, Nothing}
+    # validated by connect
     sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(String(sslmode_v))
-    sslmode_str == "disable" || sslmode_str == "prefer" || sslmode_str == "require" || sslmode_str == "verify-full" || throw(Error("invalid sslmode: $sslmode_str"))
     if sslmode_str != "disable"
         # send SSLRequest
         writemessage(socket, debug, '\0', Int32(80877103))
@@ -1649,6 +1654,10 @@ function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug:
     tls_required = sslmode_str == "require" || sslmode_str == "verify-full"
     gssencmode_str = gssencmode === nothing ? "disable" : lowercase(gssencmode::String)
     gss_required = gssencmode_str == "require"
+    # a backstop, as in connect: an unknown mode would fall through to the
+    # branches that may send the cancel key in cleartext
+    gssencmode_str in GSSENCMODES || throw(Error("invalid gssencmode: $gssencmode_str"))
+    sslmode_str in SSLMODES || throw(Error("invalid sslmode: $sslmode_str"))
     krbsrvname_str = krbsrvname === nothing ? "postgres" : krbsrvname::String
     socket = connectsocket(host, port, connect_timeout_v)
     stream = socket

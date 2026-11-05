@@ -698,7 +698,7 @@ include("trim_compile_tests.jl")
         # an unexpanded ${PGSSLMODE} meant to be verify-full must fail loudly
         # rather than fall back to the unauthenticated default
         withenv("PGSSLMODE" => "") do
-            @test Postgres.parse_dsn("host=h").sslmode == ""
+            @test_throws ArgumentError Postgres.parse_dsn("host=h")
         end
 
         withenv(

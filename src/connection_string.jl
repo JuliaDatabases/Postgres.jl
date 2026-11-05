@@ -1,6 +1,7 @@
 module ConnectionString
 
 using URIs
+import ..SSLMODES, ..GSSENCMODES
 
 """
     Postgres.ConnectionParams(; host="localhost", port=5432, user="", password=nothing,
@@ -17,7 +18,10 @@ arguments mirror the connection keywords: `application_name`, `options`,
 `sslservername`, `gssencmode`, `krbsrvname`, `gssdelegation`,
 `statement_timeout`, `statement_cache_maxsize`, `debug`, and `reconnect`. `numeric_overflow` accepts `:warn` (return out-of-range numeric
 values as text with a warning) or `:error` (throw). DSN strings use `warn` or
-`error` without the colon.
+`error` without the colon. `sslmode` accepts `disable`, `prefer`, `require`, or
+`verify-full`, and `gssencmode` accepts `disable`, `prefer`, or `require`, in
+any letter case; any other value throws an `ArgumentError` here rather than
+when connecting.
 """
 struct ConnectionParams
     host::String
@@ -46,6 +50,10 @@ end
 
 function ConnectionParams(; host::String="localhost", port::Int=5432, user::String="", password::Union{String, Nothing}=nothing, dbname::String="", application_name::Union{String, Nothing}=nothing, options::Union{String, Nothing}=nothing, connect_timeout::Union{Int, Nothing}=nothing, sslmode::Union{String, Nothing}=nothing, sslrootcert::Union{String, Nothing}=nothing, sslcert::Union{String, Nothing}=nothing, sslkey::Union{String, Nothing}=nothing, sslcapath::Union{String, Nothing}=nothing, sslservername::Union{String, Nothing}=nothing, gssencmode::Union{String, Nothing}=nothing, krbsrvname::Union{String, Nothing}=nothing, gssdelegation::Bool=false, statement_timeout::Union{Int, Nothing}=nothing, statement_cache_maxsize::Int=100, debug::Bool=false, reconnect::Bool=false, numeric_overflow::Symbol=:warn)
     numeric_overflow in (:warn, :error) || throw(ArgumentError("numeric_overflow must be :warn or :error"))
+    err = check_mode("sslmode", sslmode, SSLMODES)
+    err === nothing || throw(ArgumentError(err.msg))
+    err = check_mode("gssencmode", gssencmode, GSSENCMODES)
+    err === nothing || throw(ArgumentError(err.msg))
     return ConnectionParams(host, port, user, password, dbname, application_name, options, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, sslservername, gssencmode, krbsrvname, gssdelegation, statement_timeout, statement_cache_maxsize, debug, reconnect, numeric_overflow)
 end
 
@@ -152,6 +160,14 @@ const IGNORED_PARAMS = Set([
 # valid UTF-8 either, but lowercase accepts them, so they parse as before.
 has_malformed_char(s::String) = any(c -> Base.ismalformed(c) || Base.isoverlong(c), s)
 
+# sslmode and gssencmode are case-insensitive, as in libpq. A malformed value
+# can never match and cannot be lowercased.
+function check_mode(key::String, value::Union{String, Nothing}, accepted::Tuple{Vararg{String}})
+    value === nothing && return nothing
+    !has_malformed_char(value) && lowercase(value) in accepted && return nothing
+    return ConnectionParameterError(key, :invalid_value, "invalid value \"$(escape_string(value))\" for connection parameter \"$key\"; expected one of $(join(accepted, ", "))")
+end
+
 function parse_bool_param(value::Union{String, Nothing}, default::Bool, key::String)
     value === nothing && return default
     # an empty value means "unset", as it does for the integer parameters
@@ -230,13 +246,10 @@ function params_from_values(values::Dict{String, String})
     port isa ConnectionParameterError && return port
     connect_timeout = parse_optional_int(get(merged, "connect_timeout", nothing), "connect_timeout")
     connect_timeout isa ConnectionParameterError && return connect_timeout
-    # other sslmode and gssencmode values are checked when connecting, but a
-    # malformed one can never match and cannot be lowercased
-    for (key, accepted) in (("sslmode", "disable, prefer, require, verify-full"), ("gssencmode", "disable, prefer, require"))
-        value = get(merged, key, nothing)
-        (value === nothing || !has_malformed_char(value)) ||
-            return ConnectionParameterError(key, :invalid_value, "invalid value \"$(escape_string(value))\" for connection parameter \"$key\"; expected one of $accepted")
-    end
+    err = check_mode("sslmode", get(merged, "sslmode", nothing), SSLMODES)
+    err === nothing || return err
+    err = check_mode("gssencmode", get(merged, "gssencmode", nothing), GSSENCMODES)
+    err === nothing || return err
     gssdelegation = parse_bool_param(get(merged, "gssdelegation", nothing), false, "gssdelegation")
     gssdelegation isa ConnectionParameterError && return gssdelegation
     statement_timeout = parse_optional_int(get(merged, "statement_timeout", nothing), "statement_timeout")
@@ -368,6 +381,12 @@ PostgreSQL URI (`"postgresql://user:pass@host:5432/dbname"`) into
 to the `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`,
 `PGCONNECT_TIMEOUT`, `PGSSL*`, `PGGSSENCMODE`, `PGKRBSRVNAME`, and
 `PGGSSDELEGATION` environment variables, then to defaults.
+
+An invalid value throws an `ArgumentError`. This includes an `sslmode` or
+`gssencmode` that is not one of the accepted values, compared
+case-insensitively, also when it comes from `PGSSLMODE` or `PGGSSENCMODE`:
+`invalid value "verfy-full" for connection parameter "sslmode"; expected one of
+disable, prefer, require, verify-full`.
 
 Invalid URI syntax is reported as `ArgumentError` without retaining the
 underlying parser's input-bearing exception. To find out which parameter is
