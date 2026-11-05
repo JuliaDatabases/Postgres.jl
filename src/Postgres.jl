@@ -834,7 +834,9 @@ The request carries only the backend pid and cancel key, which `conn` keeps
 after its socket closes. So it also cancels the statement of a connection an
 `InterruptException` closed mid-query: the socket is closed because the
 stream position is unknown, but the statement keeps running on the server
-until it is cancelled.
+until it finishes or is cancelled. Cancel before using `conn` again: with
+`reconnect=true`, the next use opens a new session, and a later cancel goes to
+that session instead.
 """
 function cancel_query!(conn::Connection)
     # Read without the lock: cancel_query! is called precisely when another
