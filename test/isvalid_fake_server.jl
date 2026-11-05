@@ -1,8 +1,8 @@
 # isvalid against a scripted server: message shapes a live PostgreSQL cannot be
 # made to produce on demand (a notice or parameter change while idle, a warning
 # followed by a bare close as on immediate shutdown, protocol garbage, a
-# truncated message, a close with no bytes). Reuses the fake-server helpers
-# from gssapi.jl.
+# truncated message, a close with no bytes), and the Terminate message sent
+# by close. Reuses the fake-server helpers from gssapi.jl.
 
 struct RecordingStyle <: Postgres.API.AbstractPostgresStyle
     notices::Vector{Any}
@@ -11,6 +11,12 @@ end
 RecordingStyle() = RecordingStyle(Any[], Postgres.API.Notification[])
 Postgres.API.notice_callback(s::RecordingStyle, notice) = (push!(s.notices, notice); nothing)
 Postgres.API.notification_callback(s::RecordingStyle, n) = (push!(s.notifications, n); nothing)
+
+# closes the connection from inside the notice callback
+struct ClosingStyle <: Postgres.API.AbstractPostgresStyle
+    conn::Ref{Any}
+end
+Postgres.API.notice_callback(s::ClosingStyle, notice) = (close(s.conn[]); nothing)
 
 fields_msg(code::Char, pairs::Pair{Char, String}...) =
     pgmsg(code, vcat([vcat(UInt8(k), Vector{UInt8}(v), 0x00) for (k, v) in pairs]..., 0x00))
@@ -82,6 +88,51 @@ function test_isvalid_fake_server()
             conn = fake_connection(port, style)
             @test timedwait(() -> !Postgres.isvalid(conn), 5.0) === :ok
             @test !isopen(conn)
+        end
+    end
+
+    @testset "close sends Terminate" begin
+        received = Tuple{Char, Vector{UInt8}}[]
+        with_fake_server(serve_idle(sock -> begin
+            push!(received, read_message(sock))
+            eof(sock) || error("fake server: bytes after Terminate")
+        end)) do port, accepted
+            conn = fake_connection(port, RecordingStyle())
+            close(conn)
+            @test !isopen(conn)
+            close(conn) # closing again is a no-op
+            @test timedwait(() -> !isempty(received), 5.0) === :ok
+            @test received == [('X', UInt8[])]
+        end
+    end
+
+    @testset "close does not throw when Terminate cannot be written" begin
+        with_fake_server(serve_idle(sock -> begin
+            eof(sock) || error("fake server: bytes after a failed Terminate")
+        end)) do port, accepted
+            conn = fake_connection(port, RecordingStyle())
+            # a write deadline in the past makes the Terminate write fail
+            Postgres.Reseau.TCP.set_write_deadline!(conn.socket.transport, 1)
+            @test close(conn) === nothing
+            @test !isopen(conn)
+        end
+    end
+
+    @testset "close from a callback inside an operation sends no Terminate" begin
+        received = UInt8[]
+        done = Ref(false)
+        with_fake_server(serve_idle(sock -> begin
+            send(sock, notice_msg("WARNING", "01000", "close from the callback"))
+            while !eof(sock); push!(received, read(sock, UInt8)); end
+            done[] = true
+        end)) do port, accepted
+            style = ClosingStyle(Ref{Any}(nothing))
+            conn = fake_connection(port, style)
+            style.conn[] = conn
+            # isvalid runs the notice callback while it holds the connection lock
+            @test timedwait(() -> (Postgres.isvalid(conn); !isopen(conn)), 5.0) === :ok
+            @test timedwait(() -> done[], 5.0) === :ok
+            @test isempty(received)
         end
     end
 
