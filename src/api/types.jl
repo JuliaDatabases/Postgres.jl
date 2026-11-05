@@ -252,37 +252,23 @@ function register_type!(registry::Dict{Int, TypeInfo}, oid::Integer, julia_type:
     return registry
 end
 
-@inline function tzoffset_seconds(offset::AbstractString)
-    isempty(offset) && return 0
-    sign = offset[1] == '-' ? -1 : 1
-    digits = replace(String(offset[2:end]), ":" => "")
-    isempty(digits) && return 0
-    hours = parse(Int, digits[1:2])
-    mins = length(digits) >= 4 ? parse(Int, digits[3:4]) : 0
-    # pre-standardization (LMT-era) timestamps in named zones carry a seconds
-    # field ("+05:21:10"); dropping it silently shifts the decoded value
-    secs = length(digits) >= 6 ? parse(Int, digits[5:6]) : 0
-    return sign * (hours * 3600 + mins * 60 + secs)
-end
-
 # ── hand-rolled postgres text-format date/time parsing ──────────────────────
-# The wire formats are fixed-layout ("YYYY-MM-DD", "HH:MM:SS[.ffffff]",
-# "YYYY-MM-DD HH:MM:SS[.ffffff][±TZ]"), so direct digit extraction is both faster
-# than the generic Dates machinery and — decisive under `juliac --trim` — fully
-# static: Parsers' dateformat path iterates a type-erased Vector{AbstractDateToken},
-# which is dynamic dispatch per token. Time supports nanoseconds; DateTime supports only milliseconds. Keep the
-# fraction until the target type is known.
+# The `date` and `time` wire formats are fixed-layout ("YYYY-MM-DD",
+# "HH:MM:SS[.ffffff]"), so direct digit extraction is both faster than the
+# generic Dates machinery and — decisive under `juliac --trim` — fully static:
+# Parsers' dateformat path iterates a type-erased Vector{AbstractDateToken},
+# which is dynamic dispatch per token. Timestamps, which add an optional UTC
+# offset, go through `Durations.ZonedTimestamp` instead.
 @inline _pg_digit(b::UInt8)::Int = Int(b - UInt8('0'))
 @inline _pg_isdigit(b::UInt8)::Bool = UInt8('0') <= b <= UInt8('9')
 
 # The year is normally 4 digits but PostgreSQL emits more beyond year 9999, so
-# scan it rather than assuming a fixed width. Returns the date and the offset
-# just past it. The digit-count bound and separator checks matter: an ISO year
-# is zero-padded to at least 4 digits, so accepting fewer would silently
-# mis-decode other DateStyle renderings ("03-04-2020" is Postgres-style for
-# 2020-03-04, not year 3), and an unbounded scan would overflow Int on
-# adversarial input.
-@inline function _pg_date_at_end(c, o::Int)
+# scan it rather than assuming a fixed width. The digit-count bound and
+# separator checks matter: an ISO year is zero-padded to at least 4 digits, so
+# accepting fewer would silently mis-decode other DateStyle renderings
+# ("03-04-2020" is Postgres-style for 2020-03-04, not year 3), and an unbounded
+# scan would overflow Int on adversarial input.
+@inline function _pg_date_at(c, o::Int)::Date
     y = 0
     i = o
     n = length(c)
@@ -297,10 +283,8 @@ end
         throw(ArgumentError("invalid postgres date"))
     m = _pg_digit(c[i+1]) * 10 + _pg_digit(c[i+2])
     d = _pg_digit(c[i+4]) * 10 + _pg_digit(c[i+5])
-    return Date(y, m, d), i + 6
+    return Date(y, m, d)
 end
-
-@inline _pg_date_at(c, o::Int)::Date = first(_pg_date_at_end(c, o))
 
 @inline function _pg_hms_at(c, o::Int)
     h = _pg_digit(c[o]) * 10 + _pg_digit(c[o+1])
@@ -373,42 +357,71 @@ end
     return
 end
 
+# The ISO DateStyle text of timestamp and timestamptz values. A timestamptz value
+# ends with its UTC offset, which `Durations.ZonedTimestamp` reads after this.
+const PG_TIMESTAMP_FORMAT = Dates.DateFormat("yyyy-mm-dd HH:MM:SS.n")
+
+# timestamp(tz) text into a DateTime field: the UTC time, floored to milliseconds.
+# `Timestamp{Microsecond}`'s range ends in year 294247, before PostgreSQL's; past it,
+# text with no digits finer than a millisecond reads as `Timestamp{Millisecond}`.
 function pg_parse_datetime(s::AbstractString)::DateTime
-    c = codeunits(s)
-    _check_temporal_special(s, "timestamp")
-    length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
-    # the time starts one space past the date, whose year may be wider than 4
-    d, after_date = _pg_date_at_end(c, 1)
-    h, mi, se, ns = _pg_hms_at(c, after_date + 1)
-    return DateTime(Dates.year(d), Dates.month(d), Dates.day(d), h, mi, se, ns ÷ 1_000_000)
+    try
+        return DateTime(pg_parse_timestamp(s, Durations.Timestamp{Dates.Microsecond}))
+    catch e
+        e isa PostgresInterfaceError || rethrow()
+        return DateTime(pg_parse_timestamp(s, Durations.Timestamp{Dates.Millisecond}))
+    end
 end
 
-# Decode in wide Unix-epoch ticks so both timezone adjustment and the final
-# range check happen before narrowing. Timestamp arithmetic itself wraps at
-# Int64 limits, and a local time can be outside the range while UTC fits.
 pg_parse_timestamp(s::AbstractString) = pg_parse_timestamp(s, PGTimestamp)
 pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp}) = pg_parse_timestamp(s, Durations.Timestamp{Dates.Nanosecond})
 
+# The UTC time: timestamptz text carries an offset, and timestamp text, which has
+# none, reads as UTC.
 function pg_parse_timestamp(s::AbstractString, ::Type{Durations.Timestamp{P}}) where {P}
     _check_temporal_special(s, "timestamp")
-    c = codeunits(s)
-    length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
-    d, after_date = _pg_date_at_end(c, 1)
-    h, mi, se, ns = _pg_hms_at(c, after_date + 1)
-    Time(h, mi, se) # validate the clock fields
-    offset_at = findnext(ch -> ch == '+' || ch == '-', s, after_date + 1)
-    offset = offset_at === nothing ? 0 : tzoffset_seconds(SubString(s, offset_at))
-    days = Int128(Dates.value(d)) - Dates.value(Date(1970, 1, 1))
-    nanoseconds = days * 86_400_000_000_000 + (h * 3600 + mi * 60 + se - offset) * Int128(1_000_000_000) + ns
-    ticks, remainder = divrem(nanoseconds, Dates.value(convert(Dates.Nanosecond, P(1))))
-    iszero(remainder) || throw(InexactError(:pg_parse_timestamp, Durations.Timestamp{P}, s))
-    typemin(Int64) <= ticks <= typemax(Int64) ||
+    try
+        return _pg_utc_timestamp(Durations.Timestamp{P}, s)
+    catch e
+        # An OverflowError means the offset moved the UTC time out of range. For an
+        # ArgumentError, reading again at a resolution that holds the value tells digits
+        # finer than `P` from a time outside its range: PostgreSQL writes at most six
+        # fraction digits, and a coarser resolution reaches further. Text that no
+        # resolution reads keeps the parser's error.
+        if e isa ArgumentError
+            if _pg_reads(Durations.Timestamp{Dates.Microsecond}, s)
+                P in (Dates.Second, Dates.Millisecond) && throw(InexactError(:pg_parse_timestamp, Durations.Timestamp{P}, s))
+            elseif _pg_reads(Durations.Timestamp{Dates.Millisecond}, s)
+                P === Dates.Second && throw(InexactError(:pg_parse_timestamp, Durations.Timestamp{P}, s))
+            else
+                rethrow()
+            end
+        elseif !(e isa OverflowError)
+            rethrow()
+        end
         throw(PostgresInterfaceError("postgres timestamp is outside the range of Durations.Timestamp{$P}; select it as text or request a wider-range Timestamp resolution"))
-    return Durations.Timestamp{P}(Dates.UTInstant(P(Int64(ticks))))
+    end
+end
+
+function _pg_utc_timestamp(::Type{Durations.Timestamp{P}}, s::AbstractString) where {P}
+    # JSON text, such as `row_to_json` output, writes a `T` between the date and the time
+    zt = UInt8('T') in codeunits(s) ? Durations.ZonedTimestamp{P,:UTC}(s, Durations.ISOTimestampFormat) :
+        Durations.ZonedTimestamp{P,:UTC}(s, PG_TIMESTAMP_FORMAT)
+    return Durations.Timestamp{P}(zt, Dates.UTC)
+end
+
+function _pg_reads(::Type{T}, s::AbstractString) where {T}
+    try
+        _pg_utc_timestamp(T, s)
+        return true
+    catch e
+        e isa ArgumentError || e isa OverflowError || rethrow()
+        return false
+    end
 end
 
 # timestamp(tz) column into a Date field: the UTC date, as for DateTime fields
-pg_parse_date_any(s::AbstractString)::Date = occursin(':', s) ? Date(pg_parse_datetime_any(s)) : pg_parse_date(s)
+pg_parse_date_any(s::AbstractString)::Date = occursin(':', s) ? Date(pg_parse_datetime(s)) : pg_parse_date(s)
 
 # timestamp(tz) column into a Time field: the UTC time of day
 function pg_parse_time_any(s::AbstractString)::Time
@@ -431,46 +444,6 @@ function pg_parse_integer(::Type{T}, s::AbstractString) where {T <: Integer}
     end
     wide === nothing && return Parsers.parse(T, s)
     return convert(T, wide)
-end
-
-# timestamptz column into a DateTime field: sniff a trailing offset/Z
-function pg_parse_datetime_any(s::AbstractString)::DateTime
-    isempty(s) && throw(ArgumentError("invalid postgres timestamp"))
-    ch = s[end]
-    if ch == 'Z' || (length(s) >= 20 && (any(isequal('+'), SubString(s, 20)) || any(isequal('-'), SubString(s, 20))))
-        return parse_timestamptz(String(s))
-    end
-    return pg_parse_datetime(s)
-end
-
-@inline function parse_timestamptz(val::String)
-    lastindex(val) == 0 && throw(ArgumentError("invalid postgres timestamptz"))
-    # timestamptz output puts " BC" after the zone offset, so the check inside
-    # pg_parse_datetime (which sees only the offset-stripped prefix) can't
-    # catch it; check the full value here
-    _check_temporal_special(val, "timestamp")
-    if val[end] == 'Z'
-        ts = SubString(val, 1, prevind(val, lastindex(val)))
-        return pg_parse_datetime(ts)
-    end
-    space_idx = findfirst(isequal(' '), val)
-    space_idx === nothing && return pg_parse_datetime(val)
-    offset_idx = nothing
-    i = lastindex(val)
-    while i > space_idx
-        c = val[i]
-        if c == '+' || c == '-'
-            offset_idx = i
-            break
-        end
-        i = prevind(val, i)
-    end
-    offset_idx === nothing && return pg_parse_datetime(val)
-    ts = SubString(val, 1, prevind(val, offset_idx))
-    dt = pg_parse_datetime(ts)
-    offset = SubString(val, offset_idx)
-    seconds = tzoffset_seconds(offset)
-    return dt - Dates.Second(seconds)
 end
 
 function parse_numeric(val::String, on_overflow::Symbol=:warn)::NumericValue
@@ -940,9 +913,6 @@ function parse_value(typeId::Int, val::Union{String, FieldBytes}, registry::Dict
     elseif T == PGTimestamp
         return pg_parse_timestamp(val)
     elseif T == DateTime
-        if typeId == 1184
-            return parse_timestamptz(val)
-        end
         return pg_parse_datetime(val)
     elseif T == UUID
         return UUID(val)
@@ -1076,7 +1046,7 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Float32}, s::String) = Parsers.
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Float64}, s::String) = Parsers.parse(Float64, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Date}, s::String) = pg_parse_date_any(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Time}, s::String) = pg_parse_time_any(s), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{DateTime}, s::String) = pg_parse_datetime_any(s), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{DateTime}, s::String) = pg_parse_datetime(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{UUID}, s::String) = UUID(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{IntervalType}, s::String) = parse_interval(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{UInt8}}, s::String) = decode_bytea(s), nothing
