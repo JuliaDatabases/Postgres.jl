@@ -88,6 +88,39 @@ function test_execute_fake_server()
         end
     end
 
+    @testset "cancel after an interrupt closed the socket" begin
+        # An InterruptException that lands mid-statement closes the socket (the
+        # stream position is unknown) and leaves the statement running on the
+        # server. The cancel needs only the pid and key the connection holds.
+        segment_read = Base.Event()
+        cancels = Tuple{Int32, Int32, Int32}[]
+        handler = function (sock, n)
+            if n == 1
+                serve_idle(sock -> begin
+                    read_unnamed_segment(sock)
+                    notify(segment_read)
+                    drain(sock)
+                end)(sock, n)
+            else
+                code, body = read_request(sock)
+                push!(cancels, (code, rd32(body[1:4]), rd32(body[5:8])))
+            end
+        end
+        with_fake_server(handler) do port, accepted
+            conn = execute_connection(port)
+            task = @async connect_err(() -> DBInterface.execute(conn, "SELECT pg_sleep(60)"))
+            wait(segment_read)
+            schedule(task, InterruptException(); error=true)
+            @test fetch(task) isa InterruptException
+            @test !isopen(conn)
+            Postgres.cancel_query!(conn)
+            @test timedwait(() -> !isempty(cancels), 5.0) === :ok
+            # the pid and key the fake server sent in BackendKeyData
+            @test cancels == [(CANCEL_REQUEST, Int32(4242), Int32(777))]
+            @test accepted[] == 2
+        end
+    end
+
     @testset "a server error before ParseComplete keeps the connection" begin
         with_fake_server(serve_idle(sock -> begin
             read_unnamed_segment(sock)

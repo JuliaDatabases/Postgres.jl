@@ -829,28 +829,26 @@ the cancel key it carries is a credential: if `conn` itself is on TLS or
 GSSAPI encryption, the cancel connection requires the same. Throws a `PostgresInterfaceError` if the cancel
 request could not be delivered (rather than failing silently, which would
 leave the query running).
+
+The request carries only the backend pid and cancel key, which `conn` keeps
+after its socket closes. So it also cancels the statement of a connection an
+`InterruptException` closed mid-query: the socket is closed because the
+stream position is unknown, but the statement keeps running on the server
+until it finishes or is cancelled. Cancel before using `conn` again: with
+`reconnect=true`, the next use opens a new session, and a later cancel goes to
+that session instead.
 """
 function cancel_query!(conn::Connection)
+    # Read without the lock: cancel_query! is called precisely when another
+    # task holds it running the query being cancelled, and the socket state
+    # does not matter, since the request goes over its own connection.
     host = conn.host
     port = conn.port
     pid = conn.pid
     skey = conn.skey
     debug = conn.debug
-    # Checked outside the lock deliberately: cancel_query! is called precisely
-    # when another task holds it running the query being cancelled, so a
-    # trylock-guarded check would be skipped in the case that matters. Reading
-    # the socket field unlocked matches how host/pid/skey are read below.
     sslmode = cancel_sslmode(conn.socket.transport isa Reseau.TLS.Conn, conn.sslmode)
     gssencmode = cancel_gssencmode(conn.socket.transport isa API.GSSConn, conn.gssencmode)
-    if trylock(conn.lock)
-        try
-            !isopen(conn.socket) && throw(PostgresInterfaceError("cannot cancel query: connection not open"))
-            pid = conn.pid
-            skey = conn.skey
-        finally
-            unlock(conn.lock)
-        end
-    end
     ok = API.cancel_request(host, port, pid, skey, debug, sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.connect_timeout, gssencmode, conn.krbsrvname, conn.gssdelegation, conn.style)
     ok || throw(PostgresInterfaceError("failed to deliver the cancel request to $(host):$(port)"))
     return conn
