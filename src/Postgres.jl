@@ -21,6 +21,12 @@ Base.showerror(io::IO, e::PostgresInterfaceError) = print(io, e.msg)
 
 @noinline _reject_nul(what::String) = throw(PostgresInterfaceError("$what cannot contain a NUL byte"))
 
+# The values accepted for sslmode and gssencmode, compared case-insensitively.
+# The connection-string parser, the constructors, and the connect and cancel
+# paths all read these, so the lists cannot drift apart.
+const SSLMODES = ("disable", "prefer", "require", "verify-full")
+const GSSENCMODES = ("disable", "prefer", "require")
+
 include("api/API.jl")
 using .API
 include("connection_string.jl")
@@ -82,6 +88,9 @@ Supported keyword arguments. All are also available as DSN/URI options except
   forwards the ticket to the server (default `false`). Kerberos comes from the
   operating system library (`kinit` tickets, `krb5.conf`), with no bundled
   Kerberos; see the support policy.
+- `sslmode` and `gssencmode` values are case-insensitive. Any other value
+  throws an `ArgumentError` when the connection is constructed, before
+  connecting, with the message `Postgres.parse_dsn` gives for it.
 - `statement_cache_maxsize`: LRU backend cache size for explicit named prepared
   statements (default 100; `0` disables)
 - `reconnect`: automatically reconnect and re-prepare statements if the
@@ -180,6 +189,12 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         krbsrvname_val !== nothing && occursin('\0', krbsrvname_val) && _reject_nul("krbsrvname")
         xor(sslcert_val === nothing, sslkey_val === nothing) &&
             throw(PostgresInterfaceError("sslcert and sslkey must be provided together"))
+        # checked here, not only when connecting, so that no negotiation path
+        # can skip the check and the error matches parse_dsn's
+        err = ConnectionString.check_mode("sslmode", sslmode_val, SSLMODES)
+        err === nothing || throw(ArgumentError(err.msg))
+        err = ConnectionString.check_mode("gssencmode", gssencmode_val, GSSENCMODES)
+        err === nothing || throw(ArgumentError(err.msg))
         maxsize = max(0, Int(statement_cache_maxsize))
         socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, options_val, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, gssencmode_val, krbsrvname_val, gssdelegation, style)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)

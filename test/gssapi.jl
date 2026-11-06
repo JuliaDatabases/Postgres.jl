@@ -388,7 +388,119 @@ function test_gssapi_protocol()
             @test accepted[] == 1
             @test isempty(style.contexts)
         end
-        @test_throws Postgres.Error Postgres.Connection(host="127.0.0.1", port=1, user="u", gssencmode="bogus", style=style)
+        @test_throws ArgumentError Postgres.Connection(host="127.0.0.1", port=1, user="u", gssencmode="bogus", style=style)
+    end
+
+    @testset "every sslmode and gssencmode value is accepted, in any case" begin
+        # a server without TLS: disable and prefer connect, while require and
+        # verify-full get past validation and fail on its 'N'
+        handler = function (sock, n)
+            len = rd32(readn(sock, 4))
+            body = readn(sock, len - 4)
+            if rd32(body) == SSL_REQUEST
+                send(sock, [UInt8('N')])
+                read_startup(sock)
+            end
+            ready!(sock)
+            drain(sock)
+        end
+        style = FakeGSSStyle(false)
+        with_fake_server(handler) do port, accepted
+            for mode in ("disable", "prefer", "require", "verify-full"), sslmode in (mode, uppercase(mode), titlecase(mode)),
+                    gssencmode in (nothing, "disable", "Prefer", "PREFER")
+                err = connect_err() do
+                    close(Postgres.Connection(host="127.0.0.1", port=port, user="u", sslmode=sslmode, gssencmode=gssencmode, style=style))
+                end
+                if mode in ("disable", "prefer")
+                    @test err === nothing
+                else
+                    @test err isa Postgres.Error && err.message == "server does not support SSL"
+                end
+            end
+            for gssencmode in ("require", "Require", "REQUIRE")
+                err = connect_err(() -> Postgres.Connection(host="127.0.0.1", port=port, user="u", gssencmode=gssencmode, style=style))
+                @test err isa Postgres.Error && err.message == "GSSAPI encryption required but no credential cache"
+            end
+        end
+    end
+
+    @testset "an invalid sslmode is refused before GSS encryption is negotiated" begin
+        # this server accepts GSS encryption, so before sslmode was checked up
+        # front, gssencmode=require with an invalid sslmode connected
+        style = FakeGSSStyle()
+        handler = function (sock, n)
+            code, _ = read_request(sock)
+            code == GSSENC_REQUEST || error("expected GSSENCRequest, got $code")
+            send(sock, [UInt8('G')])
+            io = server_handshake(sock)
+            read_startup(io)
+            ready!(io)
+            drain(io)
+        end
+        with_fake_server(handler) do port, accepted
+            for (gssencmode, sslmode) in (("require", "bogus"), ("Prefer", "verify-ful"))
+                err = connect_err(() -> Postgres.Connection(host="127.0.0.1", port=port, user="u", gssencmode=gssencmode, sslmode=sslmode, style=style))
+                @test err isa ArgumentError
+                @test err.msg == "invalid value \"$sslmode\" for connection parameter \"sslmode\"; expected one of disable, prefer, require, verify-full"
+                # the connect path checks too, before any dial, for direct callers
+                err = connect_err(() -> Postgres.API.connect("127.0.0.1", port, "db", "u", nothing, false, nothing, nothing, nothing, sslmode,
+                                                             nothing, nothing, nothing, nothing, nothing, nothing, gssencmode, nothing, false, style))
+                @test err isa Postgres.Error && err.message == "invalid sslmode: $(lowercase(sslmode))"
+            end
+            err = connect_err(() -> DBInterface.connect(Postgres.Connection, "postgresql://u@127.0.0.1:$port/db?gssencmode=require&sslmode=bogus"; style=style))
+            @test err isa ArgumentError
+            @test accepted[] == 0
+            @test isempty(style.contexts)
+            # with a valid sslmode, the same configuration connects over GSS
+            conn = Postgres.Connection(host="127.0.0.1", port=port, user="u", gssencmode="require", sslmode="Verify-Full", style=style)
+            @test conn.socket.transport isa Postgres.API.GSSConn
+            close(conn)
+        end
+    end
+
+    @testset "cancel_request accepts every sslmode and gssencmode value, in any case" begin
+        cancels = Ref(0)
+        handler = function (sock, n)
+            code, _ = read_request(sock)
+            if code == SSL_REQUEST
+                send(sock, [UInt8('N')])
+                code, _ = read_request(sock)
+            elseif code == GSSENC_REQUEST
+                send(sock, [UInt8('G')])
+                code, _ = read_request(server_handshake(sock))
+            end
+            code == CANCEL_REQUEST || error("expected CancelRequest, got $code")
+            cancels[] += 1
+        end
+        style = FakeGSSStyle()
+        with_fake_server(handler) do port, accepted
+            expected = 0
+            for mode in ("disable", "prefer", "require", "verify-full"), sslmode in (mode, uppercase(mode), titlecase(mode))
+                if mode in ("disable", "prefer")
+                    @test Postgres.API.cancel_request("127.0.0.1", port, Int32(1), Int32(1), false, sslmode)
+                    expected += 1
+                else
+                    # a server without TLS: the cancel key is not sent in cleartext
+                    err = connect_err(() -> Postgres.API.cancel_request("127.0.0.1", port, Int32(1), Int32(1), false, sslmode))
+                    @test err isa Postgres.PostgresInterfaceError && startswith(err.msg, "server refused TLS on the cancel connection")
+                end
+            end
+            for gssencmode in ("disable", "Disable", "prefer", "PREFER", "require", "Require")
+                @test Postgres.API.cancel_request("127.0.0.1", port, Int32(1), Int32(1), false, nothing, nothing, nothing, nothing,
+                                                  nothing, nothing, nothing, gssencmode, nothing, false, style)
+                expected += 1
+            end
+            @test timedwait(() -> cancels[] == expected, 5.0) === :ok
+            @test count(ctx -> ctx.encrypt, style.contexts) == 4
+            # an invalid mode is refused before any dial
+            dialed = accepted[]
+            err = connect_err(() -> Postgres.API.cancel_request("127.0.0.1", port, Int32(1), Int32(1), false, "bogus"))
+            @test err isa Postgres.Error && err.message == "invalid sslmode: bogus"
+            err = connect_err(() -> Postgres.API.cancel_request("127.0.0.1", port, Int32(1), Int32(1), false, nothing, nothing, nothing, nothing,
+                                                                nothing, nothing, nothing, "bogus", nothing, false, style))
+            @test err isa Postgres.Error && err.message == "invalid gssencmode: bogus"
+            @test accepted[] == dialed
+        end
     end
 
     @testset "GSSAPI authentication (codes 7, 8, 9)" begin
