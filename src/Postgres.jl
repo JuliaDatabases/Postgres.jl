@@ -66,7 +66,9 @@ Supported keyword arguments. All are also available as DSN/URI options except
   libpq's `options` (for example `"-c search_path=myschema"` to set the default
   schema). Sent in the startup packet, so it also applies after an automatic
   reconnect. Defaults to `PGOPTIONS` when built from a DSN.
-- `connect_timeout` (seconds), `statement_timeout` (milliseconds)
+- `connect_timeout` (seconds): bounds each connection attempt, from the TCP
+  connection through authentication and session setup, as one deadline
+- `statement_timeout` (milliseconds)
 - `sslmode` (`"disable"`, `"prefer"` (default), `"require"`, `"verify-full"`),
   `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`, and `sslservername`.
   Only `verify-full` verifies the server's certificate; `require` encrypts

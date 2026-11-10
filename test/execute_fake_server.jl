@@ -25,7 +25,7 @@ function test_execute_fake_server()
         with_fake_server((sock, n) -> begin
             send(sock, vcat(pgmsg('Z', [UInt8('I')]), pgmsg('d', big), pgmsg('Z', [UInt8('T')])))
         end) do port, accepted
-            io = Postgres.API.BufferedConn(Postgres.API.connectsocket("127.0.0.1", port, nothing))
+            io = Postgres.API.BufferedConn(Postgres.API.connectsocket("127.0.0.1", port, Int64(0)))
             sleep(0.2) # let the whole burst reach the socket
             @test Postgres.API.readheader(io) == (UInt8('Z'), 1)
             # one transport read fetched more than the 5-byte header

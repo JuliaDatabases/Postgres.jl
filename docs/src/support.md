@@ -16,9 +16,13 @@ is not supported.
 Client certificates require both `sslcert` and `sslkey` and use TLS 1.2.
 Server-only TLS connections can negotiate TLS 1.2 or TLS 1.3.
 
-`connect_timeout` bounds the TCP connection and TLS handshake. It does not
-bound PostgreSQL authentication or query execution. Use `statement_timeout`
-for query execution on a direct or session-pooled connection.
+`connect_timeout` bounds each connection attempt as a whole, as in libpq: the
+TCP connection, GSS or TLS negotiation, authentication, and session setup
+share one deadline. A host name that resolves to several addresses is dialed
+within that one deadline. An attempt that runs out of time throws
+`Postgres.Error` with "timeout expired". The timeout also applies to
+reconnects and to `cancel_query!`. It does not bound query execution; use
+`statement_timeout` for that on a direct or session-pooled connection.
 
 Keep a manual transaction or streaming cursor on the task that created it.
 Do not run unrelated operations on that connection until the scope ends. Use

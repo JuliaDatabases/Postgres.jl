@@ -666,9 +666,6 @@ function authRequest(debug, len, socket, user, ::Nothing, host::String, krbsrvna
     end
 end
 
-connectsocket(host::AbstractString, port::Integer; connect_timeout::Union{Int, Nothing}=nothing) =
-    connectsocket(host, port, connect_timeout)
-
 # `host:port` for Reseau, with IPv6 literals bracketed (`[::1]:5432`) so the
 # address parser doesn't reject the extra colons
 function hostport_address(host::AbstractString, port::Integer)
@@ -678,14 +675,40 @@ function hostport_address(host::AbstractString, port::Integer)
     return occursin(':', h) ? string("[", h, "]:", Int(port)) : string(h, ":", Int(port))
 end
 
-function connectsocket(host::AbstractString, port::Integer, @nospecialize(connect_timeout::Union{Int, Nothing}))
+# The deadline of one connection attempt, as an absolute `time_ns()` instant:
+# `connect_timeout` seconds from now, or 0 (none) when it is unset, zero or
+# negative, as in libpq.
+function connect_deadline(connect_timeout::Union{Int, Nothing})
+    (connect_timeout === nothing || connect_timeout <= 0) && return Int64(0)
+    return Int64(time_ns()) + min(Int64(connect_timeout), Int64(9_000_000_000)) * 1_000_000_000
+end
+
+# A dial, read or write cut off by the attempt's deadline. The dial reports it
+# inside an OpError, and TLS reports it as the cause of a TLSError.
+function is_timeout(err)
+    err isa Reseau.IOPoll.DeadlineExceededError && return true
+    err isa Reseau.HostResolvers.DialTimeoutError && return true
+    err isa Reseau.TLS.TLSError && return err.cause isa Reseau.IOPoll.DeadlineExceededError
+    err isa Reseau.HostResolvers.OpError || return false
+    return err.err isa Reseau.HostResolvers.DialTimeoutError || err.err isa Reseau.IOPoll.DeadlineExceededError
+end
+
+timeout_error(address::String) = Error("timeout expired while connecting to $address")
+
+# Dials within the attempt's `deadline` (0 for none) and leaves it on the socket
+# as the read and write deadline, so the GSS or TLS negotiation, startup and
+# authentication that follow share the same window.
+function connectsocket(host::AbstractString, port::Integer, deadline::Int64)
     address = hostport_address(host, port)
-    return if connect_timeout === nothing
-        Reseau.TCP.connect(address)
-    else
-        timeout_ns = Int64(connect_timeout) * 1_000_000_000
-        Reseau.TCP.connect(address; timeout_ns)
+    deadline == 0 && return Reseau.TCP.connect(address)
+    socket = try
+        Reseau.TCP.connect(address; deadline_ns=deadline)
+    catch err
+        is_timeout(err) && throw(timeout_error(address))
+        rethrow()
     end
+    Reseau.TCP.set_deadline!(socket, deadline)
+    return socket
 end
 
 function tlsupgrade(
@@ -773,32 +796,40 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
         gssencmode_str == "require" && throw(Error("GSSAPI encryption required but no credential cache"))
         try_gss = false
     end
-    if try_gss
-        socket = connectsocket(host, port, connect_timeout_v)
-        gss_used = true
-        try
-            gss = gss_encrypt(socket, style, host, krbsrvname_str, gssdelegation, debug)
-            gss !== nothing && return _startup!(gss, debug, user, dbname, password_v, application_name_v, options_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
-            gssencmode_str == "require" && throw(Error("server doesn't support GSSAPI encryption, but it was required"))
-            # 'N': nothing was consumed beyond the one byte, so continue on
-            # this connection with TLS or plaintext, as libpq does
-            gss_used = false
-            return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, options_v, connect_timeout_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
-        catch err
-            close(socket)
-            (gss_used && gssencmode_str == "prefer") || rethrow()
-            debug && @info "GSSAPI encryption attempt failed; retrying without it" exception=(err, catch_backtrace())
-        end
-    end
-    socket = connectsocket(host, port, connect_timeout_v)
-    # Any failure from here on must close the socket: nothing else holds a
-    # reference to it, and the transport has no finalizer, so an escaping
-    # exception would leak the descriptor for the life of the process —
-    # a pool or reconnect loop against a flapping server would hit EMFILE.
+    # One deadline bounds the whole attempt, the GSS fallback's second dial
+    # included, as libpq's connect_timeout does for one server address.
+    deadline = connect_deadline(connect_timeout_v)
     try
-        return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, options_v, connect_timeout_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
-    catch
-        close(socket)
+        if try_gss
+            socket = connectsocket(host, port, deadline)
+            gss_used = true
+            try
+                gss = gss_encrypt(socket, style, host, krbsrvname_str, gssdelegation, debug)
+                gss !== nothing && return _startup!(gss, debug, user, dbname, password_v, application_name_v, options_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+                gssencmode_str == "require" && throw(Error("server doesn't support GSSAPI encryption, but it was required"))
+                # 'N': nothing was consumed beyond the one byte, so continue on
+                # this connection with TLS or plaintext, as libpq does
+                gss_used = false
+                return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, options_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+            catch err
+                close(socket)
+                (gss_used && gssencmode_str == "prefer") || rethrow()
+                debug && @info "GSSAPI encryption attempt failed; retrying without it" exception=(err, catch_backtrace())
+            end
+        end
+        socket = connectsocket(host, port, deadline)
+        # Any failure from here on must close the socket: nothing else holds a
+        # reference to it, and the transport has no finalizer, so an escaping
+        # exception would leak the descriptor for the life of the process —
+        # a pool or reconnect loop against a flapping server would hit EMFILE.
+        try
+            return _connect_tls!(socket, debug, user, dbname, password_v, application_name_v, options_v, sslmode_v, sslrootcert_v, sslcert_v, sslkey_v, sslcapath_v, sslservername_v, statement_timeout_v, host, krbsrvname_str, gssdelegation, style)
+        catch
+            close(socket)
+            rethrow()
+        end
+    catch err
+        is_timeout(err) && throw(timeout_error(hostport_address(host, port)))
         rethrow()
     end
 end
@@ -806,11 +837,10 @@ end
 # SSLRequest per `sslmode`, then the startup exchange on whichever transport
 # resulted. Each branch calls `_startup!` on a concrete socket type, so the
 # calls resolve statically.
-function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbname::String, @nospecialize(password::Union{String, Nothing}), @nospecialize(application_name::Union{String, Nothing}), @nospecialize(options::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle)
+function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbname::String, @nospecialize(password::Union{String, Nothing}), @nospecialize(application_name::Union{String, Nothing}), @nospecialize(options::Union{String, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}), host::String, krbsrvname::String, gssdelegation::Bool, style::AbstractPostgresStyle)
     password_v = password::Union{String, Nothing}
     application_name_v = application_name::Union{String, Nothing}
     options_v = options::Union{String, Nothing}
-    connect_timeout_v = connect_timeout::Union{Int, Nothing}
     sslmode_v = sslmode::Union{String, Nothing}
     sslrootcert_v = sslrootcert::Union{String, Nothing}
     sslcert_v = sslcert::Union{String, Nothing}
@@ -825,8 +855,9 @@ function _connect_tls!(socket::Reseau.TCP.Conn, debug::Bool, user::String, dbnam
         writemessage(socket, debug, '\0', Int32(80877103))
         mt = read(socket, UInt8)
         if mt == UInt8('S')
-            # upgrade socket to tls and do handshake
-            tls = tlsupgrade(socket, connect_timeout_v,
+            # upgrade socket to tls and do handshake; the socket's connect
+            # deadline bounds it
+            tls = tlsupgrade(socket, nothing,
                              sslservername_v isa String ? sslservername_v : host,
                              sslmode_str == "verify-full",
                              sslcert_v, sslkey_v, sslrootcert_v, sslcapath_v)
@@ -867,6 +898,8 @@ function _startup!(socket, debug::Bool, user::String, dbname::String, @nospecial
         close_and_throw(socket, Error("server did not confirm UTF8 client_encoding"))
     buffered = BufferedConn(socket)
     align_session_formats!(buffered, server_params, debug, statement_timeout_v)
+    # Established: lift the connect deadline so it cannot cut off a later statement.
+    Reseau.TCP.set_deadline!(socket isa Reseau.TCP.Conn ? socket : socket.tcp, 0)
     return buffered, pid, skey, server_params
 end
 
@@ -1659,7 +1692,7 @@ function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug:
     gssencmode_str in GSSENCMODES || throw(Error("invalid gssencmode: $gssencmode_str"))
     sslmode_str in SSLMODES || throw(Error("invalid sslmode: $sslmode_str"))
     krbsrvname_str = krbsrvname === nothing ? "postgres" : krbsrvname::String
-    socket = connectsocket(host, port, connect_timeout_v)
+    socket = connectsocket(host, port, connect_deadline(connect_timeout_v))
     stream = socket
     refused = nothing
     sent = false
@@ -1677,7 +1710,7 @@ function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug:
             writemessage(socket, debug, '\0', Int32(80877103))
             mt = read(socket, UInt8)
             if mt == UInt8('S')
-                stream = tlsupgrade(socket, connect_timeout_v,
+                stream = tlsupgrade(socket, nothing,
                                     sslservername isa String ? sslservername::String : host,
                                     sslmode_str == "verify-full",
                                     sslcert::Union{String, Nothing}, sslkey::Union{String, Nothing},
