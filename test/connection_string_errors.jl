@@ -113,7 +113,7 @@ end
     @test Postgres.validate_dsn("host=h numeric_overflow=ignore").msg == thrown.msg
 
     # values are checked in the order parse_dsn reports them
-    invalid = ["port=abc", "connect_timeout=x", "gssdelegation=2", "statement_timeout=x",
+    invalid = ["port=abc", "connect_timeout=x", "sslmode=bogus", "gssencmode=bogus", "gssdelegation=2", "statement_timeout=x",
                "statement_cache_maxsize=x", "debug=maybe", "reconnect=ture", "numeric_overflow=ignore"]
     for i in eachindex(invalid)
         dsn = join(["host=h"; invalid[i:end]], " ")
@@ -154,7 +154,6 @@ end
     @test Postgres.validate_dsn("host=h password=p\xed\xa0\x80") === nothing
     @test Postgres.parse_dsn("host=h password=p\xed\xa0\x80").password == "p\xed\xa0\x80"
     @test Postgres.parse_dsn("postgresql://u:%ff@h/db").password == "\xff"
-    @test Postgres.validate_dsn("postgresql://u@h/db?sslmode=%ed%a0%80") === nothing
     withenv("PGPORT" => nothing) do
         @test Postgres.validate_dsn(nothing) === nothing
     end
@@ -180,4 +179,71 @@ end
         @test err.reason === :unsupported_ignored
         @test !occursin("top-secret", sprint(showerror, err))
     end
+end
+
+@testset "sslmode and gssencmode values" begin
+    for (key, accepted, envkey) in (("sslmode", ("disable", "prefer", "require", "verify-full"), "PGSSLMODE"),
+                                    ("gssencmode", ("disable", "prefer", "require"), "PGGSSENCMODE"))
+        field = Symbol(key)
+        # every value, in any case, from every source; parse_dsn stores it lowercased
+        for mode in accepted, value in (mode, uppercase(mode), titlecase(mode))
+            @test getfield(Postgres.parse_dsn("host=h $key=$value"), field) == mode
+            @test getfield(Postgres.parse_dsn("postgresql://u@h/db?$key=$value"), field) == mode
+            @test Postgres.validate_dsn("host=h $key=$value") === nothing
+            withenv(envkey => value) do
+                @test getfield(Postgres.parse_dsn("host=h"), field) == mode
+            end
+            @test getfield(Postgres.ConnectionParams(; field => value), field) == value
+        end
+
+        # anything else is rejected when parsing or constructing, not when connecting
+        rejected = [("bogus", "bogus"), ("verfy-full", "verfy-full"), ("", ""),
+                    ("require ", "require%20"), ("\xed\xa0\x80", "%ed%a0%80")]
+        for (value, encoded) in rejected
+            msg = "invalid value \"$(escape_string(value))\" for connection parameter \"$key\"; expected one of $(join(accepted, ", "))"
+            check = function (dsn)
+                err = Postgres.validate_dsn(dsn)
+                @test err isa Postgres.ConnectionParameterError
+                err isa Postgres.ConnectionParameterError || return
+                @test err.key == key
+                @test err.reason === :invalid_value
+                @test err.msg == msg
+                thrown = try
+                    Postgres.parse_dsn(dsn)
+                catch e
+                    e
+                end
+                @test thrown isa ArgumentError && thrown.msg == msg
+            end
+            check("host=h $key='$value'")
+            check("postgresql://u@h/db?$key=$encoded")
+            # an unexpanded ${PGSSLMODE} must fail loudly rather than fall back to the
+            # default. Windows keeps environment variables as UTF-16, so they cannot
+            # hold a lone surrogate.
+            if isvalid(value) || !Sys.iswindows()
+                withenv(() -> check("host=h"), envkey => value)
+            end
+            for construct in (() -> Postgres.ConnectionParams(; field => value),
+                              # port 1: a dial would fail with a Postgres.Error instead
+                              () -> Postgres.Connection(; host="127.0.0.1", port=1, field => value))
+                thrown = try
+                    construct()
+                catch e
+                    e
+                end
+                @test thrown isa ArgumentError && thrown.msg == msg
+            end
+        end
+    end
+
+    # the Connection constructor's other checks still come first
+    @test_throws Postgres.PostgresInterfaceError Postgres.Connection(host="a\0b", port=1, sslmode="bogus")
+    @test_throws Postgres.PostgresInterfaceError Postgres.Connection(host="127.0.0.1", port=1, sslcert="c.pem", gssencmode="bogus")
+
+    # the parser, the constructors, and the connect and cancel paths read one
+    # list: no other site in src may spell the values out again
+    srcdir = joinpath(pkgdir(Postgres), "src")
+    code = join((read(joinpath(dir, f), String) for (dir, _, files) in walkdir(srcdir) for f in files if endswith(f, ".jl")), "\n")
+    @test count(r"\"disable\", \"prefer\", \"require\"", code) == 2
+    @test !occursin(r"(== \"(disable|prefer|require|verify-full)\"\s*\|\|\s*\w+\s*){2}", code)
 end
