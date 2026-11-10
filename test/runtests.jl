@@ -903,9 +903,9 @@ include("trim_compile_tests.jl")
         # decoding them as AD would be silent corruption
         @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_date("0044-03-15 BC")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_datetime("0044-03-15 12:00:00 BC")
-        # timestamptz puts " BC" after the zone offset, past where the
-        # offset-stripped datetime parse can see it
-        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_timestamptz("0044-03-15 12:00:00+00 BC")
+        # timestamptz puts " BC" after the zone offset
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_datetime("0044-03-15 12:00:00+00 BC")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_timestamp("0044-03-15 12:00:00+00 BC")
         # years beyond 9999 widen the year field rather than misparsing
         @test Postgres.API.pg_parse_date("10000-01-01") == Date(10000, 1, 1)
         @test Postgres.API.pg_parse_datetime("294276-12-31 23:59:59") == DateTime(294276, 12, 31, 23, 59, 59)
