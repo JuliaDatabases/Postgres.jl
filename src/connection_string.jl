@@ -160,8 +160,9 @@ const IGNORED_PARAMS = Set([
 # valid UTF-8 either, but lowercase accepts them, so they parse as before.
 has_malformed_char(s::String) = any(c -> Base.ismalformed(c) || Base.isoverlong(c), s)
 
-# sslmode and gssencmode are case-insensitive, as in libpq. A malformed value
-# can never match and cannot be lowercased.
+# Postgres.jl compares sslmode and gssencmode case-insensitively; libpq
+# compares them exactly. A malformed value can never match and cannot be
+# lowercased.
 function check_mode(key::String, value::Union{String, Nothing}, accepted::Tuple{Vararg{String}})
     value === nothing && return nothing
     !has_malformed_char(value) && lowercase(value) in accepted && return nothing

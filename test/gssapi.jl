@@ -458,6 +458,23 @@ function test_gssapi_protocol()
         end
     end
 
+    @testset "connect_timeout bounds a stalled GSS handshake" begin
+        style = FakeGSSStyle()
+        handler = function (sock, n)
+            code, _ = read_request(sock)
+            code == GSSENC_REQUEST || error("expected GSSENCRequest, got $code")
+            send(sock, [UInt8('G')])
+            readframe(sock)  # the client's token; the server's never comes
+            drain(sock)
+        end
+        with_fake_server(handler) do port, accepted
+            started = time()
+            err = connect_err(() -> Postgres.Connection(host="127.0.0.1", port=port, user="u", gssencmode="require", connect_timeout=1, style=style))
+            @test err isa Postgres.Error && occursin("timeout expired", err.message)
+            @test time() - started < 5
+        end
+    end
+
     @testset "cancel_request accepts every sslmode and gssencmode value, in any case" begin
         cancels = Ref(0)
         handler = function (sock, n)
