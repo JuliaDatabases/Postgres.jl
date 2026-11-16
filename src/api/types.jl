@@ -69,13 +69,14 @@ end
     Postgres.notification_callback(style, notification::Notification)
 
 Called for each asynchronous `NOTIFY` ([`Notification`](@ref
-Postgres.API.Notification)) received while reading query results. Does nothing
+Postgres.API.Notification)) the connection reads while it connects, runs,
+prepares, or closes a statement, or validates an idle connection. Does nothing
 by default.
 
-A connection only observes notifications while it is reading from the server,
-so a connection that is idle or busy in another phase of a query may not see
-one. Use [`wait_for_notification`](@ref Postgres.wait_for_notification) on a
-dedicated connection to receive every notification on a channel.
+A connection reads only while it talks to the server: a notification sent while
+it is idle reaches this callback when the connection next does one of these.
+Use [`wait_for_notification`](@ref Postgres.wait_for_notification) on a
+dedicated connection to wait for notifications on a channel.
 """
 notification_callback(::AbstractPostgresStyle, notification) = nothing
 

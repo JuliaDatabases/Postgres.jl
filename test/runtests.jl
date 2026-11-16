@@ -1162,7 +1162,7 @@ include("trim_compile_tests.jl")
                     # surfaces the real server error, not an assert, and leaves the
                     # stream at ReadyForQuery so the connection stays usable
                     err = try
-                        Postgres.API.describeprepared(connp.socket, "no_such_stmt_xyz", false)
+                        Postgres.API.describeprepared(connp.style, connp.socket, "no_such_stmt_xyz", false)
                         nothing
                     catch e
                         e

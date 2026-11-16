@@ -329,7 +329,7 @@ function evict_lru_statement!(conn::Connection)
     oldest_sql === nothing && return
     stmt = pop!(conn.statements, oldest_sql)
     if !stmt.closed
-        API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+        API.close_statement(conn.style, conn.socket, stmt.name, conn.debug, conn.server_parameters)
         stmt.closed = true
     end
     return
@@ -353,7 +353,7 @@ function clear_statement_cache!(conn::Connection)
     @lock conn.lock begin
         for (sql, stmt) in conn.statements
             if !stmt.closed
-                API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+                API.close_statement(conn.style, conn.socket, stmt.name, conn.debug, conn.server_parameters)
                 stmt.closed = true
             end
         end
@@ -374,7 +374,7 @@ function set_statement_cache_maxsize!(conn::Connection, maxsize::Integer)
         if conn.statement_cache_maxsize == 0
             for (sql, stmt) in conn.statements
                 if !stmt.closed
-                    API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+                    API.close_statement(conn.style, conn.socket, stmt.name, conn.debug, conn.server_parameters)
                     stmt.closed = true
                 end
             end
@@ -559,9 +559,9 @@ lock, reconnecting, or running callbacks counts toward the timeout, but those
 steps are not interrupted.
 
 The connection lock is held while waiting, so use a dedicated connection for
-listening. Notifications received while a query uses the connection are instead
+listening. Notifications received while the connection runs other work are
 delivered to [`notification_callback`](@ref Postgres.API.notification_callback)
-during the phases that read result data.
+instead.
 """
 function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=nothing)
     start_time = time_ns()
