@@ -113,7 +113,7 @@ function checkstmt(stmt::Statement)
             # reconnect. Keep this caller handle valid as an independent
             # server statement; do not silently repopulate or overrun the
             # current cache policy.
-            stmt.name = API.prepare(stmt.conn.socket, stmt.sql, stmt.conn.debug,
+            stmt.name = API.prepare(stmt.conn.style, stmt.conn.socket, stmt.sql, stmt.conn.debug,
                                     stmt.conn.server_parameters)
             stmt.generation = stmt.conn.generation
             stmt.cached = false
@@ -122,7 +122,7 @@ function checkstmt(stmt::Statement)
             stmt.last_used = cached.last_used
         end
     elseif stmt.generation != stmt.conn.generation
-        stmt.name = API.prepare(stmt.conn.socket, stmt.sql, stmt.conn.debug,
+        stmt.name = API.prepare(stmt.conn.style, stmt.conn.socket, stmt.sql, stmt.conn.debug,
                                 stmt.conn.server_parameters)
         stmt.generation = stmt.conn.generation
     end
@@ -149,9 +149,9 @@ function DBInterface.prepare(conn::Connection, sql::AbstractString; debug::Bool=
             return statement_handle(cached)
         end
         if conn.statement_cache_maxsize == 0
-            name = API.prepare(conn.socket, sql_str, actual_debug, conn.server_parameters)
+            name = API.prepare(conn.style, conn.socket, sql_str, actual_debug, conn.server_parameters)
             nparams, names, types = API.describeprepared(
-                conn.socket, name, actual_debug, conn.server_parameters)
+                conn.style, conn.socket, name, actual_debug, conn.server_parameters)
             params = Union{String, Missing}[missing for _ = 1:nparams]
             last_used = next_statement_clock!(conn)
             return Statement{_style_type(conn)}(conn, name, sql_str, length(names), names, types, nparams, params, false, false, conn.generation, last_used)
@@ -161,9 +161,9 @@ function DBInterface.prepare(conn::Connection, sql::AbstractString; debug::Bool=
             evict_lru_statement!(conn)
         end
         # new statement to prepare
-        name = API.prepare(conn.socket, sql_str, actual_debug, conn.server_parameters)
+        name = API.prepare(conn.style, conn.socket, sql_str, actual_debug, conn.server_parameters)
         nparams, names, types = API.describeprepared(
-            conn.socket, name, actual_debug, conn.server_parameters)
+            conn.style, conn.socket, name, actual_debug, conn.server_parameters)
         params = Union{String, Missing}[missing for _ = 1:nparams]
         last_used = next_statement_clock!(conn)
         cached = Statement{_style_type(conn)}(conn, name, sql_str, length(names), names, types, nparams, params, false, true, conn.generation, last_used)
@@ -182,7 +182,7 @@ function DBInterface.close!(stmt::Statement)
         # Cached backend statements belong to the connection cache, not to a
         # caller handle. Closing one handle must not invalidate independent
         # handles or remove the cache entry.
-        stmt.cached || API.close_statement(stmt.conn.socket, stmt.name, stmt.conn.debug,
+        stmt.cached || API.close_statement(stmt.conn.style, stmt.conn.socket, stmt.name, stmt.conn.debug,
                                            stmt.conn.server_parameters)
         stmt.closed = true
     end
@@ -224,7 +224,7 @@ function close_cursor!(cursor::Cursor, commit::Bool)
         @lock cursor.conn.lock begin
             if !cursor.portal_closed && isopen(cursor.conn.socket)
                 API.writemessages(cursor.conn.socket, cursor.conn.debug, ('C', UInt8('P'), cursor.portal), ('S',))
-                API.waitfor(cursor.conn.socket, cursor.conn.debug, '3', 'Z';
+                API.waitfor(cursor.conn.style, cursor.conn.socket, cursor.conn.debug, '3', 'Z';
                             server_parameters=cursor.conn.server_parameters)
                 cursor.portal_closed = true
             end

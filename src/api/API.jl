@@ -444,12 +444,24 @@ function drain_to_ready!(socket, debug)
     return
 end
 
-# Read the next message header, expecting one of `expected`. Asynchronous
-# messages (parameter status, notices, notifications) are skipped. An
-# ErrorResponse is read fully, the stream drained through ReadyForQuery (the
-# connection stays usable), and thrown as a Postgres.Error. Any other message
-# type means the stream is desynchronized: close the connection and throw.
-function read_expected(socket, debug, expected::Char...;
+# A notice or notification can come before any reply: a NOTIFY sent while the
+# connection was idle is read by its next command.
+function dispatch_async!(style::AbstractPostgresStyle, socket, mt::UInt8, len)
+    if mt == UInt8('N')
+        notice_callback(style, noticeResponse(len, socket))
+    else
+        notification_callback(style, notificationResponse(len, socket))
+    end
+    return
+end
+
+# Read the next message header, expecting one of `expected`. Parameter status
+# messages are recorded or skipped; notices and notifications go to the style's
+# callbacks. An ErrorResponse is read fully, the stream drained through
+# ReadyForQuery (the connection stays usable), and thrown as a Postgres.Error.
+# Any other message type means the stream is desynchronized: close the
+# connection and throw.
+function read_expected(style::AbstractPostgresStyle, socket, debug, expected::Char...;
                        server_parameters::Union{Nothing, Dict{String, String}}=nothing)
     while true
         mt, len = readheader(socket, debug)
@@ -463,7 +475,7 @@ function read_expected(socket, debug, expected::Char...;
             server_parameters === nothing ? skipbytes!(socket, len) :
                 parameterStatus!(server_parameters, len, socket)
         elseif mt == UInt8('N') || mt == UInt8('A')
-            skipbytes!(socket, len)
+            dispatch_async!(style, socket, mt, len)
         else
             close_and_throw(socket, Error("unexpected message type '$(Char(mt))' from server; connection protocol state is corrupted"))
         end
@@ -477,7 +489,7 @@ function expect_auth_message(socket, debug, mt, len)
 end
 
 # wait for code, then ready
-function waitfor(socket, debug::Bool, codes::Vararg{Char, N};
+function waitfor(style::AbstractPostgresStyle, socket, debug::Bool, codes::Vararg{Char, N};
                  max_message_len::Int32=MAX_MESSAGE_LEN,
                  server_parameters::Union{Nothing, Dict{String, String}}=nothing) where {N}
     error = false
@@ -515,11 +527,11 @@ function waitfor(socket, debug::Bool, codes::Vararg{Char, N};
                     skipbytes!(socket, len)
                 end
                 found == 0 && break
+            elseif mt == UInt8('N') || mt == UInt8('A')
+                dispatch_async!(style, socket, mt, len)
             else
-                # any other message (notices, notifications, ...): discard the
-                # body. Without this the body is read as the next header and
-                # the stream desynchronizes — e.g. a NOTIFY delivered on a
-                # connection that is also running queries.
+                # any other message: discard the body, or it is read as the
+                # next header and the stream desynchronizes
                 skipbytes!(socket, len)
             end
         end
@@ -893,7 +905,7 @@ function _startup!(socket, debug::Bool, user::String, dbname::String, @nospecial
         # server version too old
         close_and_throw(socket, Error("server version too old"))
     end
-    pid, skey, server_params = waitfor(socket, debug, 'K', 'Z'; max_message_len=MAX_PREAUTH_MESSAGE_LEN)
+    pid, skey, server_params = waitfor(style, socket, debug, 'K', 'Z'; max_message_len=MAX_PREAUTH_MESSAGE_LEN)
     uppercase(replace(get(server_params, "client_encoding", ""), "-" => "")) == "UTF8" ||
         close_and_throw(socket, Error("server did not confirm UTF8 client_encoding"))
     buffered = BufferedConn(socket)
@@ -952,33 +964,33 @@ function align_session_formats!(socket, server_params::Dict{String, String}, deb
     return
 end
 
-function prepare(socket, sql::String, debug::Bool,
+function prepare(style::AbstractPostgresStyle, socket, sql::String, debug::Bool,
                  server_parameters::Union{Nothing, Dict{String, String}}=nothing;
                  name::Union{Nothing, String}=nothing)
     stmtname = name === nothing ? randstring(Random.RandomDevice(), 36) : String(name)
     writemessages(socket, debug, ('P', stmtname, sql, Int16(0)), ('S',))
-    waitfor(socket, debug, '1', 'Z'; server_parameters=server_parameters)
+    waitfor(style, socket, debug, '1', 'Z'; server_parameters=server_parameters)
     return stmtname
 end
 
 _symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len)
 
-function describeprepared(socket, name::String, debug::Bool,
+function describeprepared(style::AbstractPostgresStyle, socket, name::String, debug::Bool,
                           server_parameters::Union{Nothing, Dict{String, String}}=nothing)
     writemessages(socket, debug, ('D', UInt8('S'), name), ('S',))
-    nparams, cols, types = readprepareddescription(socket, debug, server_parameters)
-    waitfor(socket, debug, 'Z'; server_parameters=server_parameters)
+    nparams, cols, types = readprepareddescription(style, socket, debug, server_parameters)
+    waitfor(style, socket, debug, 'Z'; server_parameters=server_parameters)
     return nparams, cols, types
 end
 
-function readprepareddescription(socket, debug::Bool,
+function readprepareddescription(style::AbstractPostgresStyle, socket, debug::Bool,
                                  server_parameters::Union{Nothing, Dict{String, String}}=nothing)
     nparams = 0
     ncols = 0
     cols = Symbol[]
     types = Int[]
     try
-        mt, len = read_expected(socket, debug, 't'; server_parameters=server_parameters)
+        mt, len = read_expected(style, socket, debug, 't'; server_parameters=server_parameters)
         len >= 2 || close_and_throw(socket, Error("truncated ParameterDescription message from server"))
         nparams = Int(ntoh(read(socket, UInt16)))
         # the server truncates the count of a statement with more placeholders
@@ -987,7 +999,7 @@ function readprepareddescription(socket, debug::Bool,
             "statement has more than $MAX_BIND_PARAMS parameters, the most a Bind message can carry" :
             "invalid ParameterDescription length from server"))
         skipbytes!(socket, len - 2)
-        mt, len = read_expected(socket, debug, 'T', 'n'; server_parameters=server_parameters)
+        mt, len = read_expected(style, socket, debug, 'T', 'n'; server_parameters=server_parameters)
         if mt == UInt8('n')
             # no data
             return nparams, cols, types
@@ -1235,7 +1247,7 @@ function exec(style::S, socket::BufferedConn, stmtname::String,
     nparams = bind_param_count(length(params))
     # bind, then execute, then sync
     writemessages(socket, debug, ('B', "", stmtname, npformats, nparams, Params(params), Int16(0)), ('E', "", Int32(rowlimit)), ('S',))
-    waitfor(socket, debug, '2'; server_parameters=server_parameters)
+    waitfor(style, socket, debug, '2'; server_parameters=server_parameters)
     return Exec{S}(style, socket, names, typeIds, type_registry,
                    server_parameters, debug, Ref{Union{Nothing, String}}(nothing),
                    Ref{Union{Nothing, Int}}(nothing), Ref{UInt8}(UInt8('I')))
@@ -1332,10 +1344,10 @@ function exec_unnamed(style::S, socket::BufferedConn, sql::String,
         ('E', "", Int32(rowlimit)),
         ('S',))
     names, typeIds = try
-        mt, len = read_expected(socket, debug, '1'; server_parameters=server_parameters)
+        mt, len = read_expected(style, socket, debug, '1'; server_parameters=server_parameters)
         skipbytes!(socket, len)
-        _, names, typeIds = readprepareddescription(socket, debug, server_parameters)
-        mt, len = read_expected(socket, debug, '2'; server_parameters=server_parameters)
+        _, names, typeIds = readprepareddescription(style, socket, debug, server_parameters)
+        mt, len = read_expected(style, socket, debug, '2'; server_parameters=server_parameters)
         skipbytes!(socket, len)
         names, typeIds
     catch err
@@ -1659,10 +1671,10 @@ function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where 
     return dest
 end
 
-function close_statement(socket, name::String, debug::Bool,
+function close_statement(style::AbstractPostgresStyle, socket, name::String, debug::Bool,
                          server_parameters::Union{Nothing, Dict{String, String}}=nothing)
     writemessages(socket, debug, ('C', UInt8('S'), name), ('S',))
-    waitfor(socket, debug, '3', 'Z'; server_parameters=server_parameters)
+    waitfor(style, socket, debug, '3', 'Z'; server_parameters=server_parameters)
     return
 end
 

@@ -140,4 +140,62 @@ function test_execute_fake_server()
         end
     end
 end
+
+# A NOTIFY that arrives while the connection is idle is read by whatever the
+# connection does next, often before the first reply to Parse, Describe, Bind,
+# or Close. A notice can come before any of them too.
+@testset "notices and notifications are dispatched in every wait" begin
+    notice_and_notify(tag) = vcat(notice_msg("NOTICE", "00000", tag), notification_msg(77, "chan", tag))
+    no_cache_connection(port, style) = Postgres.Connection(host="127.0.0.1", port=port, user="u", dbname="db",
+        sslmode="disable", gssencmode="disable", statement_cache_maxsize=0, style=style)
+    function serve_statements(sock)
+        read_unnamed_segment(sock)
+        send(sock, vcat(notice_and_notify("before ParseComplete"), pgmsg('1', UInt8[]),
+                        notice_and_notify("before ParameterDescription"), pgmsg('t', UInt8[0x00, 0x00]),
+                        notice_and_notify("before NoData"), pgmsg('n', UInt8[]),
+                        notice_and_notify("before BindComplete"), pgmsg('2', UInt8[]),
+                        pgmsg('C', Vector{UInt8}("DO\0")), pgmsg('Z', [UInt8('I')])))
+        [first(read_message(sock)) for _ in 1:2] == ['P', 'S'] || error("fake server: expected Parse/Sync")
+        send(sock, vcat(notice_and_notify("before prepare ParseComplete"), pgmsg('1', UInt8[]), pgmsg('Z', [UInt8('I')])))
+        [first(read_message(sock)) for _ in 1:2] == ['D', 'S'] || error("fake server: expected Describe/Sync")
+        send(sock, vcat(pgmsg('t', UInt8[0x00, 0x00]), pgmsg('n', UInt8[]),
+                        notice_and_notify("before describe ReadyForQuery"), pgmsg('Z', [UInt8('I')])))
+        [first(read_message(sock)) for _ in 1:3] == ['B', 'E', 'S'] || error("fake server: expected Bind/Execute/Sync")
+        send(sock, vcat(notice_and_notify("before statement BindComplete"), pgmsg('2', UInt8[]),
+                        pgmsg('C', Vector{UInt8}("DO\0")), pgmsg('Z', [UInt8('I')])))
+        [first(read_message(sock)) for _ in 1:2] == ['C', 'S'] || error("fake server: expected Close/Sync")
+        send(sock, vcat(notice_and_notify("before CloseComplete"), pgmsg('3', UInt8[]), pgmsg('Z', [UInt8('I')])))
+        drain(sock)
+    end
+    style = RecordingStyle()
+    with_fake_server(serve_idle(serve_statements)) do port, accepted
+        conn = no_cache_connection(port, style)
+        @test Postgres.command_tag(DBInterface.execute(conn, "DO \$\$ BEGIN END \$\$")) == "DO"
+        stmt = DBInterface.prepare(conn, "DO \$\$ BEGIN END \$\$")
+        @test Postgres.command_tag(DBInterface.execute(stmt)) == "DO"
+        DBInterface.close!(stmt)
+        @test isopen(conn)
+        close(conn)
+    end
+    tags = ["before ParseComplete", "before ParameterDescription", "before NoData", "before BindComplete",
+            "before prepare ParseComplete", "before describe ReadyForQuery", "before statement BindComplete",
+            "before CloseComplete"]
+    @test [n.payload for n in style.notifications] == tags
+    @test [n["M"] for n in style.notices] == tags
+
+    @testset "during startup" begin
+        style = RecordingStyle()
+        with_fake_server((sock, n) -> begin
+            read_startup(sock)
+            send(sock, vcat(auth_msg(0), notice_and_notify("during startup"), ready_bundle()))
+            drain(sock)
+        end) do port, accepted
+            conn = fake_connection(port, style)
+            @test isopen(conn)
+            close(conn)
+        end
+        @test [n.payload for n in style.notifications] == ["during startup"]
+        @test [n["M"] for n in style.notices] == ["during startup"]
+    end
+end
 end
