@@ -10,8 +10,7 @@ they also run database tests when a Linux Docker daemon is available.
 
 `sslmode=verify-full` verifies the certificate chain and server name. Use a DNS
 name as `host`, or set `sslservername` to the DNS name when dialing a resolved
-address. IP-address subject-alternative-name matching on a TLS 1.2-only server
-is not supported.
+address.
 
 Client certificates require both `sslcert` and `sslkey`. TLS connections
 negotiate TLS 1.2 or TLS 1.3, with or without a client certificate.

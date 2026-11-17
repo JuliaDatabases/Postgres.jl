@@ -33,8 +33,8 @@ MD5 = "0.2"
 Parsers = "2.7, 3"
 Pkg = "1.10"
 Random = "1.10"
-# Reseau 1.5 adds non-blocking tryread! behind isvalid.
-Reseau = "1.5"
+# Reseau 1.7.1 verifies IP-address hosts when the TLS client falls back to TLS 1.2.
+Reseau = "1.7.1"
 SASLAuth = "1.1.0"
 Sockets = "1.10"
 StructUtils = "2.3"
