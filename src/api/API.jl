@@ -752,12 +752,9 @@ function tlsupgrade(socket::Reseau.TCP.Conn, @nospecialize(connect_timeout::Unio
                           nothing, nothing, ca_file, nothing, String[], UInt16[],
                           handshake_timeout_ns, Reseau.TLS.TLS1_2_VERSION, nothing, false)
     else
-        # Reseau 1.3.x does not send a configured client certificate on its
-        # mixed TLS 1.2/1.3 client path. Its TLS 1.2 path does. Keep mTLS
-        # functional and fail-closed until the dependency fixes that path.
         Reseau.TLS.Config(sni, verify_peer, verify_peer, Reseau.TLS.ClientAuthMode.NoClientCert,
                           ssl_cert::String, ssl_key::String, ca_file, nothing, String[], UInt16[],
-                          handshake_timeout_ns, Reseau.TLS.TLS1_2_VERSION, Reseau.TLS.TLS1_2_VERSION, false)
+                          handshake_timeout_ns, Reseau.TLS.TLS1_2_VERSION, nothing, false)
     end
     tls_conn = Reseau.TLS.client(socket, config)
     try

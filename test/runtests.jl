@@ -3049,7 +3049,7 @@ include("trim_compile_tests.jl")
                     end
 
                     # Require and verify a client certificate for one role.
-                    # This covers the TLS 1.2 mTLS path and the cancel request,
+                    # This covers mTLS over TLS 1.3 and the cancel request,
                     # which must present the same client identity.
                     mtls_admin = DBInterface.connect(Postgres.Connection,
                         ssl_cfg.host, ssl_cfg.user, ssl_cfg.password;
@@ -3081,7 +3081,7 @@ include("trim_compile_tests.jl")
                                 WHERE pid = pg_backend_pid()
                             """))
                             @test tls_row.ssl
-                            @test tls_row.version == "TLSv1.2"
+                            @test tls_row.version == "TLSv1.3"
                             @test occursin("CN=postgres_mtls", tls_row.client_dn)
 
                             mtls_task = errormonitor(Threads.@spawn begin
