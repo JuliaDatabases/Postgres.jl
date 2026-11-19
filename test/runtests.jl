@@ -492,6 +492,13 @@ function random_array_string(rng::AbstractRNG)
     return String(rand(rng, alphabet, rand(rng, 0:12)))
 end
 
+# allocations of a call after a warm-up call; measured inside a function so
+# `@allocations` does not force-compile the enclosing testset
+function warm_allocations(f, s::String, ::Type{T}) where {T}
+    f(s, T)
+    return @allocations f(s, T)
+end
+
 include("timestamps.jl")
 include("decimals.jl")
 include("result_decoding.jl")
@@ -963,6 +970,28 @@ include("trim_compile_tests.jl")
         @test Postgres.API.parse_array_by_oid("{/var/log/x[1].txt,b}", 25, registry) == ["/var/log/x[1].txt", "b"]
 
         @test Postgres.API.ArrayParsing.parse_array("{1,2}", Int64) isa Vector{Int64}
+        # one-dimensional arrays without NULLs or escapes are read straight into
+        # a typed vector; any other literal gives what the general parser gives
+        let parse = Postgres.API.ArrayParsing.parse_array
+            @test parse("{ 1 , \"2\",3 }", Int32) == Int32[1, 2, 3]
+            @test parse("{12.00,-7}", Int64) == [12, -7]
+            @test parse("{}", Float64) == Float64[]
+            @test parse("{NaN,-Infinity,1.5}", Float64) isa Vector{Float64}
+            @test isequal(parse("{1,NULL}", Int32), Union{Missing, Int32}[1, missing])
+            @test parse("{\"NULL\",NULL}", String) isa Vector{Union{Missing, String}}
+            @test parse("{\"a\\\"b\",c d,\"\"}", String) == ["a\"b", "c d", ""]
+            @test parse("{{1,2},{3,4}}", Int32) == [Int32[1, 2], Int32[3, 4]]
+            @test parse("{1,{2}}", Int32) == Any[Int32(1), Int32[2]]
+            @test parse("{2024-01-02,2024-02-29}", Date) == [Date(2024, 1, 2), Date(2024, 2, 29)]
+            @test_throws ArgumentError parse("{1,x}", Int32)
+            @test parse("{aNULLb,\"NULL\"}", String)::Vector{String} == ["aNULLb", "NULL"]
+            # a literal with a NULL, an escape or a nested array costs no more than
+            # the general parser alone: the fast path turns it away before reading
+            general(s, ::Type{T}) where {T} = Postgres.API.ArrayParsing.parse_array_inner(codeunits(s), Ref(1), T)
+            for (s, T) in (("{1,2,3,4,NULL}", Int32), ("{abc,\"x\\\\y\"}", String), ("{{1,2},{3,4}}", Int32))
+                @test warm_allocations(parse, s, T) <= warm_allocations(general, s, T)
+            end
+        end
         @test Postgres.API.parse_value(1005, "{1,-2}", registry) == Int16[1, -2]
         @test Postgres.API.parse_value(1021, "{1.5,NaN}", registry) isa Vector{Float32}
         @test Postgres.API.parse_value(1000, "{t,f}", registry) == [true, false]
