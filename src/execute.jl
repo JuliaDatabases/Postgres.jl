@@ -144,8 +144,8 @@ end
 # columns changed since it was prepared (SQLSTATE 0A000, "cached plan must not
 # change result type"). Close that server statement so the next use prepares
 # the SQL again.
-function discard_rejected_statement!(stmt::Statement, err)
-    (err isa API.Error && err.code == "0A000") || return
+function discard_rejected_statement!(stmt::Statement, err::API.Error)
+    err.code == "0A000" || return
     conn = stmt.conn
     cached = get(conn.statements, stmt.sql, nothing)
     if cached !== nothing && cached.name == stmt.name
@@ -582,7 +582,7 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
                              stmt.names, stmt.typeIds, stmt.conn.type_registry,
                              actual_debug, 0, stmt.conn.server_parameters)
             catch err
-                discard_rejected_statement!(stmt, err)
+                err isa API.Error && discard_rejected_statement!(stmt, err)
                 rethrow()
             finally
                 # Bound strings can contain credentials or personal data. The
@@ -832,7 +832,7 @@ function cursor(stmt::Statement, params=nothing; fetchsize::Integer=1000,
                 read_portal_batch!(cursor)
                 return cursor
             catch err
-                discard_rejected_statement!(stmt, err)
+                err isa API.Error && discard_rejected_statement!(stmt, err)
                 rethrow()
             finally
                 fill!(stmt.params, missing)
