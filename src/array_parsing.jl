@@ -70,7 +70,10 @@ function parse_unquoted(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int})
             pos[] += 1
         end
     end
-    return String(strip(String(buf)))
+    # The server quotes any element that contains ASCII whitespace, so an
+    # unquoted element runs to the delimiter. Unicode spaces such as U+00A0
+    # are never quoted and belong to the element: do not strip.
+    return String(buf)
 end
 
 function parse_bool_token(token::String)
