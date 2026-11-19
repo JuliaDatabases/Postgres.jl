@@ -1299,6 +1299,28 @@ include("trim_compile_tests.jl")
                     @test function_value == 42
                     @test only(DBInterface.execute(held)).val == 42
 
+                    # DDL that changes a prepared statement's result columns
+                    # makes PostgreSQL reject it (0A000). That rejection must
+                    # not stick to the cache, and statements prepared again
+                    # must read the server's new column names and order.
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS stmt_shape")
+                    DBInterface.execute(conn, "CREATE TABLE stmt_shape (a int, b int)")
+                    DBInterface.execute(conn, "INSERT INTO stmt_shape VALUES (1, 2)")
+                    shape_sql = "SELECT * FROM stmt_shape"
+                    shape_handle = DBInterface.prepare(conn, shape_sql)
+                    @test only(Tables.rowtable(DBInterface.execute(shape_handle))) == (a = 1, b = 2)
+                    Postgres.execute_script(conn, """
+                        ALTER TABLE stmt_shape RENAME COLUMN a TO tmp;
+                        ALTER TABLE stmt_shape RENAME COLUMN b TO a;
+                        ALTER TABLE stmt_shape RENAME COLUMN tmp TO b;
+                    """)
+                    shape_err = try DBInterface.execute(shape_handle) catch err; err end
+                    @test shape_err isa Postgres.API.Error && shape_err.code == "0A000"
+                    @test only(Tables.rowtable(DBInterface.execute(DBInterface.prepare(conn, shape_sql)))) == (b = 1, a = 2)
+                    @test only(Tables.rowtable(DBInterface.execute(shape_handle))) == (b = 1, a = 2)
+                    DBInterface.close!(shape_handle)
+                    DBInterface.execute(conn, "DROP TABLE stmt_shape")
+
                     DBInterface.close!(held)
                     DBInterface.close!(mismatch_stmt)
                     DBInterface.close!(failing_stmt)
