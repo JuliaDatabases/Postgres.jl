@@ -1373,12 +1373,12 @@ include("trim_compile_tests.jl")
                 @test bracket_row.arr == bracket_param
                 # PostgreSQL quotes an element only for ASCII whitespace, so
                 # other whitespace at an element's edge arrives unquoted
-                edge_ws = [" lead", "trail ", " both　", "a b"]
+                edge_ws = ["\u00a0lead", "trail\u00a0", "\u2028both\u3000", "a b"]
                 edge_row = only(Tables.rowtable(DBInterface.execute(conn,
-                    raw"SELECT ARRAY[E' lead', E'trail ', E' both　', 'a b'] AS arr")))
+                    raw"SELECT ARRAY[E'\u00a0lead', E'trail\u00a0', E'\u2028both\u3000', 'a b'] AS arr")))
                 @test edge_row.arr == edge_ws
                 @test DBInterface.execute(conn, raw"SELECT $1::text[] AS arr", (edge_ws,), NamedTuple{(:arr,), Tuple{Vector{String}}}).arr == edge_ws
-                array_row =only(Tables.rowtable(DBInterface.execute(conn, "SELECT '{1,NULL,3}'::int[] AS arr")))
+                array_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '{1,NULL,3}'::int[] AS arr")))
                 @test isequal(array_row.arr, Union{Missing, Int32}[1, missing, 3])
                 nested_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '{{1,2},{3,4}}'::int[] AS arr")))
                 @test nested_row.arr == [Int32[1, 2], Int32[3, 4]]
