@@ -53,26 +53,6 @@ function read_fixed(io::BufferedConn, ::Type{T}) where {T}
     return x
 end
 
-function Base.unsafe_read(io::BufferedConn, p::Ptr{UInt8}, n::UInt)
-    remaining = Int(n)
-    while remaining > 0
-        if bytesavailable(io) == 0
-            # a remainder larger than the scratch buffer goes straight to `p`
-            if remaining >= length(io.scratch) && !io.ended
-                unsafe_read(io.transport, p, UInt(remaining))
-                return nothing
-            end
-            fill_buffer!(io) || throw(EOFError())
-        end
-        k = min(remaining, bytesavailable(io))
-        GC.@preserve io unsafe_copyto!(p, pointer(io.buffer, io.pos), k)
-        io.pos += k
-        p += k
-        remaining -= k
-    end
-    return nothing
-end
-
 function Base.readbytes!(io::BufferedConn, buf::AbstractVector{UInt8}, nb::Integer=length(buf); all::Bool=true)
     n = Int(nb)
     n >= 0 || throw(ArgumentError("nb must be nonnegative"))
