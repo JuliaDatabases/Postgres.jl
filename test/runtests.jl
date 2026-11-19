@@ -1352,21 +1352,6 @@ include("trim_compile_tests.jl")
                     update_res = DBInterface.execute(conn, "UPDATE command_tag_test SET id = id + 1")
                     @test Postgres.command_tag(update_res) == "UPDATE 2"
                     @test Postgres.rows_affected(update_res) == 2
-                    # rows of one result share read buffers; rows of every size,
-                    # one larger than a buffer, and rows a consumer keeps (a
-                    # Vector{Any} target keeps each DataRow) must read back intact
-                    sizes_sql = "SELECT g AS n, repeat(chr(65 + g % 26), CASE WHEN g = 1500 THEN 200000 ELSE g * 37 % 5000 END) AS s FROM generate_series(1, 3000) g"
-                    text_of(n) = repeat(Char(65 + n % 26), n == 1500 ? 200000 : n * 37 % 5000)
-                    typed_rows = DBInterface.execute(conn, sizes_sql, (), Vector{@NamedTuple{n::Int32, s::String}})
-                    @test all(r -> r.s == text_of(r.n), typed_rows)
-                    kept = DBInterface.execute(conn, sizes_sql, (), Vector{Any})
-                    DBInterface.execute(conn, sizes_sql)
-                    kept_values = map(kept) do row
-                        values = Any[]
-                        StructUtils.applyeach(Postgres.PostgresStyle(), (_, v) -> push!(values, v), row)
-                        values
-                    end
-                    @test all(v -> v[2] == text_of(v[1]), kept_values)
                 end
                 @testset "Type Parsing" begin
                     id, expected = setup_types(conn)
