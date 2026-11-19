@@ -1037,28 +1037,35 @@ end
 # buffer (instead of incrementally from the socket) means a failure while
 # converting values — a bad cast, a user lift throwing — aborts at a message
 # boundary, so the caller can drain the rest of the result and keep the
-# connection usable.
+# connection usable. The body is `buf[start:start+len-1]`; the rows of one
+# result share `buf`.
 struct DataRow
     buf::Vector{UInt8}
+    start::Int
+    len::Int
     names::Vector{Symbol}
     typeIds::Vector{Int}
     type_registry::Dict{Int, TypeInfo}
 end
 
+DataRow(buf::Vector{UInt8}, names::Vector{Symbol}, typeIds::Vector{Int}, type_registry::Dict{Int, TypeInfo}) =
+    DataRow(buf, 1, length(buf), names, typeIds, type_registry)
+
 # (style types + behavior interface live in types.jl, included before this point)
 
 function StructUtils.applyeach(::AbstractPostgresStyle, f, dr::DataRow)
     buf = dr.buf
-    nbuf = length(buf)
+    # index of the body's last byte
+    nbuf = dr.start + dr.len - 1
     GC.@preserve buf begin
-        nbuf >= 2 || throw(Error("truncated DataRow message from server"))
-        ncols = Int(ntoh(unsafe_load(Ptr{Int16}(pointer(buf)))))
+        dr.len >= 2 || throw(Error("truncated DataRow message from server"))
+        ncols = Int(ntoh(unsafe_load(Ptr{Int16}(pointer(buf, dr.start)))))
         # the protocol mandates one value per described column; anything else
         # (including a negative count, which is signed on the wire) would leave
         # the caller's row partly unfilled — an UndefRefError downstream
         (ncols == length(dr.names) && ncols == length(dr.typeIds)) ||
             throw(Error("DataRow column count does not match the row description"))
-        pos = 3
+        pos = dr.start + 2
         for i = 1:ncols
             # column lengths come off the wire: validate each against the
             # message actually received before reading the value
@@ -1134,8 +1141,15 @@ function rows_affected_from_command_tag(tag::String)
     end
 end
 
+# Row bodies are copied into shared chunks rather than one allocation per row.
+# A chunk is never overwritten, so a row a consumer keeps (a `Vector{Any}`
+# target keeps the DataRow itself) stays valid.
+const ROW_CHUNK_SIZE = 1 << 16
+
 function StructUtils.applyeach(::AbstractPostgresStyle, f, e::Exec)
     nrows = 0
+    chunk = UInt8[]
+    used = 0
     server_error = nothing
     consumer_error = nothing
     copy_in_statement = false
@@ -1152,7 +1166,14 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, e::Exec)
             elseif mt == UInt8('D')
                 nrows += 1
                 if consumer_error === nothing
-                    row = DataRow(read(e.socket, len), e.names, e.typeIds, e.type_registry)
+                    if used + len > length(chunk)
+                        # zeroed, so showing a kept DataRow never prints uninitialized memory
+                        chunk = zeros(UInt8, max(ROW_CHUNK_SIZE, len))
+                        used = 0
+                    end
+                    GC.@preserve chunk unsafe_read(e.socket, pointer(chunk, used + 1), len)
+                    row = DataRow(chunk, used + 1, len, e.names, e.typeIds, e.type_registry)
+                    used += len
                     try
                         f(nrows, row)
                     catch err

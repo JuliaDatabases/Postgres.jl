@@ -39,6 +39,20 @@ function Base.read(io::BufferedConn, ::Type{UInt8})
     return b
 end
 
+# Message headers carry an Int32 length, so this runs once per protocol
+# message. Base's `read(io, T)` reads through a heap-allocated `Ref`.
+Base.read(io::BufferedConn, T::Union{Type{Int16}, Type{UInt16}, Type{Int32}, Type{UInt32}}) = read_fixed(io, T)
+
+function read_fixed(io::BufferedConn, ::Type{T}) where {T}
+    while bytesavailable(io) < sizeof(T)
+        fill_buffer!(io) || throw(EOFError())
+    end
+    buf = io.buffer
+    x = GC.@preserve buf unsafe_load(Ptr{T}(pointer(buf, io.pos)))
+    io.pos += sizeof(T)
+    return x
+end
+
 function Base.unsafe_read(io::BufferedConn, p::Ptr{UInt8}, n::UInt)
     remaining = Int(n)
     while remaining > 0
