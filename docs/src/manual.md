@@ -177,6 +177,12 @@ Prepared statements can be created explicitly. Postgres.jl caches their named
 backend statements with LRU eviction while returning an independent handle to
 each caller. Set `statement_cache_maxsize=0` to disable this cache.
 
+If DDL or a `search_path` change alters a prepared statement's result
+columns, PostgreSQL rejects its next execution with SQLSTATE `0A000` ("cached
+plan must not change result type"). Postgres.jl then closes that server
+statement, so the next execution of the same SQL, through a new or an existing
+handle, prepares it again and reads the new columns.
+
 ```julia
 stmt = DBInterface.prepare(conn, raw"SELECT $1::text AS value")
 rows = Tables.rowtable(DBInterface.execute(stmt, ("prepared",)))

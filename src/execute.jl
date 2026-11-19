@@ -61,9 +61,11 @@ mutable struct Statement{S <: API.AbstractPostgresStyle} <: DBInterface.Statemen
     const conn::Connection{Statement{S}, S}
     name::String
     const sql::String
-    const nfields::Int
-    const names::Vector{Symbol}
-    const typeIds::Vector{Int}
+    # The result description of the server statement `name`; replaced
+    # whenever the SQL is prepared again, since DDL can change it.
+    nfields::Int
+    names::Vector{Symbol}
+    typeIds::Vector{Int}
     const nparams::Int
     # holds references to params as strings
     const params::Vector{Union{String, Missing}}
@@ -113,20 +115,50 @@ function checkstmt(stmt::Statement)
             # reconnect. Keep this caller handle valid as an independent
             # server statement; do not silently repopulate or overrun the
             # current cache policy.
-            stmt.name = API.prepare(stmt.conn.style, stmt.conn.socket, stmt.sql, stmt.conn.debug,
-                                    stmt.conn.server_parameters)
-            stmt.generation = stmt.conn.generation
+            reprepare!(stmt)
             stmt.cached = false
         else
             touch_statement!(stmt.conn, cached)
             stmt.last_used = cached.last_used
         end
     elseif stmt.generation != stmt.conn.generation
-        stmt.name = API.prepare(stmt.conn.style, stmt.conn.socket, stmt.sql, stmt.conn.debug,
-                                stmt.conn.server_parameters)
-        stmt.generation = stmt.conn.generation
+        reprepare!(stmt)
     end
     stmt.cached || touch_statement!(stmt.conn, stmt)
+    return
+end
+
+# Prepare the SQL as a new server statement and adopt its description: the
+# columns can differ from the last prepare after DDL or a search_path change.
+function reprepare!(stmt::Statement)
+    conn = stmt.conn
+    stmt.name = API.prepare(conn.style, conn.socket, stmt.sql, conn.debug, conn.server_parameters)
+    _, stmt.names, stmt.typeIds = API.describeprepared(conn.style, conn.socket, stmt.name, conn.debug,
+                                                       conn.server_parameters)
+    stmt.nfields = length(stmt.names)
+    stmt.generation = conn.generation
+    return
+end
+
+# PostgreSQL rejects every later execution of a prepared statement whose result
+# columns changed since it was prepared (SQLSTATE 0A000, "cached plan must not
+# change result type"). Close that server statement so the next use prepares
+# the SQL again.
+function discard_rejected_statement!(stmt::Statement, err)
+    (err isa API.Error && err.code == "0A000") || return
+    conn = stmt.conn
+    cached = get(conn.statements, stmt.sql, nothing)
+    if cached !== nothing && cached.name == stmt.name
+        delete!(conn.statements, stmt.sql)
+        cached.closed = true
+    end
+    stmt.generation = -1 # checkstmt prepares again
+    try
+        isopen(conn.socket) && API.close_statement(conn.style, conn.socket, stmt.name, conn.debug,
+                                                   conn.server_parameters)
+    catch
+        # the caller is already throwing the server's rejection
+    end
     return
 end
 
@@ -549,6 +581,9 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
                 API.exec(style, stmt.conn.socket, stmt.name, stmt.params,
                              stmt.names, stmt.typeIds, stmt.conn.type_registry,
                              actual_debug, 0, stmt.conn.server_parameters)
+            catch err
+                discard_rejected_statement!(stmt, err)
+                rethrow()
             finally
                 # Bound strings can contain credentials or personal data. The
                 # vector must be cleared even if local parameter validation or
@@ -796,6 +831,9 @@ function cursor(stmt::Statement, params=nothing; fetchsize::Integer=1000,
                 API.writemessages(conn.socket, conn.debug, ('B', portal, stmt.name, Int16(0), API.bind_param_count(length(stmt.params)), API.Params(stmt.params), Int16(0)), ('E', portal, Int32(cursor.fetchsize)), ('S',))
                 read_portal_batch!(cursor)
                 return cursor
+            catch err
+                discard_rejected_statement!(stmt, err)
+                rethrow()
             finally
                 fill!(stmt.params, missing)
             end
