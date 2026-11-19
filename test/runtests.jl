@@ -978,6 +978,19 @@ include("trim_compile_tests.jl")
             @test parse("{2024-01-02,2024-02-29}", Date) == [Date(2024, 1, 2), Date(2024, 2, 29)]
             @test_throws ArgumentError parse("{1,x}", Int32)
         end
+        @test Postgres.API.parse_value(1005, "{1,-2}", registry) == Int16[1, -2]
+        @test Postgres.API.parse_value(1021, "{1.5,NaN}", registry) isa Vector{Float32}
+        @test Postgres.API.parse_value(1000, "{t,f}", registry) == [true, false]
+        # types registered without a parser: other types get the text, other
+        # vector types get string elements, and numbers are an error
+        let reg = Dict(registry)
+            Postgres.API.register_type!(reg, 990001, Symbol)
+            Postgres.API.register_type!(reg, 990002, Vector{Symbol})
+            Postgres.API.register_type!(reg, 990003, Int8)
+            @test Postgres.API.parse_value(990001, "abc", reg) == "abc"
+            @test Postgres.API.parse_value(990002, "{a,b}", reg) == ["a", "b"]
+            @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_value(990003, "1", reg)
+        end
 
         rng = MersenneTwister(0x5097)
         for _ in 1:200

@@ -39,24 +39,18 @@ function Base.read(io::BufferedConn, ::Type{UInt8})
     return b
 end
 
-function Base.unsafe_read(io::BufferedConn, p::Ptr{UInt8}, n::UInt)
-    remaining = Int(n)
-    while remaining > 0
-        if bytesavailable(io) == 0
-            # a remainder larger than the scratch buffer goes straight to `p`
-            if remaining >= length(io.scratch) && !io.ended
-                unsafe_read(io.transport, p, UInt(remaining))
-                return nothing
-            end
-            fill_buffer!(io) || throw(EOFError())
-        end
-        k = min(remaining, bytesavailable(io))
-        GC.@preserve io unsafe_copyto!(p, pointer(io.buffer, io.pos), k)
-        io.pos += k
-        p += k
-        remaining -= k
+# Message headers carry an Int32 length, so this runs once per protocol
+# message. Base's `read(io, T)` reads through a heap-allocated `Ref`.
+Base.read(io::BufferedConn, T::Union{Type{Int16}, Type{UInt16}, Type{Int32}, Type{UInt32}}) = read_fixed(io, T)
+
+function read_fixed(io::BufferedConn, ::Type{T}) where {T}
+    while bytesavailable(io) < sizeof(T)
+        fill_buffer!(io) || throw(EOFError())
     end
-    return nothing
+    buf = io.buffer
+    x = GC.@preserve buf unsafe_load(Ptr{T}(pointer(buf, io.pos)))
+    io.pos += sizeof(T)
+    return x
 end
 
 function Base.readbytes!(io::BufferedConn, buf::AbstractVector{UInt8}, nb::Integer=length(buf); all::Bool=true)

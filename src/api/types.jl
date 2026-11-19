@@ -241,7 +241,7 @@ end
 
 default_type_info(oid::Int) = get(DEFAULT_TYPE_REGISTRY, oid, TypeInfo(String, nothing))
 
-type_info(registry::Dict{Int, TypeInfo}, oid::Int) = get(registry, oid, default_type_info(oid))
+type_info(registry::Dict{Int, TypeInfo}, oid::Int) = get(() -> default_type_info(oid), registry, oid)
 
 @inline function juliatype(f, oid::Int, registry::Dict{Int, TypeInfo})
     info = type_info(registry, oid)
@@ -912,69 +912,72 @@ const FieldBytes = SubArray{UInt8, 1, Vector{UInt8}, Tuple{UnitRange{Int}}, true
 _field_text(val::String) = val
 _field_text(val::FieldBytes) = GC.@preserve val unsafe_string(pointer(val), length(val))
 
+# Runs once per value. `===` on types is a pointer comparison, where `==` and
+# `<:` are runtime calls, so the identity checks come first and the subtype
+# checks only see types no identity check matched.
 function parse_value(typeId::Int, val::Union{String, FieldBytes}, registry::Dict{Int, TypeInfo})
     info = type_info(registry, typeId)
     if info.parser !== nothing
         return info.parser(_field_text(val), registry)
     end
     T = info.julia_type
-    if T == Bool
+    T === String && return _field_text(val)
+    if T === Bool
         return parse_boolean(val)
-    elseif T == Int16
+    elseif T === Int16
         return Parsers.parse(Int16, val)
-    elseif T == Int32
+    elseif T === Int32
         return Parsers.parse(Int32, val)
-    elseif T == Int64
+    elseif T === Int64
         return Parsers.parse(Int64, val)
-    elseif T == Cuint
+    elseif T === Cuint
         return Parsers.parse(Cuint, val)
-    elseif T == Float32
+    elseif T === Float32
         return Parsers.parse(Float32, val)
-    elseif T == Float64
+    elseif T === Float64
         return Parsers.parse(Float64, val)
     end
     # Text, lazy JSON and custom parsers own their bytes. Fixed-width scalar
     # decoders above can read directly from the row's bounded byte view.
     val = _field_text(val)
-    if T == Char
+    if T === Char
         return pg_parse_char(val)
-    elseif T == PGTimestamp
+    elseif T === PGTimestamp
         return pg_parse_timestamp(val)
-    elseif T == DateTime
+    elseif T === DateTime
         if typeId == 1184
             return parse_timestamptz(val)
         end
         return pg_parse_datetime(val)
-    elseif T == UUID
+    elseif T === UUID
         return UUID(val)
-    elseif T == Date
+    elseif T === Date
         return pg_parse_date(val)
-    elseif T == Time
+    elseif T === Time
         return pg_parse_time(val)
+    elseif T === Vector{UInt8}
+        return decode_bytea(val)
+    elseif T === JSONType
+        return JSON.lazy(val)
+    elseif T === Vector{String}
+        return parse_array(val, String)
+    elseif T === Vector{Int16}
+        return parse_array(val, Int16)
+    elseif T === Vector{Int32}
+        return parse_array(val, Int32)
+    elseif T === Vector{Int64}
+        return parse_array(val, Int64)
+    elseif T === Vector{Float32}
+        return parse_array(val, Float32)
+    elseif T === Vector{Float64}
+        return parse_array(val, Float64)
+    elseif T === Vector{Bool}
+        return parse_array(val, Bool)
     elseif T <: Number || T <: Dates.TimeType
         # custom numeric/time registrations must supply a parser function: a
         # runtime-Type Parsers.parse here is unresolvable under --trim
         throw(PostgresInterfaceError("no parser registered for this type; pass a parser function when registering the type"))
-    elseif T == Vector{UInt8}
-        return decode_bytea(val)
-    elseif T == JSONType
-        return JSON.lazy(val)
     elseif T <: AbstractVector
-        if T == Vector{String}
-            return parse_array(val, String)
-        elseif T == Vector{Int16}
-            return parse_array(val, Int16)
-        elseif T == Vector{Int32}
-            return parse_array(val, Int32)
-        elseif T == Vector{Int64}
-            return parse_array(val, Int64)
-        elseif T == Vector{Float32}
-            return parse_array(val, Float32)
-        elseif T == Vector{Float64}
-            return parse_array(val, Float64)
-        elseif T == Vector{Bool}
-            return parse_array(val, Bool)
-        end
         return parse_array(val, String)
     end
     return val
