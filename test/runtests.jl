@@ -963,6 +963,19 @@ include("trim_compile_tests.jl")
         @test Postgres.API.parse_array_by_oid("{/var/log/x[1].txt,b}", 25, registry) == ["/var/log/x[1].txt", "b"]
 
         @test Postgres.API.ArrayParsing.parse_array("{1,2}", Int64) isa Vector{Int64}
+        @test Postgres.API.parse_value(1005, "{1,-2}", registry) == Int16[1, -2]
+        @test Postgres.API.parse_value(1021, "{1.5,NaN}", registry) isa Vector{Float32}
+        @test Postgres.API.parse_value(1000, "{t,f}", registry) == [true, false]
+        # types registered without a parser: other types get the text, other
+        # vector types get string elements, and numbers are an error
+        let reg = Dict(registry)
+            Postgres.API.register_type!(reg, 990001, Symbol)
+            Postgres.API.register_type!(reg, 990002, Vector{Symbol})
+            Postgres.API.register_type!(reg, 990003, Int8)
+            @test Postgres.API.parse_value(990001, "abc", reg) == "abc"
+            @test Postgres.API.parse_value(990002, "{a,b}", reg) == ["a", "b"]
+            @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_value(990003, "1", reg)
+        end
 
         rng = MersenneTwister(0x5097)
         for _ in 1:200
