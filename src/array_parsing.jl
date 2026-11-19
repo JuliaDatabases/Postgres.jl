@@ -70,7 +70,13 @@ function parse_unquoted(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int})
             pos[] += 1
         end
     end
-    return String(strip(String(buf)))
+    # Trim only the ASCII whitespace PostgreSQL itself ignores around an
+    # element. Base.strip also removes Unicode spaces such as U+00A0, which
+    # the server never quotes, so they belong to the element.
+    while !isempty(buf) && is_ws(buf[end])
+        pop!(buf)
+    end
+    return String(buf)
 end
 
 function parse_bool_token(token::String)
