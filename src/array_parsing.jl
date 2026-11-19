@@ -175,14 +175,31 @@ function parse_array_inner(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, i
     return coerce_array(values, inner_type)
 end
 
+# Whether the literal is one `parse_flat_array` gives up on, told without
+# reading any element: a nested array (the server writes `{{`), a backslash
+# escape, or the bytes `NULL`. Memchr scans keep this cheap. A quoted "NULL" or
+# a word containing it also counts; the general parser reads those the same way.
+function needs_general_parser(code::Base.CodeUnits{UInt8, String}, open::Int)
+    open < length(code) && code[open + 1] == BRACE_OPEN && return true
+    findfirst(==(BACKSLASH), code) !== nothing && return true
+    i = findfirst(==(UInt8('N')), code)
+    while i !== nothing
+        i + 3 <= length(code) && code[i + 1] == UInt8('U') && code[i + 2] == UInt8('L') && code[i + 3] == UInt8('L') && return true
+        i = findnext(==(UInt8('N')), code, i + 1)
+    end
+    return false
+end
+
 # The common case, a one-dimensional array without NULLs or escapes, read
 # straight into a `Vector{T}`. `parse_array_inner` copies each token through a
 # growable buffer and boxes each value into a `Vector{Any}` first. Elements are
-# split and parsed exactly as there; returns `nothing` at the first nested
-# array, escape, NULL or value that is not a `T`, and the caller then parses
-# the whole literal with `parse_array_inner`.
+# split and parsed exactly as there. Returns `nothing` when
+# `needs_general_parser` says so, so such a literal is parsed once, or at a
+# later nested array or a value that is not a `T`; the caller then parses the
+# whole literal with `parse_array_inner`.
 function parse_flat_array(str::String, open::Int, inner_type::Type{T}) where {T}
     code = codeunits(str)
+    needs_general_parser(code, open) && return nothing
     n = length(code)
     dest = T[]
     i = open + 1
@@ -199,7 +216,6 @@ function parse_flat_array(str::String, open::Int, inner_type::Type{T}) where {T}
         j = i
         while j <= n
             b = code[j]
-            b == BACKSLASH && return nothing
             (quoted ? b == QUOTE : (b == COMMA || b == BRACE_CLOSE)) && break
             j += 1
         end
@@ -207,7 +223,7 @@ function parse_flat_array(str::String, open::Int, inner_type::Type{T}) where {T}
         # a quoted element ends past its closing quote
         i = quoted && j <= n ? j + 1 : j
         value = parse_scalar(token, inner_type, quoted)
-        (value === missing || value isa AbstractVector || !(value isa T)) && return nothing
+        value isa T || return nothing
         push!(dest, value)
         while i <= n && is_ws(code[i])
             i += 1
