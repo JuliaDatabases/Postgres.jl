@@ -39,6 +39,16 @@ function test_execute_fake_server()
             close(io)
         end
     end
+    @testset "a message header split across transport reads" begin
+        msg = pgmsg('d', UInt8[1, 2, 3])
+        with_fake_server((sock, n) -> foreach(b -> (send(sock, [b]); sleep(0.02)), msg)) do port, accepted
+            io = Postgres.API.BufferedConn(Postgres.API.connectsocket("127.0.0.1", port, Int64(0)))
+            @test Postgres.API.readheader(io) == (UInt8('d'), 3)
+            @test Postgres.API.readbody(io, 3) == UInt8[1, 2, 3]
+            @test_throws EOFError read(io, Int32)
+            close(io)
+        end
+    end
     # the replies the server gets out before the connection is lost
     partial_replies = (
         "before ParseComplete" => UInt8[],
