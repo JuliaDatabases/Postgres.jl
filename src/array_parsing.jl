@@ -175,6 +175,48 @@ function parse_array_inner(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, i
     return coerce_array(values, inner_type)
 end
 
+# The common case, a one-dimensional array without NULLs or escapes, read
+# straight into a `Vector{T}`. `parse_array_inner` copies each token through a
+# growable buffer and boxes each value into a `Vector{Any}` first. Elements are
+# split and parsed exactly as there; returns `nothing` at the first nested
+# array, escape, NULL or value that is not a `T`, and the caller then parses
+# the whole literal with `parse_array_inner`.
+function parse_flat_array(str::String, open::Int, inner_type::Type{T}) where {T}
+    code = codeunits(str)
+    n = length(code)
+    dest = T[]
+    i = open + 1
+    while i <= n
+        while i <= n && is_ws(code[i])
+            i += 1
+        end
+        i > n && break
+        c = code[i]
+        c == BRACE_CLOSE && break
+        c == BRACE_OPEN && return nothing
+        quoted = c == QUOTE
+        quoted && (i += 1)
+        j = i
+        while j <= n
+            b = code[j]
+            b == BACKSLASH && return nothing
+            (quoted ? b == QUOTE : (b == COMMA || b == BRACE_CLOSE)) && break
+            j += 1
+        end
+        token = GC.@preserve str unsafe_string(pointer(str, i), j - i)
+        # a quoted element ends past its closing quote
+        i = quoted && j <= n ? j + 1 : j
+        value = parse_scalar(token, inner_type, quoted)
+        (value === missing || value isa AbstractVector || !(value isa T)) && return nothing
+        push!(dest, value)
+        while i <= n && is_ws(code[i])
+            i += 1
+        end
+        i <= n && code[i] == COMMA && (i += 1)
+    end
+    return dest
+end
+
 const EQUALS = UInt8('=')
 
 # PostgreSQL prefixes an array literal with explicit dimensions whenever a
@@ -217,6 +259,8 @@ function parse_array(str::String, inner_type::Type{T}) where {T}
     end
     c = code[pos[]]
     if c == BRACE_OPEN
+        flat = parse_flat_array(str, pos[], inner_type)
+        flat === nothing || return flat
         return parse_array_inner(code, pos, inner_type)
     end
     value = parse_scalar(str, inner_type, true)
