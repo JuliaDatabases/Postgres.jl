@@ -70,12 +70,9 @@ function parse_unquoted(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int})
             pos[] += 1
         end
     end
-    # Trim only the ASCII whitespace PostgreSQL itself ignores around an
-    # element. Base.strip also removes Unicode spaces such as U+00A0, which
-    # the server never quotes, so they belong to the element.
-    while !isempty(buf) && is_ws(buf[end])
-        pop!(buf)
-    end
+    # The server quotes any element that contains ASCII whitespace, so an
+    # unquoted element runs to the delimiter. Unicode spaces such as U+00A0
+    # are never quoted and belong to the element: do not strip.
     return String(buf)
 end
 
