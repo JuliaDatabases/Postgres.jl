@@ -26,6 +26,19 @@ conn = DBInterface.connect(
 )
 ```
 
+An invalid connection string throws an `ArgumentError`. To check one without
+connecting or catching, use `Postgres.validate_dsn`. It returns `nothing`, or a
+`Postgres.ConnectionParameterError` whose `reason` is `:unknown_key`,
+`:invalid_value`, `:unsupported_ignored`, or `:malformed`, and whose `key` names
+the parameter (or is `nothing` when there is none to name).
+
+```julia
+err = Postgres.validate_dsn("host=127.0.0.1 port=abc")
+if err !== nothing && err.reason === :invalid_value
+    println("invalid value for ", err.key)   # invalid value for port
+end
+```
+
 Session defaults such as the schema search path are set with libpq's `options`
 keyword (or the `PGOPTIONS` environment variable). The value is sent to the
 server in the startup packet, so it also applies after an automatic reconnect.
@@ -164,6 +177,12 @@ Prepared statements can be created explicitly. Postgres.jl caches their named
 backend statements with LRU eviction while returning an independent handle to
 each caller. Set `statement_cache_maxsize=0` to disable this cache.
 
+If DDL or a `search_path` change alters a prepared statement's result
+columns, PostgreSQL rejects its next execution with SQLSTATE `0A000` ("cached
+plan must not change result type"). Postgres.jl then closes that server
+statement, so the next execution of the same SQL, through a new or an existing
+handle, prepares it again and reads the new columns.
+
 ```julia
 stmt = DBInterface.prepare(conn, raw"SELECT $1::text AS value")
 rows = Tables.rowtable(DBInterface.execute(stmt, ("prepared",)))
@@ -277,6 +296,12 @@ Postgres.cancel_query!(conn)
 ```
 
 The running query raises a `Postgres.Error` with PostgreSQL SQLSTATE `57014`.
+
+The request carries only the backend pid and cancel key, so it also works on a
+connection that an `InterruptException` closed mid-query. Its statement keeps
+running on the server until it finishes or is cancelled. Call `cancel_query!`
+before you use the connection again: with `reconnect=true`, the next use opens a
+new session, and a later cancel goes to that session instead.
 
 ## LISTEN And NOTIFY
 

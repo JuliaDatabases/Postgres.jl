@@ -70,7 +70,10 @@ function parse_unquoted(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int})
             pos[] += 1
         end
     end
-    return String(strip(String(buf)))
+    # The server quotes any element that contains ASCII whitespace, so an
+    # unquoted element runs to the delimiter. Unicode spaces such as U+00A0
+    # are never quoted and belong to the element: do not strip.
+    return String(buf)
 end
 
 function parse_bool_token(token::String)
@@ -172,6 +175,64 @@ function parse_array_inner(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, i
     return coerce_array(values, inner_type)
 end
 
+# Whether the literal is one `parse_flat_array` gives up on, told without
+# reading any element: a nested array (the server writes `{{`), a backslash
+# escape, or the bytes `NULL`. Memchr scans keep this cheap. A quoted "NULL" or
+# a word containing it also counts; the general parser reads those the same way.
+function needs_general_parser(code::Base.CodeUnits{UInt8, String}, open::Int)
+    open < length(code) && code[open + 1] == BRACE_OPEN && return true
+    findfirst(==(BACKSLASH), code) !== nothing && return true
+    i = findfirst(==(UInt8('N')), code)
+    while i !== nothing
+        i + 3 <= length(code) && code[i + 1] == UInt8('U') && code[i + 2] == UInt8('L') && code[i + 3] == UInt8('L') && return true
+        i = findnext(==(UInt8('N')), code, i + 1)
+    end
+    return false
+end
+
+# The common case, a one-dimensional array without NULLs or escapes, read
+# straight into a `Vector{T}`. `parse_array_inner` copies each token through a
+# growable buffer and boxes each value into a `Vector{Any}` first. Elements are
+# split and parsed exactly as there. Returns `nothing` when
+# `needs_general_parser` says so, so such a literal is parsed once, or at a
+# later nested array or a value that is not a `T`; the caller then parses the
+# whole literal with `parse_array_inner`.
+function parse_flat_array(str::String, open::Int, inner_type::Type{T}) where {T}
+    code = codeunits(str)
+    needs_general_parser(code, open) && return nothing
+    n = length(code)
+    dest = T[]
+    i = open + 1
+    while i <= n
+        while i <= n && is_ws(code[i])
+            i += 1
+        end
+        i > n && break
+        c = code[i]
+        c == BRACE_CLOSE && break
+        c == BRACE_OPEN && return nothing
+        quoted = c == QUOTE
+        quoted && (i += 1)
+        j = i
+        while j <= n
+            b = code[j]
+            (quoted ? b == QUOTE : (b == COMMA || b == BRACE_CLOSE)) && break
+            j += 1
+        end
+        token = GC.@preserve str unsafe_string(pointer(str, i), j - i)
+        # a quoted element ends past its closing quote
+        i = quoted && j <= n ? j + 1 : j
+        value = parse_scalar(token, inner_type, quoted)
+        value isa T || return nothing
+        push!(dest, value)
+        while i <= n && is_ws(code[i])
+            i += 1
+        end
+        i <= n && code[i] == COMMA && (i += 1)
+    end
+    return dest
+end
+
 const EQUALS = UInt8('=')
 
 # PostgreSQL prefixes an array literal with explicit dimensions whenever a
@@ -214,6 +275,8 @@ function parse_array(str::String, inner_type::Type{T}) where {T}
     end
     c = code[pos[]]
     if c == BRACE_OPEN
+        flat = parse_flat_array(str, pos[], inner_type)
+        flat === nothing || return flat
         return parse_array_inner(code, pos, inner_type)
     end
     value = parse_scalar(str, inner_type, true)

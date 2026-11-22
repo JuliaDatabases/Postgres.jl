@@ -492,12 +492,20 @@ function random_array_string(rng::AbstractRNG)
     return String(rand(rng, alphabet, rand(rng, 0:12)))
 end
 
+# allocations of a call after a warm-up call; measured inside a function so
+# `@allocations` does not force-compile the enclosing testset
+function warm_allocations(f, s::String, ::Type{T}) where {T}
+    f(s, T)
+    return @allocations f(s, T)
+end
+
 include("timestamps.jl")
 include("decimals.jl")
 include("result_decoding.jl")
 include("gssapi.jl")
 include("isvalid_fake_server.jl")
 include("execute_fake_server.jl")
+include("connect_timeout_fake_server.jl")
 include("execute_script_fake_server.jl")
 include("executemany.jl")
 include("notification_deadlines.jl")
@@ -516,6 +524,7 @@ include("trim_compile_tests.jl")
                 :Connection, :ConnectionPool, :ConnectionParams, :PostgresInterfaceError,
                 :Error, :Notification, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
                 :query_logging_enabled, :query_logger, :notice_callback, :notification_callback, :parse_dsn,
+                :validate_dsn, :ConnectionParameterError,
                 :transaction, Symbol("@transaction"), :start_transaction, :commit, :rollback, :in_transaction,
                 :cursor, :execute_script, :copy_from, :copy_to, :load!, :listen!, :unlisten!, :notify!, :wait_for_notification,
                 :register_type!, :register_enum!, :register_composite!, :register_range!,
@@ -697,7 +706,7 @@ include("trim_compile_tests.jl")
         # an unexpanded ${PGSSLMODE} meant to be verify-full must fail loudly
         # rather than fall back to the unauthenticated default
         withenv("PGSSLMODE" => "") do
-            @test Postgres.parse_dsn("host=h").sslmode == ""
+            @test_throws ArgumentError Postgres.parse_dsn("host=h")
         end
 
         withenv(
@@ -961,6 +970,41 @@ include("trim_compile_tests.jl")
         @test Postgres.API.parse_array_by_oid("{/var/log/x[1].txt,b}", 25, registry) == ["/var/log/x[1].txt", "b"]
 
         @test Postgres.API.ArrayParsing.parse_array("{1,2}", Int64) isa Vector{Int64}
+        # one-dimensional arrays without NULLs or escapes are read straight into
+        # a typed vector; any other literal gives what the general parser gives
+        let parse = Postgres.API.ArrayParsing.parse_array
+            @test parse("{ 1 , \"2\",3 }", Int32) == Int32[1, 2, 3]
+            @test parse("{12.00,-7}", Int64) == [12, -7]
+            @test parse("{}", Float64) == Float64[]
+            @test parse("{NaN,-Infinity,1.5}", Float64) isa Vector{Float64}
+            @test isequal(parse("{1,NULL}", Int32), Union{Missing, Int32}[1, missing])
+            @test parse("{\"NULL\",NULL}", String) isa Vector{Union{Missing, String}}
+            @test parse("{\"a\\\"b\",c d,\"\"}", String) == ["a\"b", "c d", ""]
+            @test parse("{{1,2},{3,4}}", Int32) == [Int32[1, 2], Int32[3, 4]]
+            @test parse("{1,{2}}", Int32) == Any[Int32(1), Int32[2]]
+            @test parse("{2024-01-02,2024-02-29}", Date) == [Date(2024, 1, 2), Date(2024, 2, 29)]
+            @test_throws ArgumentError parse("{1,x}", Int32)
+            @test parse("{aNULLb,\"NULL\"}", String)::Vector{String} == ["aNULLb", "NULL"]
+            # a literal with a NULL, an escape or a nested array costs no more than
+            # the general parser alone: the fast path turns it away before reading
+            general(s, ::Type{T}) where {T} = Postgres.API.ArrayParsing.parse_array_inner(codeunits(s), Ref(1), T)
+            for (s, T) in (("{1,2,3,4,NULL}", Int32), ("{abc,\"x\\\\y\"}", String), ("{{1,2},{3,4}}", Int32))
+                @test warm_allocations(parse, s, T) <= warm_allocations(general, s, T)
+            end
+        end
+        @test Postgres.API.parse_value(1005, "{1,-2}", registry) == Int16[1, -2]
+        @test Postgres.API.parse_value(1021, "{1.5,NaN}", registry) isa Vector{Float32}
+        @test Postgres.API.parse_value(1000, "{t,f}", registry) == [true, false]
+        # types registered without a parser: other types get the text, other
+        # vector types get string elements, and numbers are an error
+        let reg = Dict(registry)
+            Postgres.API.register_type!(reg, 990001, Symbol)
+            Postgres.API.register_type!(reg, 990002, Vector{Symbol})
+            Postgres.API.register_type!(reg, 990003, Int8)
+            @test Postgres.API.parse_value(990001, "abc", reg) == "abc"
+            @test Postgres.API.parse_value(990002, "{a,b}", reg) == ["a", "b"]
+            @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_value(990003, "1", reg)
+        end
 
         rng = MersenneTwister(0x5097)
         for _ in 1:200
@@ -1060,6 +1104,7 @@ include("trim_compile_tests.jl")
     test_isvalid_fake_server()
     test_isvalid_fragmentation()
     test_execute_fake_server()
+    test_connect_timeout_fake_server()
     test_execute_script_fake_server()
     test_executemany_protocol()
     test_notification_deadlines()
@@ -1159,7 +1204,7 @@ include("trim_compile_tests.jl")
                     # surfaces the real server error, not an assert, and leaves the
                     # stream at ReadyForQuery so the connection stays usable
                     err = try
-                        Postgres.API.describeprepared(connp.socket, "no_such_stmt_xyz", false)
+                        Postgres.API.describeprepared(connp.style, connp.socket, "no_such_stmt_xyz", false)
                         nothing
                     catch e
                         e
@@ -1296,6 +1341,28 @@ include("trim_compile_tests.jl")
                     @test function_value == 42
                     @test only(DBInterface.execute(held)).val == 42
 
+                    # DDL that changes a prepared statement's result columns
+                    # makes PostgreSQL reject it (0A000). That rejection must
+                    # not stick to the cache, and statements prepared again
+                    # must read the server's new column names and order.
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS stmt_shape")
+                    DBInterface.execute(conn, "CREATE TABLE stmt_shape (a int, b int)")
+                    DBInterface.execute(conn, "INSERT INTO stmt_shape VALUES (1, 2)")
+                    shape_sql = "SELECT * FROM stmt_shape"
+                    shape_handle = DBInterface.prepare(conn, shape_sql)
+                    @test only(Tables.rowtable(DBInterface.execute(shape_handle))) == (a = 1, b = 2)
+                    Postgres.execute_script(conn, """
+                        ALTER TABLE stmt_shape RENAME COLUMN a TO tmp;
+                        ALTER TABLE stmt_shape RENAME COLUMN b TO a;
+                        ALTER TABLE stmt_shape RENAME COLUMN tmp TO b;
+                    """)
+                    shape_err = try DBInterface.execute(shape_handle) catch err; err end
+                    @test shape_err isa Postgres.API.Error && shape_err.code == "0A000"
+                    @test only(Tables.rowtable(DBInterface.execute(DBInterface.prepare(conn, shape_sql)))) == (b = 1, a = 2)
+                    @test only(Tables.rowtable(DBInterface.execute(shape_handle))) == (b = 1, a = 2)
+                    DBInterface.close!(shape_handle)
+                    DBInterface.execute(conn, "DROP TABLE stmt_shape")
+
                     DBInterface.close!(held)
                     DBInterface.close!(mismatch_stmt)
                     DBInterface.close!(failing_stmt)
@@ -1368,6 +1435,13 @@ include("trim_compile_tests.jl")
                 bracket_param = ["a]b", "x[1]", "]", "plain"]
                 bracket_row = only(Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::text[] AS arr", (bracket_param,))))
                 @test bracket_row.arr == bracket_param
+                # PostgreSQL quotes an element only for ASCII whitespace, so
+                # other whitespace at an element's edge arrives unquoted
+                edge_ws = ["\u00a0lead", "trail\u00a0", "\u2028both\u3000", "a b"]
+                edge_row = only(Tables.rowtable(DBInterface.execute(conn,
+                    raw"SELECT ARRAY[E'\u00a0lead', E'trail\u00a0', E'\u2028both\u3000', 'a b'] AS arr")))
+                @test edge_row.arr == edge_ws
+                @test DBInterface.execute(conn, raw"SELECT $1::text[] AS arr", (edge_ws,), NamedTuple{(:arr,), Tuple{Vector{String}}}).arr == edge_ws
                 array_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '{1,NULL,3}'::int[] AS arr")))
                 @test isequal(array_row.arr, Union{Missing, Int32}[1, missing, 3])
                 nested_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '{{1,2},{3,4}}'::int[] AS arr")))
@@ -2859,6 +2933,25 @@ include("trim_compile_tests.jl")
                     @test result.code == "57014"
                     DBInterface.close!(cancel_conn)
 
+                    # an interrupt mid-statement closes the socket but leaves the
+                    # statement running; the cancel still reaches it with the pid
+                    # and key the connection holds
+                    interrupted = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+                    pid = interrupted.pid
+                    task = @async connect_err(() -> DBInterface.execute(interrupted, "SELECT pg_sleep(30)"))
+                    started = timedwait(5.0; pollint=0.05) do
+                        only(DBInterface.execute(conn, "SELECT count(*) AS n FROM pg_stat_activity WHERE pid = $pid AND state = 'active'")).n == 1
+                    end
+                    @test started === :ok
+                    schedule(task, InterruptException(); error=true)
+                    @test fetch(task) isa InterruptException
+                    @test !isopen(interrupted)
+                    Postgres.cancel_query!(interrupted)
+                    stopped = timedwait(10.0; pollint=0.05) do
+                        only(DBInterface.execute(conn, "SELECT count(*) AS n FROM pg_stat_activity WHERE pid = $pid AND state = 'active'")).n == 0
+                    end
+                    @test stopped === :ok
+
                     # the cancel key must never go out in the clear when the
                     # connection it cancels required TLS; the refusal is a
                     # thrown error, not a silent no-op (this server has no SSL,
@@ -3027,7 +3120,7 @@ include("trim_compile_tests.jl")
                     end
 
                     # Require and verify a client certificate for one role.
-                    # This covers the TLS 1.2 mTLS path and the cancel request,
+                    # This covers mTLS over TLS 1.3 and the cancel request,
                     # which must present the same client identity.
                     mtls_admin = DBInterface.connect(Postgres.Connection,
                         ssl_cfg.host, ssl_cfg.user, ssl_cfg.password;
@@ -3059,7 +3152,7 @@ include("trim_compile_tests.jl")
                                 WHERE pid = pg_backend_pid()
                             """))
                             @test tls_row.ssl
-                            @test tls_row.version == "TLSv1.2"
+                            @test tls_row.version == "TLSv1.3"
                             @test occursin("CN=postgres_mtls", tls_row.client_dn)
 
                             mtls_task = errormonitor(Threads.@spawn begin

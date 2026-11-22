@@ -21,6 +21,12 @@ Base.showerror(io::IO, e::PostgresInterfaceError) = print(io, e.msg)
 
 @noinline _reject_nul(what::String) = throw(PostgresInterfaceError("$what cannot contain a NUL byte"))
 
+# The values accepted for sslmode and gssencmode, compared case-insensitively.
+# The connection-string parser, the constructors, and the connect and cancel
+# paths all read these, so the lists cannot drift apart.
+const SSLMODES = ("disable", "prefer", "require", "verify-full")
+const GSSENCMODES = ("disable", "prefer", "require")
+
 include("api/API.jl")
 using .API
 include("connection_string.jl")
@@ -60,7 +66,9 @@ Supported keyword arguments. All are also available as DSN/URI options except
   libpq's `options` (for example `"-c search_path=myschema"` to set the default
   schema). Sent in the startup packet, so it also applies after an automatic
   reconnect. Defaults to `PGOPTIONS` when built from a DSN.
-- `connect_timeout` (seconds), `statement_timeout` (milliseconds)
+- `connect_timeout` (seconds): bounds each connection attempt, from the TCP
+  connection through authentication and session setup, as one deadline
+- `statement_timeout` (milliseconds)
 - `sslmode` (`"disable"`, `"prefer"` (default), `"require"`, `"verify-full"`),
   `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`, and `sslservername`.
   Only `verify-full` verifies the server's certificate; `require` encrypts
@@ -82,6 +90,9 @@ Supported keyword arguments. All are also available as DSN/URI options except
   forwards the ticket to the server (default `false`). Kerberos comes from the
   operating system library (`kinit` tickets, `krb5.conf`), with no bundled
   Kerberos; see the support policy.
+- `sslmode` and `gssencmode` values are case-insensitive. Any other value
+  throws an `ArgumentError` when the connection is constructed, before
+  connecting, with the message `Postgres.parse_dsn` gives for it.
 - `statement_cache_maxsize`: LRU backend cache size for explicit named prepared
   statements (default 100; `0` disables)
 - `reconnect`: automatically reconnect and re-prepare statements if the
@@ -180,6 +191,12 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         krbsrvname_val !== nothing && occursin('\0', krbsrvname_val) && _reject_nul("krbsrvname")
         xor(sslcert_val === nothing, sslkey_val === nothing) &&
             throw(PostgresInterfaceError("sslcert and sslkey must be provided together"))
+        # checked here, not only when connecting, so that no negotiation path
+        # can skip the check and the error matches parse_dsn's
+        err = ConnectionString.check_mode("sslmode", sslmode_val, SSLMODES)
+        err === nothing || throw(ArgumentError(err.msg))
+        err = ConnectionString.check_mode("gssencmode", gssencmode_val, GSSENCMODES)
+        err === nothing || throw(ArgumentError(err.msg))
         maxsize = max(0, Int(statement_cache_maxsize))
         socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, options_val, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, gssencmode_val, krbsrvname_val, gssdelegation, style)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
@@ -312,7 +329,7 @@ function evict_lru_statement!(conn::Connection)
     oldest_sql === nothing && return
     stmt = pop!(conn.statements, oldest_sql)
     if !stmt.closed
-        API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+        API.close_statement(conn.style, conn.socket, stmt.name, conn.debug, conn.server_parameters)
         stmt.closed = true
     end
     return
@@ -336,7 +353,7 @@ function clear_statement_cache!(conn::Connection)
     @lock conn.lock begin
         for (sql, stmt) in conn.statements
             if !stmt.closed
-                API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+                API.close_statement(conn.style, conn.socket, stmt.name, conn.debug, conn.server_parameters)
                 stmt.closed = true
             end
         end
@@ -357,7 +374,7 @@ function set_statement_cache_maxsize!(conn::Connection, maxsize::Integer)
         if conn.statement_cache_maxsize == 0
             for (sql, stmt) in conn.statements
                 if !stmt.closed
-                    API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+                    API.close_statement(conn.style, conn.socket, stmt.name, conn.debug, conn.server_parameters)
                     stmt.closed = true
                 end
             end
@@ -542,9 +559,9 @@ lock, reconnecting, or running callbacks counts toward the timeout, but those
 steps are not interrupted.
 
 The connection lock is held while waiting, so use a dedicated connection for
-listening. Notifications received while a query uses the connection are instead
+listening. Notifications received while the connection runs other work are
 delivered to [`notification_callback`](@ref Postgres.API.notification_callback)
-during the phases that read result data.
+instead.
 """
 function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=nothing)
     start_time = time_ns()
@@ -829,28 +846,26 @@ the cancel key it carries is a credential: if `conn` itself is on TLS or
 GSSAPI encryption, the cancel connection requires the same. Throws a `PostgresInterfaceError` if the cancel
 request could not be delivered (rather than failing silently, which would
 leave the query running).
+
+The request carries only the backend pid and cancel key, which `conn` keeps
+after its socket closes. So it also cancels the statement of a connection an
+`InterruptException` closed mid-query: the socket is closed because the
+stream position is unknown, but the statement keeps running on the server
+until it finishes or is cancelled. Cancel before using `conn` again: with
+`reconnect=true`, the next use opens a new session, and a later cancel goes to
+that session instead.
 """
 function cancel_query!(conn::Connection)
+    # Read without the lock: cancel_query! is called precisely when another
+    # task holds it running the query being cancelled, and the socket state
+    # does not matter, since the request goes over its own connection.
     host = conn.host
     port = conn.port
     pid = conn.pid
     skey = conn.skey
     debug = conn.debug
-    # Checked outside the lock deliberately: cancel_query! is called precisely
-    # when another task holds it running the query being cancelled, so a
-    # trylock-guarded check would be skipped in the case that matters. Reading
-    # the socket field unlocked matches how host/pid/skey are read below.
     sslmode = cancel_sslmode(conn.socket.transport isa Reseau.TLS.Conn, conn.sslmode)
     gssencmode = cancel_gssencmode(conn.socket.transport isa API.GSSConn, conn.gssencmode)
-    if trylock(conn.lock)
-        try
-            !isopen(conn.socket) && throw(PostgresInterfaceError("cannot cancel query: connection not open"))
-            pid = conn.pid
-            skey = conn.skey
-        finally
-            unlock(conn.lock)
-        end
-    end
     ok = API.cancel_request(host, port, pid, skey, debug, sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.connect_timeout, gssencmode, conn.krbsrvname, conn.gssdelegation, conn.style)
     ok || throw(PostgresInterfaceError("failed to deliver the cancel request to $(host):$(port)"))
     return conn
@@ -906,6 +921,19 @@ end
 function DBInterface.close!(conn::Connection)
     @lock conn.lock begin
         if !conn.closed
+            # Send Terminate first, like libpq's closePGconn (sendTerminateConn
+            # in fe-connect.c), so the server sees an orderly close rather than
+            # an unexpected EOF. Best effort: the connection may already be
+            # broken, and close must not throw. A reentrant close, from a
+            # callback inside an operation, runs while that operation still
+            # owns the stream, and an executemany writer may be blocked on the
+            # socket: only closing the socket wakes it, so skip Terminate there.
+            if conn.lock.reentrancy_cnt == 1 && isopen(conn.socket)
+                try
+                    API.writemessage(conn.socket, conn.debug, 'X')
+                catch
+                end
+            end
             close(conn.socket)
             conn.closed = true
         end
@@ -1507,6 +1535,7 @@ end
         "public Connection, ConnectionPool, ConnectionParams, PostgresInterfaceError, " *
         "Error, Notification, PostgresRange, AbstractPostgresStyle, PostgresStyle, " *
         "query_logging_enabled, query_logger, notice_callback, notification_callback, parse_dsn, " *
+        "validate_dsn, ConnectionParameterError, " *
         "transaction, @transaction, start_transaction, commit, rollback, in_transaction, " *
         "cursor, execute_script, copy_from, copy_to, load!, listen!, unlisten!, notify!, wait_for_notification, " *
         "register_type!, register_enum!, register_composite!, register_range!, " *
