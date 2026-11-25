@@ -776,6 +776,18 @@ include("trim_compile_tests.jl")
             @test_throws Postgres.API.Error Postgres.API.readheader(
                 socket, false, Postgres.API.MAX_PREAUTH_MESSAGE_LEN)
         end
+        # md5 authentication: the server asks for md5 (auth code 5) with a salt, then
+        # accepts. Its bytes are queued first, so the client's reply lands behind them.
+        let socket = Base.BufferStream()
+            write(socket, hton(Int32(5)))
+            write(socket, UInt8[0x01, 0x02, 0x03, 0x04])
+            write(socket, UInt8('R'))
+            write(socket, hton(Int32(8)))
+            write(socket, hton(Int32(0)))
+            @test (@test_logs (:info, "md5 salt: 01020304") match_mode=:any Postgres.API.authRequest(
+                true, Int32(8), socket, "user", "pw", "localhost", "postgres", false,
+                Postgres.API.PostgresStyle())) === socket
+        end
 
         # a malformed DataRow must fail with a clear protocol error rather
         # than reading past the buffer or leaving the row partly unfilled
