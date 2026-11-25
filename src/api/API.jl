@@ -276,7 +276,7 @@ end
 function _write_message_to_buffer(buf::IOBuffer, debug::Bool, msg::Tuple)
     code = first(msg)::Char
     parts = Base.tail(msg)
-    debug && @info "sending message: $code, $parts"
+    debug && @info "sending message: $code" parts
     len = Int32(4 + _msgsizeof_parts(parts))
     code != '\0' && write(buf, UInt8(code))
     write(buf, hton(len))
@@ -285,7 +285,7 @@ function _write_message_to_buffer(buf::IOBuffer, debug::Bool, msg::Tuple)
 end
 
 function _writemessage_parts(socket, debug::Bool, code::Char, parts::Tuple)::Nothing
-    debug && @info "sending message: $code, $parts"
+    debug && @info "sending message: $code" parts
     len = Int32(4 + _msgsizeof_parts(parts))
     buf = IOBuffer(Vector{UInt8}(undef, len + 1); write=true)
     code != '\0' && write(buf, UInt8(code))
@@ -588,7 +588,7 @@ function authRequest(debug, len, socket, user, password, host::String, krbsrvnam
     elseif auth_code == 5
         # md5 salt
         salt = read(socket, 4)
-        debug && @info "md5 salt: $salt"
+        debug && @info "md5 salt: $(bytes2hex(salt))"
         # concat('md5', md5(concat(md5(concat(password, username)), random-salt)))
         # Calculate the MD5 password
         pass = string("md5", bytes2hex(md5(vcat(Vector{UInt8}(bytes2hex(md5(string(password, user)))), salt))))
